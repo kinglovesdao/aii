@@ -1,0 +1,28 @@
+# Credentials / secrets - never commit
+*.env
+*.env.*
+.env
+.env.*
+*token*
+*secret*
+*credential*
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build artifacts
+*.pdf
+*.docx
+target/
+node_modules/
+
+# Local notes
+NOTES.local.md
