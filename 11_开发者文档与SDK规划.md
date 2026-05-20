@@ -71,6 +71,8 @@ docs.《[占位]项目名》.io
 | **Go** | 微服务、节点接入 | go-ethereum/ethclient | 与主网同步 |
 | **Rust** | 高性能、子链合约（WASM） | ethers-rs | T0 + 1 月 |
 
+> **AI 接入轨**（详见《13 AI 集成 — MCP 与 CLI》）：除上述 SDK 外，AII 协议级提供 **CLI（`aii`）+ MCP Server**。任何能调用 Shell 或 MCP 协议的 AI 智能体（Claude Desktop / Claude Code / Cursor / Cline / OpenDevin）**无需 SDK 即可操作链**。这是 AII 区别于传统公链的核心入口选项。
+
 ### 2.2 社区 SDK（二类支持）
 
 | 语言 | 备注 |
