@@ -1,0 +1,23 @@
+[package]
+name = "aii-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Primitive types for the AII protocol (H256, Address, U256, AlgoId, BlsPubKey, BlsSignature, SignedTx)"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+quickcheck = { workspace = true }
