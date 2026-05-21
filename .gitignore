@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+*.pdb
+*.dSYM/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Credentials (never commit)
+*.env
+*.env.*
+*token*
+*secret*
+*credential*
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Coverage
+*.profraw
+lcov.info
+coverage/
+
+# Local notes
+NOTES.local.md
