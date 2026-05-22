@@ -11,7 +11,7 @@
 //! - `AlgoId`: 1-byte integer (RLP short string of length 1).
 //! - `SignedTx`: 4-element RLP list `[algo_id, pubkey, signature, payload]`.
 
-use aii_types::{Address, H256};
+use aii_types::{Address, AlgoId, H256};
 use alloy_rlp::{Decodable, Encodable};
 
 /// Encode an [`H256`] as RLP, returning the bytes.
@@ -50,6 +50,24 @@ pub fn decode_address(mut bytes: &[u8]) -> Result<Address, alloy_rlp::Error> {
     let mut out = [0u8; 20];
     out.copy_from_slice(&v);
     Ok(Address::new(out))
+}
+
+/// Encode an [`AlgoId`] as RLP. Wire format is a single byte (RLP short
+/// string of length 1).
+#[must_use]
+pub fn encode_algo_id(a: AlgoId) -> alloy_rlp::bytes::BytesMut {
+    let mut buf = alloy_rlp::bytes::BytesMut::with_capacity(2);
+    [a.as_byte()].as_slice().encode(&mut buf);
+    buf
+}
+
+/// Decode an RLP-encoded [`AlgoId`].
+pub fn decode_algo_id(mut bytes: &[u8]) -> Result<AlgoId, alloy_rlp::Error> {
+    let v = <alloy_rlp::bytes::Bytes as Decodable>::decode(&mut bytes)?;
+    if v.len() != 1 {
+        return Err(alloy_rlp::Error::UnexpectedLength);
+    }
+    AlgoId::from_byte(v[0]).map_err(|_| alloy_rlp::Error::Custom("unknown AlgoId byte"))
 }
 
 #[cfg(test)]
@@ -108,5 +126,33 @@ mod tests {
         let mut bad = vec![0x93];
         bad.extend(std::iter::repeat(0u8).take(19));
         assert!(decode_address(&bad).is_err());
+    }
+
+    #[test]
+    fn algo_id_secp256k1_round_trips() {
+        let encoded = encode_algo_id(AlgoId::Secp256k1);
+        assert_eq!(decode_algo_id(&encoded).unwrap(), AlgoId::Secp256k1);
+    }
+
+    #[test]
+    fn algo_id_all_variants_round_trip() {
+        for v in [
+            AlgoId::Secp256k1,
+            AlgoId::Ed25519,
+            AlgoId::Bls12_381,
+            AlgoId::MlDsa65,
+            AlgoId::SlhDsa128s,
+            AlgoId::Falcon512,
+            AlgoId::HybridSecpMlDsa,
+        ] {
+            let encoded = encode_algo_id(v);
+            assert_eq!(decode_algo_id(&encoded).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn algo_id_decode_rejects_unknown_byte() {
+        let bad = [0x81, 0xFF];
+        assert!(decode_algo_id(&bad).is_err());
     }
 }
