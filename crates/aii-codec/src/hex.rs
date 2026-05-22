@@ -54,6 +54,41 @@ pub fn decode_bytes(s: &str) -> Result<Vec<u8>, HexError> {
     })
 }
 
+use aii_types::U256;
+
+/// Encode a `U256` quantity in ETH JSON-RPC format:
+///
+/// - The value zero serializes as `"0x0"` (exactly one digit).
+/// - Any non-zero value serializes as `0x` + minimal lowercase hex with **no**
+///   leading zeros (e.g. `U256::from(255)` → `"0xff"`).
+#[must_use]
+pub fn encode_quantity(n: U256) -> String {
+    if n.is_zero() {
+        return String::from("0x0");
+    }
+    let raw = format!("{n:x}");
+    let mut out = String::with_capacity(2 + raw.len());
+    out.push_str("0x");
+    out.push_str(&raw);
+    out
+}
+
+/// Decode a `0x`-prefixed minimal-hex quantity. Accepts `"0x0"`; rejects any
+/// other leading-zero form per the ETH JSON-RPC quantity convention.
+pub fn decode_quantity(s: &str) -> Result<U256, HexError> {
+    let body = s.strip_prefix("0x").ok_or(HexError::MissingPrefix)?;
+    if body.is_empty() {
+        return Err(HexError::OddLength(0));
+    }
+    if body.len() > 1 && body.starts_with('0') {
+        return Err(HexError::InvalidChar { ch: '0', pos: 2 });
+    }
+    U256::from_str_radix(body, 16).map_err(|_| {
+        let ch = body.chars().next().unwrap_or('?');
+        HexError::InvalidChar { ch, pos: 2 }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +140,42 @@ mod tests {
     fn decode_rejects_invalid_chars() {
         let err = decode_bytes("0xzz").unwrap_err();
         assert_eq!(err, HexError::InvalidChar { ch: 'z', pos: 2 });
+    }
+
+    #[test]
+    fn quantity_zero_encodes_as_0x0() {
+        assert_eq!(encode_quantity(U256::ZERO), "0x0");
+    }
+
+    #[test]
+    fn quantity_strips_leading_zeros() {
+        assert_eq!(encode_quantity(U256::from(0x0FFu64)), "0xff");
+        assert_eq!(encode_quantity(U256::from(1u64)), "0x1");
+        assert_eq!(encode_quantity(U256::from(0x1234u64)), "0x1234");
+    }
+
+    #[test]
+    fn quantity_round_trip_for_typical_values() {
+        for n in [0u64, 1, 0xFF, 0x1234, u64::MAX] {
+            let v = U256::from(n);
+            assert_eq!(decode_quantity(&encode_quantity(v)).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn quantity_rejects_padded_leading_zero() {
+        assert!(matches!(
+            decode_quantity("0x01"),
+            Err(HexError::InvalidChar { .. })
+        ));
+        assert!(matches!(
+            decode_quantity("0x00"),
+            Err(HexError::InvalidChar { .. })
+        ));
+    }
+
+    #[test]
+    fn quantity_rejects_empty_body() {
+        assert_eq!(decode_quantity("0x"), Err(HexError::OddLength(0)));
     }
 }
