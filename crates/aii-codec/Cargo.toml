@@ -1,0 +1,28 @@
+[package]
+name = "aii-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "RLP / SSZ / JSON-RPC codecs for the AII protocol types"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+ssz_rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+quickcheck = { workspace = true }
