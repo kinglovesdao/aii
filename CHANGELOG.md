@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency graph, interface-locking policy, and security/audit plan aligned with docs
   04/08/10 of the reference set.
 
+## [0.0.2] — 2026-05-22
+
+### Added
+- New crate `aii-codec` with RLP / SSZ / JSON-RPC hex codecs.
+  - RLP impls for `H256`, `Address`, `AlgoId`, `SignedTx`.
+  - SSZ impls for `H256`, `Address`, `AlgoId`, `BlsPubKey`, `BlsSignature`, `SignedTx`.
+  - ETH JSON-RPC hex helpers (`bytes_hex` / `quantity` / `hex_h256` / `hex_address` serde modules).
+  - Local `SszError` (insulates from ssz_rs non-exhaustive-enum drift).
+  - `CodecError` umbrella with `From` for `alloy_rlp::Error` / `SszError` / `serde_json::Error` / `HexError`.
+  - 52 unit tests + 11 property tests.
+- Workspace deps: `alloy-rlp 0.3`, `ssz_rs 0.9`, `serde_json 1`, `hex 0.4`.
+
+### Changed
+- Workspace version 0.0.1 → 0.0.2.
+
 ## [0.0.1] — 2026-05-21
 
 ### Added
