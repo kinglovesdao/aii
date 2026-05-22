@@ -1,6 +1,6 @@
 //! Property-based tests for `aii-types`.
 
-use aii_types::{AlgoId, BlsPubKey, BlsSignature, H256, SignedTx, U256};
+use aii_types::{AlgoId, BlsPubKey, BlsSignature, SignedTx, H256, U256};
 use proptest::prelude::*;
 
 proptest! {

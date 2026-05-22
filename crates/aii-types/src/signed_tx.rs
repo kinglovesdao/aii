@@ -27,12 +27,7 @@ pub struct SignedTx {
 
 impl SignedTx {
     /// Construct a new envelope.
-    pub fn new(
-        algo_id: AlgoId,
-        pubkey: Vec<u8>,
-        signature: Vec<u8>,
-        payload: Vec<u8>,
-    ) -> Self {
+    pub fn new(algo_id: AlgoId, pubkey: Vec<u8>, signature: Vec<u8>, payload: Vec<u8>) -> Self {
         Self {
             algo_id,
             pubkey,
@@ -88,12 +83,7 @@ mod tests {
 
     #[test]
     fn different_algo_id_in_same_struct() {
-        let pq_tx = SignedTx::new(
-            AlgoId::MlDsa65,
-            vec![0x00; 1952],
-            vec![0x00; 3309],
-            vec![],
-        );
+        let pq_tx = SignedTx::new(AlgoId::MlDsa65, vec![0x00; 1952], vec![0x00; 3309], vec![]);
         assert!(pq_tx.algo_id.quantum_safe());
         assert_eq!(pq_tx.wire_size(), 1 + 1952 + 3309);
     }

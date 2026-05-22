@@ -51,8 +51,8 @@ mod tests {
     #[test]
     fn from_pubkey_hash_takes_last_20_bytes() {
         let mut hash_bytes = [0u8; 32];
-        for i in 12..32 {
-            hash_bytes[i] = (i - 11) as u8;
+        for (i, b) in hash_bytes.iter_mut().enumerate().skip(12) {
+            *b = (i - 11) as u8;
         }
         let addr = Address::from_pubkey_hash(H256::new(hash_bytes));
         let expected: [u8; 20] = std::array::from_fn(|i| (i + 1) as u8);

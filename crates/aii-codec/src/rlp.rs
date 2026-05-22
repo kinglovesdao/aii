@@ -11,7 +11,7 @@
 //! - `AlgoId`: 1-byte integer (RLP short string of length 1).
 //! - `SignedTx`: 4-element RLP list `[algo_id, pubkey, signature, payload]`.
 
-use aii_types::{Address, AlgoId, H256, SignedTx};
+use aii_types::{Address, AlgoId, SignedTx, H256};
 use alloy_rlp::{Decodable, Encodable};
 
 /// Encode an [`H256`] as RLP, returning the bytes.

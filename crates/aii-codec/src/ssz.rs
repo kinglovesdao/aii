@@ -5,7 +5,7 @@
 //! `SignedTx` is the only variable-length case and uses an SSZ container
 //! (Task 13) with offset-table layout.
 
-use aii_types::{Address, AlgoId, BlsPubKey, BlsSignature, H256, SignedTx};
+use aii_types::{Address, AlgoId, BlsPubKey, BlsSignature, SignedTx, H256};
 
 /// Encode an [`H256`] as 32-byte SSZ-serialized bytes (an SSZ Vector<u8, 32>).
 #[must_use]
@@ -143,9 +143,8 @@ pub fn encode_signed_tx(tx: &SignedTx) -> Vec<u8> {
     let off2 = off1 + tx.pubkey.len() as u32;
     let off3 = off2 + tx.signature.len() as u32;
 
-    let mut out = Vec::with_capacity(
-        fixed_part + tx.pubkey.len() + tx.signature.len() + tx.payload.len(),
-    );
+    let mut out =
+        Vec::with_capacity(fixed_part + tx.pubkey.len() + tx.signature.len() + tx.payload.len());
     out.push(tx.algo_id.as_byte());
     out.extend_from_slice(&off1.to_le_bytes());
     out.extend_from_slice(&off2.to_le_bytes());

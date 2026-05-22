@@ -4,7 +4,7 @@
 //! `decode(encode(value)) == value` for each codec.
 
 use aii_codec::{hex, json, rlp, ssz};
-use aii_types::{Address, AlgoId, BlsPubKey, BlsSignature, H256, SignedTx, U256};
+use aii_types::{Address, AlgoId, BlsPubKey, BlsSignature, SignedTx, H256, U256};
 use proptest::prelude::*;
 
 fn algo_id_strategy() -> impl Strategy<Value = AlgoId> {
@@ -55,7 +55,7 @@ proptest! {
     #[test]
     fn rlp_address_round_trip(seed in proptest::array::uniform32(any::<u8>())) {
         let mut a_bytes = [0u8; 20];
-        for i in 0..20 { a_bytes[i] = seed[i]; }
+        a_bytes.copy_from_slice(&seed[..20]);
         let a = Address::new(a_bytes);
         let encoded = rlp::encode_address(&a);
         prop_assert_eq!(rlp::decode_address(&encoded).unwrap(), a);
