@@ -124,6 +124,61 @@ pub fn decode_bls_signature(bytes: &[u8]) -> Result<BlsSignature, SszError> {
     Ok(BlsSignature::new(out))
 }
 
+/// Encode a [`SignedTx`] as an SSZ container with layout:
+///
+/// ```text
+/// container SignedTx {
+///     algo_id  : uint8,                  // fixed 1B
+///     pubkey   : List[byte, MAX_PUBKEY], // variable (offset)
+///     signature: List[byte, MAX_SIG],    // variable (offset)
+///     payload  : List[byte, MAX_PAYLOAD] // variable (offset)
+/// }
+/// ```
+///
+/// Wire layout: `[algo_id (1B), off1 (4B LE), off2 (4B LE), off3 (4B LE), pubkey, signature, payload]`.
+#[must_use]
+pub fn encode_signed_tx(tx: &SignedTx) -> Vec<u8> {
+    let fixed_part: usize = 1 + 4 + 4 + 4;
+    let off1 = fixed_part as u32;
+    let off2 = off1 + tx.pubkey.len() as u32;
+    let off3 = off2 + tx.signature.len() as u32;
+
+    let mut out = Vec::with_capacity(
+        fixed_part + tx.pubkey.len() + tx.signature.len() + tx.payload.len(),
+    );
+    out.push(tx.algo_id.as_byte());
+    out.extend_from_slice(&off1.to_le_bytes());
+    out.extend_from_slice(&off2.to_le_bytes());
+    out.extend_from_slice(&off3.to_le_bytes());
+    out.extend_from_slice(&tx.pubkey);
+    out.extend_from_slice(&tx.signature);
+    out.extend_from_slice(&tx.payload);
+    out
+}
+
+/// Decode an SSZ-encoded [`SignedTx`].
+pub fn decode_signed_tx(bytes: &[u8]) -> Result<SignedTx, SszError> {
+    let fixed_part: usize = 1 + 4 + 4 + 4;
+    if bytes.len() < fixed_part {
+        return Err(SszError::InvalidLength {
+            expected: fixed_part,
+            actual: bytes.len(),
+        });
+    }
+    let algo_id = AlgoId::from_byte(bytes[0]).map_err(|_| SszError::InvalidByte(bytes[0]))?;
+    let off1 = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+    let off2 = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let off3 = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+
+    if off1 != fixed_part || off2 < off1 || off3 < off2 || off3 > bytes.len() {
+        return Err(SszError::BadOffsetTable);
+    }
+    let pubkey = bytes[off1..off2].to_vec();
+    let signature = bytes[off2..off3].to_vec();
+    let payload = bytes[off3..].to_vec();
+    Ok(SignedTx::new(algo_id, pubkey, signature, payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +245,48 @@ mod tests {
         let encoded = encode_bls_signature(&s);
         assert_eq!(encoded.len(), 96);
         assert_eq!(decode_bls_signature(&encoded).unwrap(), s);
+    }
+
+    fn dummy_tx() -> SignedTx {
+        SignedTx::new(
+            AlgoId::Secp256k1,
+            vec![0xAA; 33],
+            vec![0xBB; 65],
+            vec![0xCC; 100],
+        )
+    }
+
+    #[test]
+    fn signed_tx_round_trips() {
+        let tx = dummy_tx();
+        let encoded = encode_signed_tx(&tx);
+        assert_eq!(decode_signed_tx(&encoded).unwrap(), tx);
+    }
+
+    #[test]
+    fn signed_tx_encoded_length_matches_wire_size_plus_offsets() {
+        let tx = dummy_tx();
+        // wire_size from aii-types is 1 + 33 + 65 + 100 = 199 (no offsets).
+        // SSZ adds 3 × 4-byte offsets = 12 extra.
+        let encoded = encode_signed_tx(&tx);
+        assert_eq!(encoded.len(), 199 + 12);
+    }
+
+    #[test]
+    fn signed_tx_decode_rejects_truncated_input() {
+        let truncated = vec![0u8; 8];
+        assert!(decode_signed_tx(&truncated).is_err());
+    }
+
+    #[test]
+    fn signed_tx_round_trips_with_pq_sizes() {
+        let pq_tx = SignedTx::new(
+            AlgoId::MlDsa65,
+            vec![0x11; 1952],
+            vec![0x22; 3309],
+            vec![0x33; 256],
+        );
+        let encoded = encode_signed_tx(&pq_tx);
+        assert_eq!(decode_signed_tx(&encoded).unwrap(), pq_tx);
     }
 }
