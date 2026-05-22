@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Workspace design spec at `docs/superpowers/specs/2026-05-21-aii-core-design.md`:
+  24-crate roadmap (M0 stones → M1 state/exec → M2 consensus/entrypoints → M3 extensions),
+  dependency graph, interface-locking policy, and security/audit plan aligned with docs
+  04/08/10 of the reference set.
+
 ## [0.0.1] — 2026-05-21
 
 ### Added
