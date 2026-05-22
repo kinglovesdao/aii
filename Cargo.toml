@@ -15,7 +15,7 @@ authors = ["AII Network contributors"]
 
 [workspace.dependencies]
 alloy-primitives = { version = "0.8", default-features = false, features = ["serde"] }
-alloy-rlp = { version = "0.3", default-features = false }
+alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
 ssz_rs = { version = "0.9", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
