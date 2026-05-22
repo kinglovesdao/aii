@@ -11,7 +11,7 @@
 //! - `AlgoId`: 1-byte integer (RLP short string of length 1).
 //! - `SignedTx`: 4-element RLP list `[algo_id, pubkey, signature, payload]`.
 
-use aii_types::{Address, AlgoId, H256};
+use aii_types::{Address, AlgoId, H256, SignedTx};
 use alloy_rlp::{Decodable, Encodable};
 
 /// Encode an [`H256`] as RLP, returning the bytes.
@@ -70,6 +70,62 @@ pub fn decode_algo_id(mut bytes: &[u8]) -> Result<AlgoId, alloy_rlp::Error> {
     AlgoId::from_byte(v[0]).map_err(|_| alloy_rlp::Error::Custom("unknown AlgoId byte"))
 }
 
+/// Encode a [`SignedTx`] as RLP. Wire layout is a 4-element list:
+/// `[algo_id (1 byte), pubkey, signature, payload]`.
+#[must_use]
+pub fn encode_signed_tx(tx: &SignedTx) -> alloy_rlp::bytes::BytesMut {
+    use alloy_rlp::Header;
+
+    let inner_len = [tx.algo_id.as_byte()].as_slice().length()
+        + tx.pubkey.as_slice().length()
+        + tx.signature.as_slice().length()
+        + tx.payload.as_slice().length();
+
+    let mut buf = alloy_rlp::bytes::BytesMut::with_capacity(inner_len + 8);
+    let header = Header {
+        list: true,
+        payload_length: inner_len,
+    };
+    header.encode(&mut buf);
+    [tx.algo_id.as_byte()].as_slice().encode(&mut buf);
+    tx.pubkey.as_slice().encode(&mut buf);
+    tx.signature.as_slice().encode(&mut buf);
+    tx.payload.as_slice().encode(&mut buf);
+    buf
+}
+
+/// Decode an RLP-encoded [`SignedTx`].
+pub fn decode_signed_tx(mut bytes: &[u8]) -> Result<SignedTx, alloy_rlp::Error> {
+    use alloy_rlp::Header;
+
+    let header = Header::decode(&mut bytes)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    if bytes.len() < header.payload_length {
+        return Err(alloy_rlp::Error::InputTooShort);
+    }
+    let (inner_slice, _rest) = bytes.split_at(header.payload_length);
+    let mut inner = inner_slice;
+
+    let algo_bytes = <alloy_rlp::bytes::Bytes as Decodable>::decode(&mut inner)?;
+    if algo_bytes.len() != 1 {
+        return Err(alloy_rlp::Error::UnexpectedLength);
+    }
+    let algo_id = AlgoId::from_byte(algo_bytes[0])
+        .map_err(|_| alloy_rlp::Error::Custom("unknown AlgoId byte"))?;
+
+    let pubkey = <alloy_rlp::bytes::Bytes as Decodable>::decode(&mut inner)?.to_vec();
+    let signature = <alloy_rlp::bytes::Bytes as Decodable>::decode(&mut inner)?.to_vec();
+    let payload = <alloy_rlp::bytes::Bytes as Decodable>::decode(&mut inner)?.to_vec();
+
+    if !inner.is_empty() {
+        return Err(alloy_rlp::Error::Custom("trailing bytes in SignedTx RLP"));
+    }
+
+    Ok(SignedTx::new(algo_id, pubkey, signature, payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,7 +159,7 @@ mod tests {
     #[test]
     fn h256_decode_rejects_wrong_length() {
         let mut bad = vec![0x9f];
-        bad.extend(std::iter::repeat(0u8).take(31));
+        bad.extend(std::iter::repeat_n(0u8, 31));
         assert!(decode_h256(&bad).is_err());
     }
 
@@ -124,7 +180,7 @@ mod tests {
     #[test]
     fn address_decode_rejects_wrong_length() {
         let mut bad = vec![0x93];
-        bad.extend(std::iter::repeat(0u8).take(19));
+        bad.extend(std::iter::repeat_n(0u8, 19));
         assert!(decode_address(&bad).is_err());
     }
 
@@ -154,5 +210,40 @@ mod tests {
     fn algo_id_decode_rejects_unknown_byte() {
         let bad = [0x81, 0xFF];
         assert!(decode_algo_id(&bad).is_err());
+    }
+
+    fn dummy_tx() -> SignedTx {
+        SignedTx::new(
+            AlgoId::Secp256k1,
+            vec![0xAA; 33],
+            vec![0xBB; 65],
+            vec![0xCC; 100],
+        )
+    }
+
+    #[test]
+    fn signed_tx_round_trips() {
+        let tx = dummy_tx();
+        let encoded = encode_signed_tx(&tx);
+        let decoded = decode_signed_tx(&encoded).unwrap();
+        assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn signed_tx_decode_rejects_non_list_header() {
+        let bad = [0x84, 0x01, 0x02, 0x03, 0x04];
+        assert!(decode_signed_tx(&bad).is_err());
+    }
+
+    #[test]
+    fn signed_tx_round_trips_with_pq_sizes() {
+        let pq_tx = SignedTx::new(
+            AlgoId::MlDsa65,
+            vec![0x11; 1952],
+            vec![0x22; 3309],
+            vec![0x33; 256],
+        );
+        let encoded = encode_signed_tx(&pq_tx);
+        assert_eq!(decode_signed_tx(&encoded).unwrap(), pq_tx);
     }
 }
