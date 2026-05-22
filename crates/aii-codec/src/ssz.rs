@@ -69,6 +69,61 @@ pub enum SszError {
     BadOffsetTable,
 }
 
+/// Encode an [`AlgoId`] as a 1-byte SSZ uint8.
+#[must_use]
+pub fn encode_algo_id(a: AlgoId) -> Vec<u8> {
+    vec![a.as_byte()]
+}
+
+/// Decode an SSZ-encoded [`AlgoId`].
+pub fn decode_algo_id(bytes: &[u8]) -> Result<AlgoId, SszError> {
+    if bytes.len() != 1 {
+        return Err(SszError::InvalidLength {
+            expected: 1,
+            actual: bytes.len(),
+        });
+    }
+    AlgoId::from_byte(bytes[0]).map_err(|_| SszError::InvalidByte(bytes[0]))
+}
+
+/// Encode a [`BlsPubKey`] (48-byte SSZ Vector<u8, 48>).
+#[must_use]
+pub fn encode_bls_pubkey(k: &BlsPubKey) -> Vec<u8> {
+    k.as_bytes().to_vec()
+}
+
+/// Decode a 48-byte SSZ payload into a [`BlsPubKey`].
+pub fn decode_bls_pubkey(bytes: &[u8]) -> Result<BlsPubKey, SszError> {
+    if bytes.len() != 48 {
+        return Err(SszError::InvalidLength {
+            expected: 48,
+            actual: bytes.len(),
+        });
+    }
+    let mut out = [0u8; 48];
+    out.copy_from_slice(bytes);
+    Ok(BlsPubKey::new(out))
+}
+
+/// Encode a [`BlsSignature`] (96-byte SSZ Vector<u8, 96>).
+#[must_use]
+pub fn encode_bls_signature(s: &BlsSignature) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+/// Decode a 96-byte SSZ payload into a [`BlsSignature`].
+pub fn decode_bls_signature(bytes: &[u8]) -> Result<BlsSignature, SszError> {
+    if bytes.len() != 96 {
+        return Err(SszError::InvalidLength {
+            expected: 96,
+            actual: bytes.len(),
+        });
+    }
+    let mut out = [0u8; 96];
+    out.copy_from_slice(bytes);
+    Ok(BlsSignature::new(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +154,41 @@ mod tests {
     fn address_decode_rejects_wrong_length() {
         let bad = vec![0; 19];
         assert!(decode_address(&bad).is_err());
+    }
+
+    #[test]
+    fn algo_id_all_variants_round_trip() {
+        for v in [
+            AlgoId::Secp256k1,
+            AlgoId::Ed25519,
+            AlgoId::Bls12_381,
+            AlgoId::MlDsa65,
+            AlgoId::SlhDsa128s,
+            AlgoId::Falcon512,
+            AlgoId::HybridSecpMlDsa,
+        ] {
+            assert_eq!(decode_algo_id(&encode_algo_id(v)).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn algo_id_decode_rejects_unknown_byte() {
+        assert!(decode_algo_id(&[0xFF]).is_err());
+    }
+
+    #[test]
+    fn bls_pubkey_round_trips() {
+        let k = BlsPubKey::new([0x77; 48]);
+        let encoded = encode_bls_pubkey(&k);
+        assert_eq!(encoded.len(), 48);
+        assert_eq!(decode_bls_pubkey(&encoded).unwrap(), k);
+    }
+
+    #[test]
+    fn bls_signature_round_trips() {
+        let s = BlsSignature::new([0x88; 96]);
+        let encoded = encode_bls_signature(&s);
+        assert_eq!(encoded.len(), 96);
+        assert_eq!(decode_bls_signature(&encoded).unwrap(), s);
     }
 }
