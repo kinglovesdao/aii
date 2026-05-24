@@ -17,6 +17,7 @@ members = [
     "crates/aii-rpc",
     "crates/aii-node",
     "crates/aii-evm",
+    "crates/aii-net-p2p",
 ]
 
 [workspace.package]
@@ -55,6 +56,7 @@ aii-microchain = { path = "crates/aii-microchain", version = "0.0.8" }
 aii-rpc = { path = "crates/aii-rpc", version = "0.0.8" }
 aii-node = { path = "crates/aii-node", version = "0.0.8" }
 aii-evm = { path = "crates/aii-evm", version = "0.0.8" }
+aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.8" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
