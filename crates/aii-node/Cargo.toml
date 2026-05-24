@@ -24,6 +24,7 @@ aii-rpc = { workspace = true }
 aii-metrics = { workspace = true }
 aii-block = { workspace = true }
 aii-state = { workspace = true }
+hex = { workspace = true }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 async-trait = "0.1"
 serde = { workspace = true }
