@@ -5,6 +5,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.24] — 2026-05-24
+
+### Added — sub-chain ↔ state integration bridge
+
+A 26th workspace crate, `aii-wasm-state`, that joins the v0.0.22 sub-chain
+VM to the v0.0.20 persistent `StateDb`. With this in place, a real WASM
+contract can read state populated by earlier transactions and have its
+post-call writes committed back — closing the loop between
+`aii-wasm`'s `HostState` trait and `aii-state`'s slot store.
+
+#### aii-wasm-state (new crate)
+
+- `StateDbHost<B>` — thin wrapper over `Arc<StateDb<B>>` implementing
+  `aii_wasm::HostState`. Storage decode errors collapse to `H256::ZERO`
+  at the trait surface (the trait returns plain `H256`; verified-state
+  invariants make non-decodable slots unreachable in practice).
+- `commit_effects(db, &effects)` — applies `effects.storage_writes`
+  via `StateDb::storage_put`. Logs are intentionally not touched — they
+  belong on a receipt-index surface, not a state CF.
+- 8 RED→GREEN tests including two end-to-end WASM cases: (a) a contract
+  reads a pre-populated slot through the bridge; (b) a write contract
+  + commit + a separate reader contract observes the persisted value.
+
+#### Why a new crate
+
+`aii-wasm` stays free of the storage stack (RocksDB / KvBackend), and
+`aii-state` stays free of wasmtime — neither acquires a new transitive
+dependency. The bridge is the smallest adapter that lets them
+cooperate.
+
+### Scope
+
+This release wires read/write through, but does NOT:
+- introduce cross-contract storage access,
+- persist `effects.logs` to a receipt index (deferred),
+- integrate with the EVM execution path (the EVM has its own
+  `RevmDb` adapter since v0.0.20; the two paths remain parallel).
+
 ## [0.0.23] — 2026-05-24
 
 ### Added — BFT-PoS stage 1 finality state machine
