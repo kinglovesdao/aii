@@ -12,4 +12,8 @@ pub enum StateError {
     /// RLP encode/decode failure.
     #[error("rlp: {0}")]
     Rlp(#[from] alloy_rlp::Error),
+
+    /// Stored value did not match the expected on-disk format.
+    #[error("decode: {0}")]
+    Decode(String),
 }
