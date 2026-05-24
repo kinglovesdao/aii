@@ -1,0 +1,23 @@
+[package]
+name = "aii-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Cryptographic primitives for the AII protocol (Keccak-256, secp256k1, BLS12-381, VRF)"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[dev-dependencies]
+proptest = { workspace = true }

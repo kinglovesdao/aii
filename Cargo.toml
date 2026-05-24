@@ -3,12 +3,13 @@ resolver = "2"
 members = [
     "crates/aii-types",
     "crates/aii-codec",
+    "crates/aii-crypto",
 ]
 
 [workspace.package]
 version = "0.0.2"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/AII-Network/aii"
 authors = ["AII Network contributors"]
@@ -27,6 +28,7 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 aii-types = { path = "crates/aii-types", version = "0.0.2" }
 aii-codec = { path = "crates/aii-codec", version = "0.0.2" }
+aii-crypto = { path = "crates/aii-crypto", version = "0.0.2" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
