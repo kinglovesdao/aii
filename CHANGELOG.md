@@ -5,6 +5,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10] — 2026-05-24
+
+### Added — User-facing surfaces + AI integration
+- `aii-onboarding` — read-only hardware probe + Tier (T1–T7) recommender
+  per 《04 架构设计文档》§14.4. `detect()` reads sysinfo; `score()` collapses
+  to 0–100 with calibrated weights; `recommend_tier()` maps to Tier.
+  11 unit tests across reference profiles + classify-disk + score-cap.
+- `aii-cli` — user-facing CLI **`aii`** built on `clap` v4:
+  - `aii status` / `aii chain-id` — query a running node via JSON-RPC
+  - `aii account new` — generate a fresh secp256k1 address (key dropped)
+  - `aii tier` — run the onboarding probe locally
+  - `--rpc <URL>` / `--json` global flags
+  4 lib tests + verified live against running aiid binary.
+- `aii-mcp` — Model Context Protocol server **`aii-mcp`** over stdio:
+  - MCP 2024-11-05 (`initialize` / `tools/list` / `tools/call`
+    / `notifications/initialized`)
+  - 4 read-only tools: `chain_status` / `chain_id` / `account_new`
+    / `tier_recommend`
+  - Plugs into Claude Desktop / Claude Code / Cursor / Cline through
+    standard `claude_desktop_config.json` `mcpServers` block.
+  7 in-process tests + stdio smoke verified end-to-end.
+
+### Notes
+- Day-0 footprint v0.0.9 stays intact; v0.0.10 adds **3 user-facing
+  crates** described in 《04 架构设计文档》§14 + 《12 AI 集成》but not in the
+  Day-0 spec §3 list. They are leaf modules — no Day-0 crate depends
+  on them.
+- 21 crates total; 54 test groups workspace-wide.
+- aii-mcp is the differentiating "AI-native chain" capability called
+  out in CLAUDE.md.
+
 ## [0.0.9] — 2026-05-24
 
 ### Added — Day-0 completion (18 of 18 crates) 🎉
