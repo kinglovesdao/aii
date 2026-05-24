@@ -1,0 +1,24 @@
+[package]
+name = "aii-net-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Peer-to-peer transport (TCP + length-prefixed framing) for AII; scoped v0.0.9 — full devp2p later."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-codec = { workspace = true }
+alloy-rlp = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "net", "time", "io-util"] }
