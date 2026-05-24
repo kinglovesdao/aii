@@ -5,6 +5,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9] — 2026-05-24
+
+### Added — Day-0 completion (18 of 18 crates) 🎉
+- `aii-state::mpt_root` — **full** Modified Merkle Patricia Tree
+  algorithm (hex-prefix encoding + leaf / extension / branch nodes +
+  RLP-length pruning per Yellow Paper Appendix D). 11 unit tests
+  covering empty / single / multi-key / extension-merge / branch-split
+  / 100-key stress. The v0.0.6 `unimplemented!()` placeholder is gone.
+- `aii-evm` (M1 #7, scoped) — `execute_transfer` runs value-transfer
+  txs against `StateDb`: nonce + balance check, debit, credit, nonce
+  bump, returns `Receipt`. EOA→EOA only; contract paths return
+  `ExecError::ContractCallsNotYetSupported` until the `revm`
+  integration lands. 6 unit tests (happy path, nonce mismatch,
+  insufficient balance, CREATE rejection, contract-recipient
+  rejection, nonce atomicity).
+- `aii-net-p2p` (M1 #8, scoped) — TCP listener + dial + length-prefixed
+  RLP frame codec (`u32` BE prefix, ≤ 1 MiB). `Message::{Hello, Ping,
+  Pong, Disconnect}`. 6 tests including two real-TCP end-to-end
+  exchanges (Hello / Ping-Pong). Full devp2p discovery + RLPx lands
+  in a later release.
+- `aii-net-sync` (M1 #9) — pure state-machine `SyncEngine`
+  (`Idle → Headers → Bodies → Done`) consuming `Event`s and emitting
+  `Action`s. Contiguity / hash-order validation. 8 tests covering
+  all transitions + error paths.
+
+### Changed
+- Workspace version 0.0.8 → 0.0.9.
+
+### Notes — **Day-0 footprint complete (18 of 18 crates)**
+- M0 ×4 — aii-types / aii-codec / aii-crypto / aii-storage
+- M1 ×5 — aii-block / aii-state (full MPT) / aii-evm / aii-net-p2p
+  / aii-net-sync
+- M2 ×9 — aii-consensus-iface / aii-microchain / aii-net-txpool /
+  aii-rpc / aii-wallet / aii-vnode / aii-config / aii-metrics
+  / aii-node (+ `aiid` binary)
+- 44 test groups; ~340 tests pass under
+  `cargo test --workspace --all-features`.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  clean. `cargo doc --workspace` clean.
+- aiid binary verified live: RocksDB opens, RPC listens, eth_chainId
+  returns `"0x63"`, aii_status reports `{"chain_id":99,…}`.
+- M2 *Day-1+* extension crates (aii-mcp / aii-wasm / aii-consensus-
+  plugins / aii-crosschain / aii-bindings / aii-onboarding /
+  full aii-consensus-bft engine) intentionally remain post-Day-0
+  per spec §3.4. Day-0 footprint is now **frozen**.
+
 ## [0.0.8] — 2026-05-24
 
 ### Added — RPC + node binary
