@@ -4,7 +4,7 @@ use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
 
 /// 32-byte hash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct H256(pub [u8; 32]);
 
