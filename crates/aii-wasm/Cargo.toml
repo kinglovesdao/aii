@@ -1,0 +1,20 @@
+[package]
+name = "aii-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WebAssembly sub-chain VM for AII — wasmtime-backed module loading, fuel-metered execution, host-call surface."
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types.workspace = true
+thiserror.workspace = true
+wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
+
+[dev-dependencies]
+wat = "1"

@@ -5,6 +5,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.19] — 2026-05-24
+
+### Added — aii-wasm scoped sub-chain VM
+
+- New crate `aii-wasm` providing a wasmtime-backed WebAssembly runtime
+  for AII sub-chains. This release intentionally exposes only the
+  surface needed to validate the gas/fuel model end-to-end — host
+  imports, richer signatures, and module caching are deferred.
+  - `WasmRuntime::new()` constructs a wasmtime `Engine` with
+    `consume_fuel(true)` enabled. The engine is reusable across many
+    modules and many calls.
+  - `WasmRuntime::instantiate(wasm, fuel)` validates + compiles the
+    binary, opens a fresh `Store`, sets the per-call fuel budget, and
+    returns a `WasmInstance`. Invalid bytes are rejected with
+    `WasmError::BadModule`.
+  - `WasmInstance::call_i32(name, args)` invokes an exported
+    `i32, … → i32` function. Strict arity / single-i32-result
+    checking on entry; trap classification on exit. Out-of-fuel,
+    missing export, and signature mismatch surface as discrete error
+    variants for clean caller branching.
+  - `WasmInstance::fuel_remaining()` reads the store's fuel reserve
+    after a call so consensus can charge the actual consumption back
+    to the transaction.
+- 9 unit tests covering: runtime construction, module validation
+  (good + garbage), `add` happy path with positive and negative i32
+  arguments, missing-export and wrong-arity rejection, fuel decrease
+  after execution, and infinite-loop trapping as `OutOfFuel`.
+
+### Gas model
+
+AII maps `1 tx-gas = 1 wasm-fuel-unit` for now; the consensus layer
+allocates the budget per call. This is a parameter that the chain
+governance — once defined — can re-tune without touching this crate.
+
+### Out of scope (deferred)
+
+- Richer call signatures (i64, f32, multi-return) — v0.0.20+
+- Host imports (state read/write, log, transfer to other addresses) —
+  v0.0.20+
+- WASI / wasi-preview2 — explicitly never on the consensus path
+- Module caching / AOT compilation — performance work, not behavior
+
+### Dependencies
+
+- New: `wasmtime = "26"` (default-features off, `cranelift + runtime`
+  only) plus `wat` as a dev-dependency for tests. wasmtime pulls in
+  cranelift which adds a one-time ~12 s compile cost the first time
+  `cargo build` runs after this update.
+
 ## [0.0.18] — 2026-05-24
 
 ### Added — aii-crosschain (scoped HTLC)
