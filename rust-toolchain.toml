@@ -1,4 +1,8 @@
 [toolchain]
-channel = "1.83"
+# Bumped from 1.83 to 1.94.1 on 2026-05-23: ecosystem moved to edition2024
+# (getrandom 0.4, indexmap 2.14, ruint 1.18, ...), requiring Rust ≥ 1.85.
+# Pin is a concrete minor to avoid rustup auto-channel-sync on each build.
+# CI may bump as `stable` advances.
+channel = "1.94.1"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
 profile = "default"
