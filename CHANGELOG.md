@@ -5,6 +5,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.22] — 2026-05-24
+
+### Added — sub-chain VM host imports
+
+`aii-wasm` grows the six `env.*` host functions that turn the v0.0.19
+wasmtime VM from a pure calculator into a stateful sub-chain contract
+runtime. Reads consult a per-call overlay, then fall through to the
+chain's persisted state via the new `HostState` trait. Writes, logs and
+abort messages accumulate in `HostEffects` and are returned to the
+caller only on success — any revert path drops them.
+
+#### aii-wasm
+
+- New `WasmModule` — compiled binary reusable across many host-aware
+  calls; pairs with the new `WasmRuntime::compile(wasm)`.
+- New `CallContext { caller, callee, block_number, block_timestamp }`
+  passed in per call.
+- New `HostState` trait — single method `storage_get(addr, slot)` —
+  read-only view into persisted chain state. Implementations are
+  trivial wrappers over `aii-state::StateDb`; the trait is tiny on
+  purpose so tests can mock it without dragging in storage.
+- New `HostEffects { storage_writes, logs }` — sorted by slot for
+  determinism. Repeat writes to the same slot collapse to the last
+  value.
+- New `WasmRuntime::call_with_host(module, fuel, name, args, ctx, host)`
+  → `HostCallResult { return_value, effects, fuel_remaining }`.
+- Six host imports under module `env`:
+  - `storage_read(slot_ptr, out_ptr)` — overlay first, then `HostState`.
+  - `storage_write(slot_ptr, value_ptr)` — into overlay only.
+  - `caller(out_ptr)` / `self_address(out_ptr)` — 20-byte writes.
+  - `log(data_ptr, data_len)` — append to effects.
+  - `abort(msg_ptr, msg_len)` — record message (≤ 256 bytes) and trap.
+- New `WasmError::Aborted(String)` variant for explicit contract revert.
+- 14 RED→GREEN tests using hand-written WAT modules covering
+  read/write round-trip, host-state fall-through, write collection,
+  same-slot last-write-wins, caller/self_address, log (including
+  zero-length), abort + truncation, per-call effect isolation,
+  out-of-fuel inside a host-call loop, and OOB pointer trapping.
+
+### Scope discipline (unchanged from v0.0.19)
+
+`aii-wasm` is the sub-chain VM only — cross-contract storage access,
+native AII transfers, WASI / wasi-preview2, and AOT/cache are explicit
+non-goals and remain so. Block-context accessors (`block_number`,
+`block_timestamp`) are reserved in `CallContext` but not yet exported
+to WASM; they land when the consensus layer plumbs them through.
+
 ## [0.0.21] — 2026-05-24
 
 ### Added — federated multisig bridge `Vault`

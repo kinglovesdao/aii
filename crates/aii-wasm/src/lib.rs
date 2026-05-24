@@ -34,6 +34,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod host;
+pub use host::{
+    CallContext, HostCallResult, HostEffects, HostState, WasmModule, MAX_ABORT_MSG_LEN,
+};
+
 use thiserror::Error;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
@@ -77,6 +82,11 @@ pub enum WasmError {
     /// Failed to set fuel on the Store (wasmtime returned an error).
     #[error("fuel control failed: {0}")]
     FuelControl(String),
+
+    /// Contract called `env.abort(msg, len)` and reverted with the
+    /// supplied message (truncated to [`MAX_ABORT_MSG_LEN`] bytes).
+    #[error("contract aborted: {0}")]
+    Aborted(String),
 }
 
 /// Owner of the wasmtime engine. Re-use across many modules.
@@ -91,6 +101,13 @@ impl WasmRuntime {
         cfg.consume_fuel(true);
         let engine = Engine::new(&cfg).map_err(|e| WasmError::Engine(e.to_string()))?;
         Ok(Self { engine })
+    }
+
+    /// Borrow the underlying wasmtime [`Engine`] — used by the host
+    /// module to build module-local linkers without re-instantiating
+    /// the engine.
+    pub(crate) const fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// Compile + instantiate a WebAssembly binary with `fuel` units
@@ -169,7 +186,7 @@ impl WasmInstance {
     }
 }
 
-fn classify_trap(func: &str, err: &wasmtime::Error) -> WasmError {
+pub(crate) fn classify_trap(func: &str, err: &wasmtime::Error) -> WasmError {
     // wasmtime distinguishes traps via downcast.
     if let Some(trap) = err.downcast_ref::<wasmtime::Trap>() {
         if matches!(trap, wasmtime::Trap::OutOfFuel) {
