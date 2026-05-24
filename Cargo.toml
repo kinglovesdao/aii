@@ -7,6 +7,7 @@ members = [
     "crates/aii-storage",
     "crates/aii-block",
     "crates/aii-state",
+    "crates/aii-config",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ aii-crypto = { path = "crates/aii-crypto", version = "0.0.6" }
 aii-storage = { path = "crates/aii-storage", version = "0.0.6" }
 aii-block = { path = "crates/aii-block", version = "0.0.6" }
 aii-state = { path = "crates/aii-state", version = "0.0.6" }
+aii-config = { path = "crates/aii-config", version = "0.0.6" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
