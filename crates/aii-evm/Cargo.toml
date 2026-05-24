@@ -20,3 +20,7 @@ aii-storage = { workspace = true }
 aii-crypto = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+revm = "18"
+# revm pulls derive_more transitively without enabling any feature; force the
+# full feature so the macro derives compile.
+derive_more = { version = "1", features = ["full"] }
