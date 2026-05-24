@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Local keystore + transaction signing for AII (secp256k1)."
+description = "Local keystore + transaction signing for AII (secp256k1 + scrypt-encrypted Web3 v3 keystore)."
 readme = "README.md"
 
 [lints]
@@ -19,7 +19,15 @@ aii-block = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 zeroize = { version = "1.8", default-features = false, features = ["zeroize_derive"] }
+scrypt = { version = "0.11", default-features = false, features = ["std"] }
+aes = { version = "0.8", default-features = false }
+ctr = { version = "0.9", default-features = false }
+cipher = { version = "0.4", default-features = false, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+uuid = { version = "1", default-features = false, features = ["v4", "serde", "std"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
-hex = { workspace = true }

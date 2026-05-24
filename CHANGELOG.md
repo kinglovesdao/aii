@@ -5,6 +5,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12] — 2026-05-24
+
+### Added — Encrypted Keystore (Web3 Secret Storage v3)
+- `aii-wallet::EncryptedKeystore` — full Web3 v3 keystore implementation:
+  - **scrypt** KDF (configurable n/r/p; `ScryptParams::light` for tests,
+    `::geth_default` for production)
+  - **AES-128-CTR** cipher with random IV
+  - **Keccak-256 MAC** over `derived_key[16..32] ‖ ciphertext` —
+    verified *before* decryption to surface wrong-password errors cleanly
+  - JSON serde compatible with `geth account import` / MetaMask:
+    `{ version: 3, id: uuid, address, crypto: {...} }`
+  - `encrypt(&LocalWallet, password, params)` / `decrypt(password)`
+  - `to_json()` / `from_json()` round-trip
+  - 8 unit tests (round-trip / wrong-password / JSON / tampered ciphertext
+    / distinct ciphertexts on re-encrypt / version + cipher + kdf rejection)
+- `aii-cli`: two new commands
+  - `aii account new-encrypted --password … --out keystore.json`
+  - `aii account verify --file keystore.json --password …`
+  - 2 new lib tests; live-verified against `aii` binary.
+
+### Changed
+- Workspace version 0.0.11 → 0.0.12.
+- `aii-wallet` deps grow: `scrypt`, `aes`, `ctr`, `cipher`, `serde_json`,
+  `uuid` (v4 + serde).
+
+### Notes
+- BIP-39 mnemonic + BIP-32 HD derivation deferred to v0.0.13 — the
+  keystore alone unlocks `aii-cli`'s `account new-encrypted` + the future
+  `aii-mcp`'s `send_transaction` write-tool (which will accept a
+  keystore + password instead of a raw secret).
+
 ## [0.0.11] — 2026-05-24
 
 ### Added — RPC extension wired to real StateDb

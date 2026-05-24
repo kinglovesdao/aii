@@ -1,7 +1,11 @@
 //! `aii` — user-facing CLI for the AII protocol.
 
-use aii_cli::{run_account_new, run_chain_id, run_status, run_tier, CliError};
+use aii_cli::{
+    run_account_new, run_account_new_encrypted, run_account_verify, run_chain_id, run_status,
+    run_tier, CliError,
+};
 use clap::{Parser, Subcommand};
+use std::fs;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -38,6 +42,25 @@ enum Cmd {
 enum AccountCmd {
     /// Generate a fresh secp256k1 keypair and print the address.
     New,
+    /// Generate a fresh keypair, encrypt it with `--password`, and write
+    /// the JSON keystore to `--out` (or stdout).
+    NewEncrypted {
+        /// Password to encrypt the keystore under.
+        #[arg(long)]
+        password: String,
+        /// Output file path; defaults to stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Verify that the password decrypts the keystore JSON at `--file`.
+    Verify {
+        /// JSON keystore path.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// Password to test.
+        #[arg(long)]
+        password: String,
+    },
 }
 
 #[tokio::main]
@@ -79,6 +102,31 @@ async fn main() -> Result<(), CliError> {
                 );
             } else {
                 println!("address: 0x{}", hex::encode(addr.as_bytes()));
+            }
+        }
+        Cmd::Account {
+            sub: AccountCmd::NewEncrypted { password, out },
+        } => {
+            let json = run_account_new_encrypted(&password)?;
+            if let Some(path) = out {
+                fs::write(&path, &json).map_err(|e| CliError::Client(e.to_string()))?;
+                eprintln!("wrote {}", path.display());
+            } else {
+                println!("{json}");
+            }
+        }
+        Cmd::Account {
+            sub: AccountCmd::Verify { file, password },
+        } => {
+            let json = fs::read_to_string(&file).map_err(|e| CliError::Client(e.to_string()))?;
+            let addr = run_account_verify(&json, &password)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "address": format!("0x{}", hex::encode(addr.as_bytes())), "ok": true })
+                );
+            } else {
+                println!("ok — address: 0x{}", hex::encode(addr.as_bytes()));
             }
         }
         Cmd::Tier => {
