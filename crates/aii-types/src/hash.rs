@@ -13,13 +13,13 @@ impl H256 {
     pub const ZERO: Self = Self([0u8; 32]);
 
     /// Construct from raw 32-byte array.
-    #[must_use] 
+    #[must_use]
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     /// Return a reference to the underlying bytes.
-    #[must_use] 
+    #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

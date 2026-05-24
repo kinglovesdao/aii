@@ -5,6 +5,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6] — 2026-05-24
+
+### Added
+- New crate `aii-state` (M1 #5 — narrow scope):
+  - `Account` — 4-field RLP `[nonce, balance, storage_root, code_hash]`,
+    `Hashable` impl, `Account::EMPTY` constant for fresh EOAs.
+  - `EMPTY_CODE_HASH` constant (= `keccak256(b"")`).
+  - `StateDb<B: KvBackend>` — `Address → Account` store keyed by
+    `keccak256(address)` in `ColumnFamily::State`; `account` / `set_account`
+    / `remove_account` methods.
+  - `mpt_root` placeholder — empty input returns `EMPTY_TRIE_HASH`;
+    non-empty input panics until v0.0.7 lands the full Merkle Patricia
+    Tree algorithm.
+- 12 unit tests across `account` / `trie` / `db` modules.
+
+### Changed
+- Workspace version 0.0.5 → 0.0.6.
+
+### Notes
+- Full MPT (hex-prefix + branch / extension / leaf nodes + RLP-pruning)
+  is deferred to v0.0.7 to keep this PR reviewable.
+- This unblocks `aii-evm` (which needs `Account` and `StateDb` more than
+  it needs trie roots — root computation happens at block-commit time).
+
 ## [0.0.5] — 2026-05-24
 
 ### Added
