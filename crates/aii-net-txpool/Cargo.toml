@@ -1,0 +1,21 @@
+[package]
+name = "aii-net-txpool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Mempool / transaction pool for AII (nonce-ordered, capacity-bounded)."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-block = { workspace = true }
+aii-crypto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
