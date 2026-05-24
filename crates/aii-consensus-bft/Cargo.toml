@@ -1,0 +1,28 @@
+[package]
+name = "aii-consensus-bft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BFT-PoS consensus engine for AII — single-node dev mode in v0.0.15; multi-validator VRF + 2/3 PRE-COMMIT later."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-block = { workspace = true }
+aii-crypto = { workspace = true }
+aii-consensus-iface = { workspace = true }
+aii-vnode = { workspace = true }
+aii-state = { workspace = true }
+aii-config = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+aii-storage = { workspace = true }

@@ -5,6 +5,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15] — 2026-05-24
+
+### Added — `aii-consensus-bft` (scoped) + live block production
+
+- **`aii-consensus-bft`** (M2 #11, scoped) — single-node dev-mode BFT
+  engine:
+  - `DevModeEngine` implements `aii_consensus_iface::Engine` so embedders
+    can swap to a real multi-validator BFT later without API churn.
+  - `produce_block()` builds an empty child block per slot, advances
+    the head, returns `(hash, number, Block)`.
+  - `EngineConfig` (slot_seconds / coinbase / base_fee / gas_limit).
+  - 8 unit tests covering head advance, parent hash linkage, timestamp
+    increment, Engine trait integration.
+- **`aiid` binary** now produces blocks on a background task:
+  - `--produce-blocks` (default `true`) starts the dev producer loop.
+  - `--slot-seconds N` sets the block interval (default 3 s).
+  - `NodeState.set_head` is called every slot — `eth_blockNumber` is no
+    longer permanently `0`.
+- Live-verified end-to-end: `eth_blockNumber` returned `0x0 → 0x2 → 0x4`
+  across 5 seconds at `--slot-seconds 1`; node log emitted
+  `block produced` events with monotonically increasing hashes.
+
+### Changed
+- Workspace version 0.0.14 → 0.0.15 (note: 0.0.14 release tag also moved
+  the workspace.package.version that had drifted to 0.0.13 since 0.0.13
+  was the last release that actually bumped both — 0.0.15 syncs all 22
+  path-dep version constraints).
+
+### Notes — what's NOT yet in this engine (v0.0.16+ targets)
+- VRF-based proposer selection (primitive exists in `aii-crypto::vrf`).
+- PRE-VOTE / PRE-COMMIT gossip over `aii-net-p2p`.
+- BLS aggregate signature over PRE-COMMIT votes.
+- ⅔ stake threshold → single-block instant finality.
+- Multi-validator V-set rotation (`aii-vnode` already tracks stake).
+- Block-body inclusion of txs from `aii-net-txpool`.
+
+The trait surface (`Engine` / `Proposer` / `Voter` / `Validation`) is
+already wired through `aii-consensus-iface`, so each future addition
+is additive and the embedder API stays stable.
+
 ## [0.0.14] — 2026-05-24
 
 ### Added — `aii-mcp` keystore + mnemonic tools (4 new MCP tools)
