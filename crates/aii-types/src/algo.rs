@@ -1,4 +1,4 @@
-//! AlgoId — signature-algorithm identifier (1 byte).
+//! `AlgoId` — signature-algorithm identifier (1 byte).
 //!
 //! Implements spec decision D7 (multi-sig Registry). Every transaction and
 //! every V-node stake operation carries an `AlgoId` as the first byte of its
@@ -35,6 +35,7 @@ pub enum AlgoId {
 
 impl AlgoId {
     /// Wire-format byte.
+    #[must_use] 
     pub const fn as_byte(self) -> u8 {
         self as u8
     }
@@ -54,6 +55,7 @@ impl AlgoId {
     }
 
     /// `true` iff this scheme is believed quantum-safe.
+    #[must_use] 
     pub const fn quantum_safe(self) -> bool {
         matches!(
             self,

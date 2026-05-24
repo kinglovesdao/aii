@@ -29,19 +29,35 @@ impl BlockBody {
 impl Encodable for BlockBody {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let payload_length = self.payload_length();
-        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         let txs_inner: usize = self.transactions.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: txs_inner }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: txs_inner,
+        }
+        .encode(out);
         for t in &self.transactions {
             t.encode(out);
         }
         let omm_inner: usize = self.ommers.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: omm_inner }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: omm_inner,
+        }
+        .encode(out);
         for o in &self.ommers {
             o.encode(out);
         }
         let w_inner: usize = self.withdrawals.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: w_inner }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: w_inner,
+        }
+        .encode(out);
         for w in &self.withdrawals {
             w.encode(out);
         }
@@ -80,6 +96,10 @@ impl Decodable for BlockBody {
             withdrawals.push(Withdrawal::decode(buf)?);
         }
 
-        Ok(Self { transactions, ommers, withdrawals })
+        Ok(Self {
+            transactions,
+            ommers,
+            withdrawals,
+        })
     }
 }

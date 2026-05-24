@@ -21,7 +21,11 @@ mod tests {
 
     #[test]
     fn rlp_round_trip_empty() {
-        let l = Log { address: Address::ZERO, topics: vec![], data: vec![] };
+        let l = Log {
+            address: Address::ZERO,
+            topics: vec![],
+            data: vec![],
+        };
         let mut buf = alloy_rlp::bytes::BytesMut::new();
         l.encode(&mut buf);
         let mut s: &[u8] = &buf;

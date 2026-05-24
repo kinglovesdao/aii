@@ -30,12 +30,20 @@ impl Receipt {
 
     fn encode_inner(&self, out: &mut dyn alloy_rlp::BufMut) {
         let payload_length = self.payload_length();
-        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         self.status.encode(out);
         self.cumulative_gas_used.encode(out);
         self.logs_bloom.encode(out);
         let logs_inner: usize = self.logs.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: logs_inner }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: logs_inner,
+        }
+        .encode(out);
         for l in &self.logs {
             l.encode(out);
         }
@@ -58,7 +66,13 @@ impl Receipt {
         while logs_start - buf.len() < logs_h.payload_length {
             logs.push(Log::decode(buf)?);
         }
-        Ok(Self { tx_type, status, cumulative_gas_used, logs_bloom, logs })
+        Ok(Self {
+            tx_type,
+            status,
+            cumulative_gas_used,
+            logs_bloom,
+            logs,
+        })
     }
 
     /// Encode receipt to the EIP-2718 wire form.

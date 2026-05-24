@@ -88,7 +88,11 @@ impl TxLegacy {
 impl Encodable for TxLegacy {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let payload_length = self.payload_length();
-        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         self.nonce.encode(out);
         encode_u256(&self.gas_price, out);
         self.gas_limit.encode(out);
@@ -133,8 +137,18 @@ impl Decodable for TxLegacy {
             AlgoId::Secp256k1
         };
 
-        Ok(Self { nonce, gas_price, gas_limit, to, value, data: data.to_vec(),
-                  v, r, s, algo_id })
+        Ok(Self {
+            nonce,
+            gas_price,
+            gas_limit,
+            to,
+            value,
+            data: data.to_vec(),
+            v,
+            r,
+            s,
+            algo_id,
+        })
     }
 }
 

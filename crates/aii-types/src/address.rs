@@ -14,11 +14,13 @@ impl Address {
     pub const ZERO: Self = Self([0u8; 20]);
 
     /// Construct from raw 20-byte array.
+    #[must_use] 
     pub const fn new(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
 
     /// Underlying byte view.
+    #[must_use] 
     pub const fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
@@ -27,6 +29,7 @@ impl Address {
     ///
     /// EVM convention: last 20 bytes of `Keccak256(uncompressed_pubkey[1..])`
     /// — we trust the caller to have already hashed.
+    #[must_use] 
     pub fn from_pubkey_hash(hash: H256) -> Self {
         let mut out = [0u8; 20];
         out.copy_from_slice(&hash.as_bytes()[12..]);

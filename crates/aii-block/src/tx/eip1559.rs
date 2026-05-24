@@ -64,7 +64,11 @@ impl TxEip1559 {
 impl Encodable for TxEip1559 {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let payload_length = self.payload_length();
-        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         self.chain_id.encode(out);
         self.nonce.encode(out);
         encode_u256(&self.max_priority_fee_per_gas, out);
@@ -74,7 +78,11 @@ impl Encodable for TxEip1559 {
         encode_u256(&self.value, out);
         self.data.as_slice().encode(out);
         let access_list_inner: usize = self.access_list.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: access_list_inner }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: access_list_inner,
+        }
+        .encode(out);
         for item in &self.access_list {
             item.encode(out);
         }
@@ -127,8 +135,21 @@ impl Decodable for TxEip1559 {
             AlgoId::Secp256k1
         };
 
-        Ok(Self { chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit,
-                  to, value, data: data.to_vec(), access_list, v, r, s, algo_id })
+        Ok(Self {
+            chain_id,
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            value,
+            data: data.to_vec(),
+            access_list,
+            v,
+            r,
+            s,
+            algo_id,
+        })
     }
 }
 

@@ -64,7 +64,7 @@ pub enum SszError {
     /// A byte couldn't be interpreted (e.g. unknown `AlgoId` byte).
     #[error("invalid SSZ byte 0x{0:02x}")]
     InvalidByte(u8),
-    /// A SignedTx offset table was malformed.
+    /// A `SignedTx` offset table was malformed.
     #[error("malformed SignedTx offset table")]
     BadOffsetTable,
 }

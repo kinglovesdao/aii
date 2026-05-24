@@ -26,7 +26,11 @@ impl Encodable for Block {
         let header_len = self.header.length();
         let body_len = self.body.length();
         let payload_length = header_len + body_len;
-        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         self.header.encode(out);
         self.body.encode(out);
     }

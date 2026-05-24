@@ -40,8 +40,30 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = "warn"
-nursery = "warn"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Pedantic / nursery sub-lints intentionally allowed across the workspace.
+# Errors are documented in module-level docstrings, not per-fn.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Foundational data types — `#[must_use]` everywhere is noise.
+must_use_candidate = "allow"
+# Doc-prose holds acronyms (RLP / EIP-XXXX / AlgoId) that read better
+# without backtick clutter.
+doc_markdown = "allow"
+# Casts between fixed-size integers are guarded by domain invariants
+# (bit indices < 2048, RLP payload lengths < usize::MAX).
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+# `h`, `s`, `r`, `v` are protocol field names, not arbitrary bindings.
+many_single_char_names = "allow"
+match_same_arms = "allow"
+# `&Option<T>` is acceptable for crate-private helper fns.
+ref_option = "allow"
+option_if_let_else = "allow"
+format_push_string = "allow"
 
 [profile.release]
 lto = "fat"

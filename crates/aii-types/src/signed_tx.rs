@@ -1,4 +1,4 @@
-//! SignedTx — generic signed-transaction envelope.
+//! `SignedTx` — generic signed-transaction envelope.
 //!
 //! A `SignedTx` is the wire-format unit consumed by the mempool and the
 //! consensus engine. It is intentionally agnostic to the signature algorithm
@@ -27,7 +27,8 @@ pub struct SignedTx {
 
 impl SignedTx {
     /// Construct a new envelope.
-    pub fn new(algo_id: AlgoId, pubkey: Vec<u8>, signature: Vec<u8>, payload: Vec<u8>) -> Self {
+    #[must_use] 
+    pub const fn new(algo_id: AlgoId, pubkey: Vec<u8>, signature: Vec<u8>, payload: Vec<u8>) -> Self {
         Self {
             algo_id,
             pubkey,
@@ -36,7 +37,8 @@ impl SignedTx {
         }
     }
 
-    /// Total wire size: 1 (algo_id) + len(pubkey) + len(signature) + len(payload).
+    /// Total wire size: 1 (`algo_id`) + len(pubkey) + len(signature) + len(payload).
+    #[must_use] 
     pub fn wire_size(&self) -> usize {
         1 + self.pubkey.len() + self.signature.len() + self.payload.len()
     }

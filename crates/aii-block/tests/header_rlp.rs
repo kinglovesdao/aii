@@ -46,8 +46,8 @@ fn fixture_cancun(number: u64) -> Header {
 #[test]
 fn ten_header_fixtures_round_trip_byte_perfect() {
     let fixtures = [
-        fixture(15_537_393),       // the merge
-        fixture(17_034_870),       // Shanghai
+        fixture(15_537_393),        // the merge
+        fixture(17_034_870),        // Shanghai
         fixture_cancun(19_426_587), // Cancun (4844 + 4788)
         fixture(1),
         fixture(100),

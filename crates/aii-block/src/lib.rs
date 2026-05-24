@@ -30,8 +30,8 @@ pub mod receipt;
 pub mod tx;
 pub mod withdrawal;
 
-pub use aii_types::{Address, AlgoId, H256, U256};
 pub use access::AccessListItem;
+pub use aii_types::{Address, AlgoId, H256, U256};
 pub use block::Block;
 pub use bloom::Bloom;
 pub use body::BlockBody;

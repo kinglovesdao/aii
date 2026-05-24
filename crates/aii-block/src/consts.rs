@@ -23,7 +23,11 @@ mod tests {
     #[test]
     fn empty_list_hash_matches_keccak() {
         let mut buf = alloy_rlp::bytes::BytesMut::new();
-        alloy_rlp::Header { list: true, payload_length: 0 }.encode(&mut buf);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut buf);
         let h = keccak256(&buf);
         assert_eq!(h, EMPTY_LIST_HASH);
     }

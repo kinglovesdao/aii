@@ -45,7 +45,11 @@ impl TxEip4844 {
     fn payload_length(&self) -> usize {
         let al_inner: usize = self.access_list.iter().map(Encodable::length).sum();
         let al = alloy_rlp::length_of_length(al_inner) + al_inner;
-        let bvh_inner: usize = self.blob_versioned_hashes.iter().map(Encodable::length).sum();
+        let bvh_inner: usize = self
+            .blob_versioned_hashes
+            .iter()
+            .map(Encodable::length)
+            .sum();
         let bvh = alloy_rlp::length_of_length(bvh_inner) + bvh_inner;
         let mut len = self.chain_id.length()
             + self.nonce.length()
@@ -71,7 +75,11 @@ impl TxEip4844 {
 impl Encodable for TxEip4844 {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let payload_length = self.payload_length();
-        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         self.chain_id.encode(out);
         self.nonce.encode(out);
         encode_u256(&self.max_priority_fee_per_gas, out);
@@ -81,13 +89,25 @@ impl Encodable for TxEip4844 {
         encode_u256(&self.value, out);
         self.data.as_slice().encode(out);
         let al_inner: usize = self.access_list.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: al_inner }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: al_inner,
+        }
+        .encode(out);
         for item in &self.access_list {
             item.encode(out);
         }
         encode_u256(&self.max_fee_per_blob_gas, out);
-        let bvh_inner: usize = self.blob_versioned_hashes.iter().map(Encodable::length).sum();
-        alloy_rlp::Header { list: true, payload_length: bvh_inner }.encode(out);
+        let bvh_inner: usize = self
+            .blob_versioned_hashes
+            .iter()
+            .map(Encodable::length)
+            .sum();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: bvh_inner,
+        }
+        .encode(out);
         for h in &self.blob_versioned_hashes {
             h.encode(out);
         }
@@ -144,9 +164,23 @@ impl Decodable for TxEip4844 {
             AlgoId::Secp256k1
         };
 
-        Ok(Self { chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit,
-                  to, value, data: data.to_vec(), access_list, max_fee_per_blob_gas,
-                  blob_versioned_hashes, v, r, s, algo_id })
+        Ok(Self {
+            chain_id,
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            value,
+            data: data.to_vec(),
+            access_list,
+            max_fee_per_blob_gas,
+            blob_versioned_hashes,
+            v,
+            r,
+            s,
+            algo_id,
+        })
     }
 }
 

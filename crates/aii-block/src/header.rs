@@ -24,7 +24,7 @@ pub struct Header {
     pub receipts_root: H256,
     /// 2048-bit bloom over all logs in this block.
     pub logs_bloom: Bloom,
-    /// PoW difficulty — `0` post-merge.
+    /// `PoW` difficulty — `0` post-merge.
     pub difficulty: U256,
     /// Block height.
     pub number: u64,
@@ -36,9 +36,9 @@ pub struct Header {
     pub timestamp: u64,
     /// Free-form bytes ≤ 32.
     pub extra_data: Vec<u8>,
-    /// PoW mix-hash; post-merge stores `prevrandao`.
+    /// `PoW` mix-hash; post-merge stores `prevrandao`.
     pub mix_hash: H256,
-    /// PoW nonce — `[0; 8]` post-merge.
+    /// `PoW` nonce — `[0; 8]` post-merge.
     pub nonce: [u8; 8],
     /// EIP-1559 base fee per gas.
     pub base_fee_per_gas: U256,
@@ -109,7 +109,11 @@ impl Header {
 impl Encodable for Header {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let payload_length = self.payload_length();
-        RlpHeader { list: true, payload_length }.encode(out);
+        RlpHeader {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
         self.parent_hash.encode(out);
         self.ommers_hash.encode(out);
         self.beneficiary.encode(out);
@@ -192,11 +196,26 @@ impl Decodable for Header {
         }
 
         Ok(Self {
-            parent_hash, ommers_hash, beneficiary, state_root, transactions_root,
-            receipts_root, logs_bloom, difficulty, number, gas_limit, gas_used,
-            timestamp, extra_data: extra_data.to_vec(), mix_hash, nonce,
-            base_fee_per_gas, withdrawals_root,
-            blob_gas_used, excess_blob_gas, parent_beacon_block_root,
+            parent_hash,
+            ommers_hash,
+            beneficiary,
+            state_root,
+            transactions_root,
+            receipts_root,
+            logs_bloom,
+            difficulty,
+            number,
+            gas_limit,
+            gas_used,
+            timestamp,
+            extra_data: extra_data.to_vec(),
+            mix_hash,
+            nonce,
+            base_fee_per_gas,
+            withdrawals_root,
+            blob_gas_used,
+            excess_blob_gas,
+            parent_beacon_block_root,
         })
     }
 }
