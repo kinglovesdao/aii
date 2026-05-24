@@ -38,6 +38,7 @@ rocksdb = ["dep:rocksdb", "dep:tempfile"]
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "write_throughput"
