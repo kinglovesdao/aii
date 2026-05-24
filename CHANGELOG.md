@@ -5,6 +5,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.17] — 2026-05-24
+
+### Added — devp2p Discovery v4 (UDP) — Ping / Pong
+
+- New module `aii-net-p2p::discovery` implementing the Ethereum
+  Discovery v4 wire spec (<https://github.com/ethereum/devp2p/blob/
+  master/discv4.md>):
+  - **Packet framing** — `hash (32) || signature (65) || type (1) ||
+    rlp(data)`. Hash verified end-to-end (tampering detected at decode).
+  - **Signature** — secp256k1 over `keccak256(type || data)`. Decoder
+    *recovers* the sender's public key + address from the signature
+    (matches devp2p's design).
+  - **Packet types** — `Ping (0x01)` and `Pong (0x02)`. `FindNode (0x03)`
+    + `Neighbours (0x04)` land in v0.0.18 with the Kademlia routing
+    table.
+  - **`Endpoint`** — IPv4/IPv6 + UDP port + TCP port; RLP round-trips.
+  - **`UdpDiscovery`** — async UDP driver (`bind` / `send` / `recv`).
+    `recv` carries a per-call timeout.
+- 8 unit tests including a real **UDP loopback Ping/Pong exchange**
+  between two driver instances + tampered-packet detection + truncated-
+  packet rejection + unknown-type-byte rejection + recv-timeout.
+
+### Changed
+- Workspace 0.0.16 → 0.0.17.
+- `aii-net-p2p` now depends on `aii-crypto` for secp256k1 packet
+  signatures.
+
+### Notes
+- Packets are size-capped at the spec's 1280-byte UDP ceiling.
+- `FindNode` / `Neighbours` need a Kademlia routing table + node-id
+  XOR distance bucketing — separate v0.0.18 deliverable. The current
+  protocol-version constant (`DISCOVERY_VERSION = 4`) is already
+  embedded in `Ping` payloads so peers consider us spec-compliant.
+
 ## [0.0.16] — 2026-05-24
 
 ### Added — `aii-evm` revm 18 integration (contract execution)

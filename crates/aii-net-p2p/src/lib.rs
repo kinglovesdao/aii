@@ -1,17 +1,20 @@
 //! # aii-net-p2p
 //!
-//! TCP-based peer transport with length-prefixed RLP framing.
+//! Peer transport for the AII protocol.
 //!
-//! ## Public API
-//! - [`Message`] — `Hello` / `Ping` / `Pong` / `Disconnect`
-//! - [`MessageCodec`] — read/write a message over an async TCP socket
-//! - [`Server`] — bind a listener that accepts inbound peers
-//! - [`dial`] — connect to a remote peer and return a `Peer` handle
-//! - [`Peer`] — owns one TCP socket; `send` + `recv`
-//! - [`P2pError`] umbrella
+//! Two layers, used independently:
+//!
+//! - **TCP transport** — length-prefixed RLP framing for application
+//!   messages. [`Message`], [`Server`], [`dial`], [`Peer`].
+//! - **UDP Discovery v4** ([`discovery`]) — devp2p-compatible
+//!   Ping/Pong (FindNode/Neighbours land in v0.0.18+). Packets are
+//!   secp256k1-signed and verified end-to-end; sender identity is
+//!   recovered from the signature.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod discovery;
 
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use std::net::SocketAddr;
