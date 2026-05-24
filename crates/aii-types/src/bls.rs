@@ -14,11 +14,13 @@ impl BlsPubKey {
     pub const ZERO: Self = Self([0u8; 48]);
 
     /// Construct from raw bytes.
+    #[must_use] 
     pub const fn new(bytes: [u8; 48]) -> Self {
         Self(bytes)
     }
 
     /// Underlying view.
+    #[must_use] 
     pub const fn as_bytes(&self) -> &[u8; 48] {
         &self.0
     }
@@ -34,11 +36,13 @@ impl BlsSignature {
     pub const ZERO: Self = Self([0u8; 96]);
 
     /// Construct from raw bytes.
+    #[must_use] 
     pub const fn new(bytes: [u8; 96]) -> Self {
         Self(bytes)
     }
 
     /// Underlying view.
+    #[must_use] 
     pub const fn as_bytes(&self) -> &[u8; 96] {
         &self.0
     }

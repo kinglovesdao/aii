@@ -1,24 +1,25 @@
 [package]
-name = "aii-types"
+name = "aii-block"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Primitive types for the AII protocol (H256, Address, U256, AlgoId, BlsPubKey, BlsSignature, SignedTx)"
+description = "Block / Header / Tx / Receipt data types for the AII protocol (EIP-2718 envelope, byte-perfect with Ethereum mainnet)."
 readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
-alloy-primitives = { workspace = true }
+aii-types = { workspace = true }
+aii-codec = { workspace = true }
+aii-crypto = { workspace = true }
 alloy-rlp = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-quickcheck = { workspace = true }
+hex = { workspace = true }

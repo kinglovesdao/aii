@@ -5,6 +5,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5] — 2026-05-24
+
+### Added
+- New crate `aii-block` (M1 #6 — first M1 crate):
+  - `Header` — 20-field EIP-1559 + 4895 + 4844 + 4788 layout with
+    forward/back-compatible trailing fields (`blob_gas_used`,
+    `excess_blob_gas`, `parent_beacon_block_root` are `Option`).
+  - `Tx` enum — EIP-2718 envelope (Legacy / EIP-1559 / EIP-4844
+    placeholder). All variants carry an optional `AlgoId` extension
+    that defaults to `Secp256k1` and emits byte-perfect Ethereum
+    encodings in that case (PQ slots are additive and read by trailing-
+    item detection during decode).
+  - `Receipt` — single struct + `TxType` discriminator + EIP-2718
+    envelope, with helpers `encode_2718` / `decode_2718`.
+  - `Block` = `Header` + `BlockBody { transactions, ommers, withdrawals }`;
+    `Block::hash()` ≡ `Header::hash()`.
+  - `Bloom` (2048-bit Yellow-Paper §4.4.2 accrue/contains), `Log`,
+    `Withdrawal` (EIP-4895, Gwei), `AccessListItem` (EIP-2930),
+    `Hashable` trait.
+  - Constants: `EMPTY_LIST_HASH`, `EMPTY_TRIE_HASH` (Keccak-verified at
+    test time).
+- 32 unit tests + 5 proptest properties + 10-header byte-perfect
+  fixture round-trip with hash self-consistency.
+
+### Changed
+- Workspace version 0.0.4 → 0.0.5.
+- `aii-types`: `impl alloy_rlp::{Encodable, Decodable}` for `H256` and
+  `Address` (unlocks `#[derive(RlpEncodable, RlpDecodable)]` for
+  downstream crates' simple structs without orphan-rule contortions).
+- `alloy-rlp` workspace dep gains the `derive` feature.
+- Workspace clippy config: list of explicit pedantic/nursery sub-lint
+  allows (errors-doc / panics-doc / must-use-candidate / doc-markdown /
+  numeric-cast family / many-single-char-names / match-same-arms /
+  ref-option / option-if-let-else / format-push-string) — matches the
+  documented "pedantic = warn" intent under CI's `-- -D warnings` flag.
+
+### Notes
+- Per spec §5.3, `aii-block` is **not** published to crates.io until M2.
+- Mainnet fixtures in v0.0.5 are synthetic but byte-perfect through
+  the encoder; an M1 follow-up swaps in genuine mainnet RLP without
+  any API change.
+- This unblocks M1 crates `aii-state` and `aii-evm` (both depend on
+  `aii-block`).
+
 ## [0.0.4] — 2026-05-24
 
 ### Added

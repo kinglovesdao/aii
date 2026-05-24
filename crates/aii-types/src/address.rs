@@ -1,6 +1,7 @@
 //! Address — 20-byte EVM-compatible account address.
 
 use crate::H256;
+use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
 
 /// 20-byte address. Lowercase hex serialization with `0x` prefix.
@@ -13,11 +14,13 @@ impl Address {
     pub const ZERO: Self = Self([0u8; 20]);
 
     /// Construct from raw 20-byte array.
+    #[must_use] 
     pub const fn new(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
 
     /// Underlying byte view.
+    #[must_use] 
     pub const fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
@@ -26,6 +29,7 @@ impl Address {
     ///
     /// EVM convention: last 20 bytes of `Keccak256(uncompressed_pubkey[1..])`
     /// — we trust the caller to have already hashed.
+    #[must_use] 
     pub fn from_pubkey_hash(hash: H256) -> Self {
         let mut out = [0u8; 20];
         out.copy_from_slice(&hash.as_bytes()[12..]);
@@ -36,6 +40,27 @@ impl Address {
 impl From<[u8; 20]> for Address {
     fn from(b: [u8; 20]) -> Self {
         Self(b)
+    }
+}
+
+impl Encodable for Address {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        self.0.as_slice().encode(out);
+    }
+    fn length(&self) -> usize {
+        self.0.as_slice().length()
+    }
+}
+
+impl Decodable for Address {
+    fn decode(buf: &mut &[u8]) -> Result<Self, alloy_rlp::Error> {
+        let bytes = <alloy_rlp::bytes::Bytes as Decodable>::decode(buf)?;
+        if bytes.len() != 20 {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&bytes);
+        Ok(Self(out))
     }
 }
 
