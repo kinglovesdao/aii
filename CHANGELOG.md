@@ -5,11 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] — 2026-05-24
+
 ### Added
-- Workspace design spec at `docs/superpowers/specs/2026-05-21-aii-core-design.md`:
-  24-crate roadmap (M0 stones → M1 state/exec → M2 consensus/entrypoints → M3 extensions),
-  dependency graph, interface-locking policy, and security/audit plan aligned with docs
-  04/08/10 of the reference set.
+- New crate `aii-crypto` with the four Day-0 cryptographic primitives:
+  - `keccak::keccak256` — Ethereum-style Keccak-256, 3 KAT vectors
+    (empty / "abc" / 1M 'a').
+  - `secp::{sign, verify, recover}` — secp256k1 ECDSA with 65-byte ETH
+    layout (`r ‖ s ‖ v`); `PublicKey::address` matches the known
+    constant for `sk = 1`.
+  - `bls::{sign, verify, fast_aggregate_verify, aggregate_signatures,
+    aggregate_pubkeys}` — BLS12-381 Eth2 `min-pk` scheme over blst.
+  - `vrf::{prove, verify}` — Schnorrkel VRF over Ristretto-25519 with
+    96-byte wire form (pre-output ‖ proof).
+  - `CryptoError` umbrella (`InvalidEncoding` + `BadSignature`).
+- 31 unit tests + 5 property tests covering all four primitives.
+- Workspace deps: `tiny-keccak 2`, `k256 0.13`, `blst 0.3`,
+  `schnorrkel 0.11`, `merlin 3`, `rand_core 0.6`.
+
+### Changed
+- Workspace version 0.0.2 → 0.0.3.
+- Rust toolchain pin 1.83 → 1.94.1; workspace `rust-version` 1.83 → 1.85
+  (ecosystem moved to edition2024 via getrandom 0.4 / indexmap 2.14 /
+  ruint 1.18).
+
+### Notes
+- Spec D7 (PQ algorithm slots) remains placeholder-only for v0.0.3;
+  concrete verifiers will land in `aii-registry` (planned v0.0.4) so
+  that `AlgoId`-keyed dispatch is the only call site.
+- `aii-crypto` is the 3rd of the 4 M0 basestone crates; remaining M0
+  work is `aii-storage` (RocksDB).
 
 ## [0.0.2] — 2026-05-22
 
