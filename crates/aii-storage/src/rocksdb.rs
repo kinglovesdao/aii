@@ -121,20 +121,16 @@ impl KvBackend for RocksDbBackend {
     }
 
     fn snapshot(&self) -> Self::Snapshot {
-        // SAFETY: the snapshot borrows the `DB` behind `self.db` (an
-        // `Arc<DB>`). We clone the Arc into `RocksDbSnapshot::db` so the
-        // DB lives at least as long as the snapshot. Transmuting the
-        // borrow lifetime to `'static` is therefore sound: the only
-        // pointer the snapshot dereferences (the `DB` it was created
-        // from) is kept alive by the sibling Arc clone.
-        let snap: rocksdb::Snapshot<'static> = unsafe {
-            std::mem::transmute::<rocksdb::Snapshot<'_>, rocksdb::Snapshot<'static>>(
-                self.db.snapshot(),
-            )
-        };
         RocksDbSnapshot {
+            // SAFETY: We lift the snapshot's lifetime to 'static. This is
+            // sound iff: (a) the underlying `DB` outlives the snapshot,
+            // guaranteed by the sibling `Arc<DB>` we store alongside, AND
+            // (b) when `RocksDbSnapshot` is dropped, `snap` drops BEFORE
+            // `db` so the snapshot's `release_snapshot` FFI call runs
+            // against a still-live DB. Rust drops struct fields in
+            // declaration order — `snap` is declared first below.
+            snap: unsafe { std::mem::transmute::<rocksdb::Snapshot<'_>, rocksdb::Snapshot<'static>>(self.db.snapshot()) },
             db: Arc::clone(&self.db),
-            snap,
         }
     }
 
@@ -188,8 +184,11 @@ fn next_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// Read-only snapshot of a [`RocksDbBackend`].
 pub struct RocksDbSnapshot {
-    db: Arc<DB>,
+    // Field order matters: `snap` drops FIRST so its Drop impl calls
+    // `release_snapshot` while the underlying DB is still alive via the
+    // sibling `Arc<DB>` clone below.
     snap: rocksdb::Snapshot<'static>,
+    db: Arc<DB>,
 }
 
 impl RocksDbSnapshot {
@@ -271,5 +270,25 @@ mod tests {
         assert_eq!(next_prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
         assert_eq!(next_prefix_upper_bound(&[0xFF, 0x00]), Some(vec![0xFF, 0x01]));
         assert_eq!(next_prefix_upper_bound(&[0xFF, 0xFF]), None);
+    }
+
+    #[test]
+    fn snapshot_outlives_backend_drop_does_not_uaf() {
+        // Reproduces the UAF that existed in the original field order:
+        // we capture a snapshot, then DROP the backend (releasing its
+        // Arc<DB> strong ref), then read through the snapshot. The
+        // snapshot's own Arc<DB> clone keeps the DB alive, and the
+        // field-drop order ensures `release_snapshot` runs before the
+        // DB is freed when the snapshot itself is dropped at scope end.
+        let b = RocksDbBackend::open_in_temp().unwrap();
+        b.put(ColumnFamily::State, b"k", b"v").unwrap();
+        let snap = b.snapshot();
+        drop(b); // release the original strong ref
+        // Snapshot now holds the only Arc<DB> strong ref.
+        assert_eq!(
+            snap.get(ColumnFamily::State, b"k").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+        // snap drops here — must not UAF.
     }
 }
