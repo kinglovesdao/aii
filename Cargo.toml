@@ -13,6 +13,7 @@ members = [
     "crates/aii-wallet",
     "crates/aii-vnode",
     "crates/aii-net-txpool",
+    "crates/aii-microchain",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ aii-metrics = { path = "crates/aii-metrics", version = "0.0.6" }
 aii-wallet = { path = "crates/aii-wallet", version = "0.0.6" }
 aii-vnode = { path = "crates/aii-vnode", version = "0.0.6" }
 aii-net-txpool = { path = "crates/aii-net-txpool", version = "0.0.6" }
+aii-microchain = { path = "crates/aii-microchain", version = "0.0.6" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
