@@ -24,6 +24,7 @@ pub mod consts;
 pub mod error;
 pub mod header;
 pub mod log;
+pub mod tx;
 pub mod withdrawal;
 
 pub use aii_types::{Address, AlgoId, H256, U256};
@@ -33,6 +34,7 @@ pub use consts::{EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 pub use error::BlockError;
 pub use header::Header;
 pub use log::Log;
+pub use tx::{Tx, TxEip1559, TxEip4844, TxLegacy, TxType};
 pub use withdrawal::Withdrawal;
 
 /// All AII block-layer values can produce a 32-byte Keccak-256 commitment.
