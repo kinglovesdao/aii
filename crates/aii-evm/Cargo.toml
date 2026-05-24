@@ -1,0 +1,22 @@
+[package]
+name = "aii-evm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AII execution layer — value-transfer + native-call dispatch (revm wrapper TBD)."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-block = { workspace = true }
+aii-state = { workspace = true }
+aii-storage = { workspace = true }
+aii-crypto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
