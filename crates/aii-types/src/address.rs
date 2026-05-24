@@ -5,7 +5,7 @@ use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
 
 /// 20-byte address. Lowercase hex serialization with `0x` prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct Address(pub [u8; 20]);
 

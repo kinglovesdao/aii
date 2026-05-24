@@ -11,6 +11,7 @@ members = [
     "crates/aii-consensus-iface",
     "crates/aii-metrics",
     "crates/aii-wallet",
+    "crates/aii-vnode",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ aii-config = { path = "crates/aii-config", version = "0.0.6" }
 aii-consensus-iface = { path = "crates/aii-consensus-iface", version = "0.0.6" }
 aii-metrics = { path = "crates/aii-metrics", version = "0.0.6" }
 aii-wallet = { path = "crates/aii-wallet", version = "0.0.6" }
+aii-vnode = { path = "crates/aii-vnode", version = "0.0.6" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
