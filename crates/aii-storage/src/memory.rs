@@ -13,7 +13,7 @@ use crate::{
     batch::{Op, WriteBatch},
     cf::ColumnFamily,
     error::StorageError,
-    snapshot::{KvIter, Snapshot},
+    snapshot::{KvItem, KvIter, Snapshot},
 };
 
 type CfMap = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -98,7 +98,7 @@ impl KvBackend for MemoryBackend {
 
     fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a> {
         let store = self.inner.read().expect("memory backend lock poisoned");
-        let items: Vec<Result<(Vec<u8>, Vec<u8>), StorageError>> = match store.get(&cf) {
+        let items: Vec<KvItem> = match store.get(&cf) {
             Some(map) => map.iter().map(|(k, v)| Ok((k.clone(), v.clone()))).collect(),
             None => vec![Err(StorageError::InvalidColumnFamily(cf))],
         };
@@ -107,7 +107,7 @@ impl KvBackend for MemoryBackend {
 
     fn iter_prefix<'a>(&'a self, cf: ColumnFamily, prefix: &'a [u8]) -> KvIter<'a> {
         let store = self.inner.read().expect("memory backend lock poisoned");
-        let items: Vec<Result<(Vec<u8>, Vec<u8>), StorageError>> = match store.get(&cf) {
+        let items: Vec<KvItem> = match store.get(&cf) {
             Some(map) => map
                 .range(prefix.to_vec()..)
                 .take_while(|(k, _)| k.starts_with(prefix))
@@ -135,7 +135,7 @@ impl Snapshot for MemorySnapshot {
     }
 
     fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a> {
-        let items: Vec<Result<(Vec<u8>, Vec<u8>), StorageError>> = match self.store.get(&cf) {
+        let items: Vec<KvItem> = match self.store.get(&cf) {
             Some(map) => map.iter().map(|(k, v)| Ok((k.clone(), v.clone()))).collect(),
             None => vec![Err(StorageError::InvalidColumnFamily(cf))],
         };

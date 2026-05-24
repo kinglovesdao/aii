@@ -35,4 +35,4 @@ pub use error::StorageError;
 pub use memory::{MemoryBackend, MemorySnapshot};
 #[cfg(feature = "rocksdb")]
 pub use rocksdb::{RocksDbBackend, RocksDbSnapshot};
-pub use snapshot::{KvIter, Snapshot};
+pub use snapshot::{KvItem, KvIter, Snapshot};

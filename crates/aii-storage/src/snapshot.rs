@@ -7,10 +7,12 @@
 
 use crate::{cf::ColumnFamily, error::StorageError};
 
+/// A single `(key, value)` pair surfaced by a [`KvIter`].
+pub type KvItem = Result<(Vec<u8>, Vec<u8>), StorageError>;
+
 /// Trait alias for the boxed-iterator type backends hand out, to keep
 /// the trait signatures readable.
-pub type KvIter<'a> =
-    Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>), StorageError>> + 'a>;
+pub type KvIter<'a> = Box<dyn Iterator<Item = KvItem> + 'a>;
 
 /// A read-only point-in-time view.
 pub trait Snapshot: Send + Sync {
