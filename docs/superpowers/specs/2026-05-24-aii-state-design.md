@@ -9,20 +9,23 @@
 
 ## §1 目标与边界
 
-### 1.1 目标 (v0.0.6)
+### 1.1 目标 (v0.0.6 — 本 PR)
 
 - ✅ `Account`：4 字段固定布局（nonce / balance / code_hash / storage_root）+ RLP 编解码 + Keccak hash
 - ✅ `StateDb`：基于 `aii_storage::KvBackend` 的 Account 读/写抽象（写入 ColumnFamily::State）
-- ✅ `mpt_root` 入口函数：给定 `Vec<(Vec<u8>, Vec<u8>)>` 返回 Merkle Patricia Tree 根；v0.0.6 用 **简化实现**（递归 hex-prefix 编码），KAT 对齐 ETH 的"空 trie"与 1 个标准 fixture。
-- ✅ `transactions_root` / `receipts_root` / `withdrawals_root` 高阶 helper，给 aii-block 的 Header 字段提供真实数据来源（aii-block 现在仅占位 `EMPTY_TRIE_HASH`）
+- ✅ `EMPTY_CODE_HASH` 常量 + re-export `EMPTY_TRIE_HASH` 自 `aii-block`
+- ✅ `mpt_root` 占位入口（空输入返回 `EMPTY_TRIE_HASH`，非空输入 `unimplemented!`）—— 真正实现见 v0.0.7
 
-### 1.2 非目标 (留给 v0.0.7+)
+### 1.2 留给 v0.0.7+
 
-- ❌ MPT pruning / state snapshot
-- ❌ Storage trie（per-account） —— 第二轮再加
-- ❌ 完整 ethereum-tests/MerkleTrie/* 兼容（M1 退出标准的一部分，但当前 PR 不要求 100%）
-- ❌ 历史状态查询（trie root + Snapshot 组合，后续）
+- ❌ 完整 MPT（hex-prefix + branch/extension/leaf 节点 + RLP-pruning）
+- ❌ `transactions_root` / `receipts_root` / `withdrawals_root` helper
+- ❌ Storage trie（per-account）
+- ❌ 完整 ethereum-tests/MerkleTrie/* 兼容
+- ❌ 历史状态查询（trie root + Snapshot 组合）
 - ❌ EVM 集成（aii-evm 单独 crate）
+
+> v0.0.6 让 aii-evm 能拿到 Account（最关键依赖）；MPT 在 v0.0.7 单独 PR 落地，避免本 PR 体积过大。
 
 ### 1.3 依赖
 
@@ -75,7 +78,7 @@ RLP 顺序：`[nonce, balance, storage_root, code_hash]`（与以太一致 —�
 - `EMPTY_CODE_HASH = keccak256(b"")` = `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`
 - `EMPTY_TRIE_HASH` 已在 aii-block 提供 —— state 也 re-export
 
-### 3.2 `mpt_root`
+### 3.2 `mpt_root` (v0.0.6 占位)
 
 ```rust
 pub fn mpt_root<I, K, V>(items: I) -> H256
@@ -85,12 +88,11 @@ where
     V: AsRef<[u8]>;
 ```
 
-行为：
+v0.0.6 行为：
 - 空输入 → `EMPTY_TRIE_HASH`
-- 输入按 key 排序后用 hex-prefix + branch/extension/leaf 节点构造 MPT
-- 返回根的 Keccak-256 值
+- 非空输入 → `unimplemented!()` panic (调用方未到时不应触发)
 
-v0.0.6 实现：朴素递归 trie（不做 RLP-length pruning，所有节点直接 keccak）。性能不重要，正确性优先。
+v0.0.7 将实现完整算法。
 
 ### 3.3 `StateDb<B>`
 
@@ -112,10 +114,8 @@ Key 格式：`keccak256(address.as_bytes())` 的 32 字节作为 ColumnFamily::S
 ## §4 测试矩阵
 
 - **Account**：≥ 5 单元测试（RLP round-trip / EOA defaults / hash 确定性 / 字段独立性 / nonce 边界）
-- **mpt_root**：
+- **mpt_root（v0.0.6）**：
   - `empty_input_equals_empty_trie_hash`
-  - `single_kv_known_hash`（参考 reth 已发布的 fixture）
-  - `key_order_irrelevant`（property test）
 - **StateDb**：
   - `get_nonexistent_returns_none`
   - `set_then_get_round_trip`
@@ -125,7 +125,7 @@ Key 格式：`keccak256(address.as_bytes())` 的 32 字节作为 ColumnFamily::S
 
 ## §5 v0.0.6 完成标准
 
-- `cargo test -p aii-state` 全绿 (≥ 15 tests)
+- `cargo test -p aii-state` 全绿 (≥ 10 tests)
 - 工作区 `cargo clippy -- -D warnings` 仍清
 - 0.0.5 → 0.0.6 版本号
 - aii-block 的 fixture 测试通过（不依赖）
