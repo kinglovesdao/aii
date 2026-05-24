@@ -28,6 +28,8 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 uuid = { version = "1", default-features = false, features = ["v4", "serde", "std"] }
+bip39 = { version = "2", default-features = false, features = ["std"] }
+bip32 = { version = "0.5", default-features = false, features = ["std", "secp256k1"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
