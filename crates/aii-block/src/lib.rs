@@ -22,6 +22,7 @@ pub mod access;
 pub mod bloom;
 pub mod consts;
 pub mod error;
+pub mod header;
 pub mod log;
 pub mod withdrawal;
 
@@ -30,6 +31,7 @@ pub use access::AccessListItem;
 pub use bloom::Bloom;
 pub use consts::{EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 pub use error::BlockError;
+pub use header::Header;
 pub use log::Log;
 pub use withdrawal::Withdrawal;
 
