@@ -9,10 +9,13 @@
 //! | Module     | Purpose                                                        |
 //! |------------|----------------------------------------------------------------|
 //! | [`cf`]     | [`ColumnFamily`] closed enum + stable wire names.              |
+//! | [`error`]  | [`StorageError`] umbrella over per-backend errors.             |
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod cf;
+pub mod error;
 
 pub use cf::ColumnFamily;
+pub use error::StorageError;
