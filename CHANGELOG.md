@@ -5,6 +5,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.23] — 2026-05-24
+
+### Added — BFT-PoS stage 1 finality state machine
+
+`aii-consensus-bft` grows a pure on-chain finality state machine
+alongside the existing `DevModeEngine`. Stake-weighted leader election,
+VRF-based seed beacon, single-phase PRE-COMMIT votes, and a BLS-
+aggregated certificate at ⅔ + 1 stake — the building blocks for real
+multi-validator BFT, decoupled from gossip and round changes so they
+can be tested independently.
+
+#### aii-consensus-bft
+
+- New `bft` submodule with the full lifecycle:
+  - `Validator { bls_pubkey, vrf_pubkey, stake }` — two keys per
+    validator: BLS for votes (aggregates cheaply), VRF for seed beacon
+    (next leader is unpredictable to anyone but the next chosen
+    proposer).
+  - `ValidatorSet::new(...)` — validates non-empty, `n ≤ 128`,
+    `Σ stake` fits in `u64`, `Σ stake > 0`.
+  - `ValidatorSet::select_leader(height, seed)` — stake-weighted
+    deterministic picker. `pick = u64::from_be_bytes(keccak256(height_be8
+    ‖ seed)[0..8]) % total_stake`, then linear scan of cumulative stake.
+  - `LeaderProof::produce / verify` — VRF over the same `(height, seed)`
+    input. `next_seed()` is the VRF output and becomes `seed_{H+1}`.
+  - `PrecommitVote::digest(block_hash, height)` — what validators sign
+    (`keccak256(hash ‖ height_be8)`).
+  - `PrecommitTallier::submit(vote)` — validates block hash, height,
+    validator index bounds, duplicate-vote guard, single-signer BLS
+    verify; tracks accumulated stake. Returns `Accepted` / `ReachedQuorum`.
+  - `PrecommitTallier::try_finalize()` — emits a `PrecommitCertificate`
+    once stake ≥ `(2 * total) / 3 + 1`.
+  - `PrecommitCertificate::verify(&vs)` — `fast_aggregate_verify` over
+    the signer subset, plus stake-subset quorum re-check.
+- New `BftError` variants: `EmptyValidatorSet`, `ValidatorSetTooLarge`,
+  `TotalStakeOverflow`, `ZeroTotalStake`, `WrongBlockHash`, `WrongHeight`,
+  `ValidatorIndexOutOfBounds`, `DuplicateVote`, `InvalidBlsSignature`,
+  `InvalidVrfProof`.
+- 26 RED→GREEN tests covering construction validation, total-stake
+  arithmetic, quorum math, leader determinism + stake-weighting (1000-
+  sample statistical check that a 99% validator wins ≥ 900 times), VRF
+  round-trip + tamper rejection, digest formula, all five tally
+  validation paths, below-/at-quorum transitions, finalize gating,
+  certificate verification + tamper rejection.
+
+### Scope discipline (same shape as v0.0.18 / v0.0.21)
+
+The bft submodule is **not yet wired into `DevModeEngine`** — that
+remains the single-node demo path. Integration, plus the still-missing
+PRE-VOTE phase, gossip layer, round changes, locking / POL, and
+equivocation slashing, are explicit non-goals for v0.0.23 and will
+land in subsequent releases.
+
 ## [0.0.22] — 2026-05-24
 
 ### Added — sub-chain VM host imports
