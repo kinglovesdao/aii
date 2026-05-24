@@ -19,21 +19,27 @@
 #![warn(missing_docs)]
 
 pub mod access;
+pub mod block;
 pub mod bloom;
+pub mod body;
 pub mod consts;
 pub mod error;
 pub mod header;
 pub mod log;
+pub mod receipt;
 pub mod tx;
 pub mod withdrawal;
 
 pub use aii_types::{Address, AlgoId, H256, U256};
 pub use access::AccessListItem;
+pub use block::Block;
 pub use bloom::Bloom;
+pub use body::BlockBody;
 pub use consts::{EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 pub use error::BlockError;
 pub use header::Header;
 pub use log::Log;
+pub use receipt::Receipt;
 pub use tx::{Tx, TxEip1559, TxEip4844, TxLegacy, TxType};
 pub use withdrawal::Withdrawal;
 
