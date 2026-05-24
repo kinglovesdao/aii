@@ -51,6 +51,79 @@ impl<B: KvBackend> StateDb<B> {
         self.backend.delete(ColumnFamily::State, &key)?;
         Ok(())
     }
+
+    /// Fetch contract bytecode by `code_hash`. Returns `None` if no
+    /// code has ever been stored under that hash.
+    ///
+    /// AII stores bytecode in the [`ColumnFamily::Code`] CF — content-
+    /// addressed by `keccak256(bytecode)`, naturally deduplicated.
+    pub fn code_get(&self, code_hash: &aii_types::H256) -> Result<Option<Vec<u8>>, StateError> {
+        Ok(self.backend.get(ColumnFamily::Code, code_hash.as_bytes())?)
+    }
+
+    /// Persist contract bytecode under `code_hash`. Idempotent: the
+    /// same bytecode under the same hash is a no-op write.
+    pub fn code_put(&self, code_hash: &aii_types::H256, bytes: &[u8]) -> Result<(), StateError> {
+        self.backend
+            .put(ColumnFamily::Code, code_hash.as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// Read one storage slot for a given contract address. Returns
+    /// `H256::ZERO` for any slot that was never written (matches EVM
+    /// semantics — unset slots read as zero).
+    pub fn storage_get(
+        &self,
+        addr: &Address,
+        slot: &aii_types::H256,
+    ) -> Result<aii_types::H256, StateError> {
+        let key = storage_key(addr, slot);
+        let bytes = self.backend.get(ColumnFamily::AccountStorage, &key)?;
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&b);
+                Ok(aii_types::H256::new(out))
+            }
+            Some(b) => Err(StateError::Decode(format!(
+                "storage slot value has unexpected length {}",
+                b.len()
+            ))),
+            None => Ok(aii_types::H256::ZERO),
+        }
+    }
+
+    /// Write one storage slot for a given contract address. Storing
+    /// `H256::ZERO` clears the entry to match EVM semantics — readers
+    /// of an unset slot get zero regardless of whether the row was
+    /// deleted or never existed.
+    pub fn storage_put(
+        &self,
+        addr: &Address,
+        slot: &aii_types::H256,
+        value: &aii_types::H256,
+    ) -> Result<(), StateError> {
+        let key = storage_key(addr, slot);
+        if value == &aii_types::H256::ZERO {
+            self.backend.delete(ColumnFamily::AccountStorage, &key)?;
+        } else {
+            self.backend
+                .put(ColumnFamily::AccountStorage, &key, value.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+/// `(address ‖ slot)` — 52-byte key for the [`ColumnFamily::AccountStorage`] CF.
+///
+/// A flat key is sufficient for now; future per-account storage tries
+/// will replace this with a per-account root, but the public API stays
+/// the same.
+fn storage_key(addr: &Address, slot: &aii_types::H256) -> [u8; 52] {
+    let mut out = [0u8; 52];
+    out[..20].copy_from_slice(addr.as_bytes());
+    out[20..].copy_from_slice(slot.as_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -110,5 +183,81 @@ mod tests {
         db.set_account(&b, &acc_b).unwrap();
         assert_eq!(db.account(&a).unwrap().unwrap().nonce, 1);
         assert_eq!(db.account(&b).unwrap().unwrap().nonce, 2);
+    }
+
+    #[test]
+    fn code_get_missing_returns_none() {
+        let db = fresh_db();
+        assert_eq!(db.code_get(&H256::new([0xaa; 32])).unwrap(), None);
+    }
+
+    #[test]
+    fn code_put_then_get_round_trip() {
+        let db = fresh_db();
+        let bytecode = vec![0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
+        let hash = H256::new([0xab; 32]);
+        db.code_put(&hash, &bytecode).unwrap();
+        assert_eq!(db.code_get(&hash).unwrap(), Some(bytecode));
+    }
+
+    #[test]
+    fn code_under_different_hashes_isolated() {
+        let db = fresh_db();
+        let h1 = H256::new([0x01; 32]);
+        let h2 = H256::new([0x02; 32]);
+        db.code_put(&h1, b"contract-1").unwrap();
+        db.code_put(&h2, b"contract-2-longer").unwrap();
+        assert_eq!(db.code_get(&h1).unwrap(), Some(b"contract-1".to_vec()));
+        assert_eq!(
+            db.code_get(&h2).unwrap(),
+            Some(b"contract-2-longer".to_vec())
+        );
+    }
+
+    #[test]
+    fn storage_unset_slot_reads_zero() {
+        let db = fresh_db();
+        let addr = Address::new([0xcd; 20]);
+        let slot = H256::new([0x77; 32]);
+        assert_eq!(db.storage_get(&addr, &slot).unwrap(), H256::ZERO);
+    }
+
+    #[test]
+    fn storage_put_then_get_round_trip() {
+        let db = fresh_db();
+        let addr = Address::new([0xcd; 20]);
+        let slot = H256::new([0; 32]);
+        let value = H256::new([0xaa; 32]);
+        db.storage_put(&addr, &slot, &value).unwrap();
+        assert_eq!(db.storage_get(&addr, &slot).unwrap(), value);
+    }
+
+    #[test]
+    fn storage_zero_value_clears_slot() {
+        let db = fresh_db();
+        let addr = Address::new([0xcd; 20]);
+        let slot = H256::new([0; 32]);
+        db.storage_put(&addr, &slot, &H256::new([0xaa; 32]))
+            .unwrap();
+        db.storage_put(&addr, &slot, &H256::ZERO).unwrap();
+        assert_eq!(db.storage_get(&addr, &slot).unwrap(), H256::ZERO);
+    }
+
+    #[test]
+    fn storage_isolated_per_address_and_slot() {
+        let db = fresh_db();
+        let a = Address::new([0x01; 20]);
+        let b = Address::new([0x02; 20]);
+        let slot_0 = H256::new([0; 32]);
+        let slot_1 = H256::new([1; 32]);
+        let v1 = H256::new([0x11; 32]);
+        let v2 = H256::new([0x22; 32]);
+        let v3 = H256::new([0x33; 32]);
+        db.storage_put(&a, &slot_0, &v1).unwrap();
+        db.storage_put(&a, &slot_1, &v2).unwrap();
+        db.storage_put(&b, &slot_0, &v3).unwrap();
+        assert_eq!(db.storage_get(&a, &slot_0).unwrap(), v1);
+        assert_eq!(db.storage_get(&a, &slot_1).unwrap(), v2);
+        assert_eq!(db.storage_get(&b, &slot_0).unwrap(), v3);
     }
 }

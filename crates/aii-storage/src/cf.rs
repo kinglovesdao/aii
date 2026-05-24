@@ -29,6 +29,8 @@ pub enum ColumnFamily {
     Meta,
     /// Subchain registry + flush anchors.
     MicroChain,
+    /// `code_hash → contract bytecode bytes`.
+    Code,
 }
 
 impl ColumnFamily {
@@ -44,6 +46,7 @@ impl ColumnFamily {
         Self::TxLookup,
         Self::Meta,
         Self::MicroChain,
+        Self::Code,
     ];
 
     /// Stable wire name (`snake_case`). Used as the `RocksDB` column-family name.
@@ -60,6 +63,7 @@ impl ColumnFamily {
             Self::TxLookup => "tx_lookup",
             Self::Meta => "meta",
             Self::MicroChain => "microchain",
+            Self::Code => "code",
         }
     }
 }
@@ -92,7 +96,8 @@ mod tests {
                 | ColumnFamily::AccountStorage
                 | ColumnFamily::TxLookup
                 | ColumnFamily::Meta
-                | ColumnFamily::MicroChain => {}
+                | ColumnFamily::MicroChain
+                | ColumnFamily::Code => {}
             }
         }
     }

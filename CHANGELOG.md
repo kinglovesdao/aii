@@ -5,6 +5,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.20] — 2026-05-24
+
+### Added — persistent contract state (bytecode + storage)
+
+aii-evm transactions now persist contract state across calls, which is
+the prerequisite for real ERC-20-style contracts to work on AII.
+
+#### aii-storage
+
+- New `ColumnFamily::Code` — `code_hash → bytecode bytes`. Bytecode is
+  stored content-addressed by `keccak256(code)`, so identical code
+  deployed twice naturally dedups.
+
+#### aii-state
+
+- New `StateDb::code_get(code_hash)` / `code_put(code_hash, bytes)` —
+  bytecode storage backed by `ColumnFamily::Code`.
+- New `StateDb::storage_get(addr, slot)` / `storage_put(addr, slot, val)` —
+  per-account EVM storage backed by `ColumnFamily::AccountStorage`.
+  Reads of unset slots return `H256::ZERO`. Writing `H256::ZERO`
+  deletes the slot (matches EVM semantics). Flat 52-byte `addr ‖ slot`
+  key for now; per-account Merkle tries are a later optimization.
+- New `StateError::Decode(String)` variant for malformed on-disk
+  storage values.
+
+#### aii-evm
+
+- `RevmDb::code_by_hash` now looks the bytecode up via
+  `StateDb::code_get` instead of returning empty. Contracts deployed
+  in earlier transactions can now be CALLed.
+- `RevmDb::storage` now looks the slot up via `StateDb::storage_get`
+  instead of returning `U256::ZERO`. `SLOAD` returns the last
+  persisted value.
+- `execute_with_revm` now commits the full revm state diff per tx:
+  account header (nonce/balance/code_hash), newly-deployed bytecode
+  (`info.code` → `code_put`), and every changed storage slot
+  (`slot.is_changed()` → `storage_put`).
+
+### Tests (3 new, all RED → GREEN)
+
+- `deploy_persists_runtime_bytecode_under_code_hash` — deploys a
+  hand-crafted 18-byte contract; verifies that the runtime bytecode is
+  retrievable from the Code CF by the resulting `account.code_hash`.
+- `calling_writer_persists_storage_slot` — deploys a writer contract
+  (`SSTORE(0, 0x42)`), CALLs it in a *separate* `execute_with_revm`
+  invocation, and verifies the slot persists. This is the test that
+  exercises the cross-tx `code_by_hash` lookup.
+- `reader_recovers_persisted_storage` — deploys a reader
+  (`SLOAD(0); RETURN`), seeds `storage[reader][0] = 0x77` via
+  `StateDb`, then CALLs the reader and verifies it returns the
+  pre-seeded value in the 32-byte output buffer.
+
+### Out of scope (deferred)
+
+- Per-account storage trie + storage root in `Account` — flat KV is
+  semantically equivalent for revm; the trie matters once we hash
+  state roots for headers.
+- Block-hash lookup in `RevmDb::block_hash` — still a deterministic
+  placeholder; lands once `aii-node` exposes a header index.
+
 ## [0.0.19] — 2026-05-24
 
 ### Added — aii-wasm scoped sub-chain VM

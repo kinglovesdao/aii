@@ -6,22 +6,21 @@
 //! when [`crate::execute_with_revm`] explicitly commits the post-tx
 //! state back.
 //!
-//! ## Limitations (v0.0.16)
-//! - **Storage trie** is not yet wired (`storage` returns `U256::ZERO`).
-//!   This is fine for value-transfer / simple bytecode that doesn't
-//!   read EVM storage, but a real ERC-20 etc. will need it.
-//! - **Code lookup by hash** is not wired (`code_by_hash` returns empty
-//!   bytecode). Contracts deployed in-memory during a single transaction
-//!   still work because `revm` caches the deployed bytecode internally.
-//! - **`block_hash`** returns a deterministic placeholder.
+//! ## v0.0.20
 //!
-//! These TODOs all need extra columns in `aii-storage` + per-account
-//! storage tries in `aii-state` (planned for v0.0.17+).
+//! Reads are now backed by real persistent storage:
+//!
+//! - `code_by_hash` consults [`StateDb::code_get`] — contracts deployed
+//!   in earlier transactions can be CALLed in later ones.
+//! - `storage` consults [`StateDb::storage_get`] — `SLOAD` returns the
+//!   last persisted value for the (address, slot) pair.
+//! - `block_hash` still returns a deterministic placeholder. Real
+//!   block-hash lookup lands once `aii-node` exposes a header index.
 
 use aii_state::StateDb;
 use aii_storage::KvBackend;
-use aii_types::Address as AiiAddress;
-use revm::primitives::{AccountInfo, Address, Bytecode, B256, U256};
+use aii_types::{Address as AiiAddress, H256 as AiiH256};
+use revm::primitives::{AccountInfo, Address, Bytecode, Bytes, B256, U256};
 use revm::Database;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -62,16 +61,24 @@ impl<B: KvBackend> Database for RevmDb<B> {
         }))
     }
 
-    fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // v0.0.16: no on-chain code lookup yet. Contracts deployed in the
-        // current transaction still execute because revm caches the body.
-        Ok(Bytecode::new())
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        let hash = AiiH256::new(*code_hash.as_slice().first_chunk::<32>().unwrap());
+        let Ok(Some(bytes)) = self.state.code_get(&hash) else {
+            return Ok(Bytecode::new());
+        };
+        // `new_raw` accepts already-validated bytecode without
+        // re-jumpdest analysis at this call site; revm will re-analyse
+        // internally as needed.
+        Ok(Bytecode::new_raw(Bytes::from(bytes)))
     }
 
-    fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
-        // v0.0.16: per-account storage trie not yet wired. All slots read
-        // as zero — correct for newly-created contracts.
-        Ok(U256::ZERO)
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        let aii_addr = AiiAddress::new(address.into_array());
+        let slot = AiiH256::new(index.to_be_bytes::<32>());
+        let Ok(value) = self.state.storage_get(&aii_addr, &slot) else {
+            return Ok(U256::ZERO);
+        };
+        Ok(U256::from_be_bytes(*value.as_bytes()))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
