@@ -1,0 +1,39 @@
+[package]
+name = "aii-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aii — user-facing CLI for the AII protocol (wallet / tx / chain queries via JSON-RPC)."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "aii"
+path = "src/main.rs"
+
+[dependencies]
+aii-types = { workspace = true }
+aii-wallet = { workspace = true }
+aii-rpc = { workspace = true }
+aii-onboarding = { workspace = true }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net"] }
+jsonrpsee = { version = "0.26", default-features = false, features = ["client", "http-client"] }
+hex = { workspace = true }
+rand = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+aii-config = { workspace = true }
+aii-node = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "net", "time"] }
