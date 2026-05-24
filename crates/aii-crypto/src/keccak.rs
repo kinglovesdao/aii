@@ -27,9 +27,8 @@ mod tests {
     #[test]
     fn keccak256_empty_matches_eth_kat() {
         let got = keccak256(b"");
-        let want =
-            hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
-                .unwrap();
+        let want = hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+            .unwrap();
         assert_eq!(got.as_bytes(), &want.as_slice()[..32]);
     }
 
@@ -37,9 +36,8 @@ mod tests {
     #[test]
     fn keccak256_abc_matches_kat() {
         let got = keccak256(b"abc");
-        let want =
-            hex::decode("4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
-                .unwrap();
+        let want = hex::decode("4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
+            .unwrap();
         assert_eq!(got.as_bytes(), &want.as_slice()[..32]);
     }
 
@@ -48,9 +46,8 @@ mod tests {
     fn keccak256_million_a_matches_kat() {
         let input = vec![b'a'; 1_000_000];
         let got = keccak256(&input);
-        let want =
-            hex::decode("fadae6b49f129bbb812be8407b7b2894f34aecf6dbd1f9b0f0c7e9853098fc96")
-                .unwrap();
+        let want = hex::decode("fadae6b49f129bbb812be8407b7b2894f34aecf6dbd1f9b0f0c7e9853098fc96")
+            .unwrap();
         assert_eq!(got.as_bytes(), &want.as_slice()[..32]);
     }
 

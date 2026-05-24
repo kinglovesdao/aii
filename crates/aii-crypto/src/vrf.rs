@@ -66,7 +66,9 @@ impl SecretKey {
     /// # Errors
     /// Returns [`CryptoError::InvalidEncoding`] for malformed inputs.
     pub fn from_bytes(bytes: &[u8; 64]) -> Result<Self, CryptoError> {
-        SrSecretKey::from_bytes(bytes).map(Self).map_err(map_sig_err)
+        SrSecretKey::from_bytes(bytes)
+            .map(Self)
+            .map_err(map_sig_err)
     }
 
     /// 64-byte serialized form.
@@ -88,7 +90,9 @@ impl PublicKey {
     /// # Errors
     /// Returns [`CryptoError::InvalidEncoding`] for off-curve inputs.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, CryptoError> {
-        SrPublicKey::from_bytes(bytes).map(Self).map_err(map_sig_err)
+        SrPublicKey::from_bytes(bytes)
+            .map(Self)
+            .map_err(map_sig_err)
     }
 
     /// 32-byte serialized form.
@@ -132,10 +136,9 @@ pub fn verify(
 ) -> Result<[u8; VRF_OUTPUT_LENGTH], CryptoError> {
     let pre_out = VRFPreOut::from_bytes(&proof.pre_output).map_err(map_sig_err)?;
     let p = VRFProof::from_bytes(&proof.proof).map_err(map_sig_err)?;
-    let (io, _) = pk
-        .0
-        .vrf_verify(transcript(input), &pre_out, &p)
-        .map_err(|_| CryptoError::BadSignature)?;
+    let (io, _) =
+        pk.0.vrf_verify(transcript(input), &pre_out, &p)
+            .map_err(|_| CryptoError::BadSignature)?;
     Ok(io.make_bytes::<[u8; VRF_OUTPUT_LENGTH]>(OUTPUT_LABEL))
 }
 

@@ -117,8 +117,9 @@ impl Signature {
     pub fn from_bytes(bytes: &[u8; 65]) -> Result<Self, CryptoError> {
         let inner = EcdsaSignature::from_slice(&bytes[..64])
             .map_err(|_| CryptoError::InvalidEncoding("secp256k1 signature scalars invalid"))?;
-        let recovery_id = RecoveryId::from_byte(bytes[64])
-            .ok_or(CryptoError::InvalidEncoding("secp256k1 recovery id not in {0,1}"))?;
+        let recovery_id = RecoveryId::from_byte(bytes[64]).ok_or(CryptoError::InvalidEncoding(
+            "secp256k1 recovery id not in {0,1}",
+        ))?;
         Ok(Self { inner, recovery_id })
     }
 
@@ -146,11 +147,13 @@ impl Signature {
 /// Returns [`CryptoError::InvalidEncoding`] only if the underlying ECDSA
 /// engine fails internally (unreachable for well-formed inputs).
 pub fn sign(sk: &SecretKey, message_hash: &H256) -> Result<Signature, CryptoError> {
-    let (sig, recid) = sk
-        .0
-        .sign_prehash_recoverable(message_hash.as_bytes())
-        .map_err(|_| CryptoError::InvalidEncoding("secp256k1 signing failed"))?;
-    Ok(Signature { inner: sig, recovery_id: recid })
+    let (sig, recid) =
+        sk.0.sign_prehash_recoverable(message_hash.as_bytes())
+            .map_err(|_| CryptoError::InvalidEncoding("secp256k1 signing failed"))?;
+    Ok(Signature {
+        inner: sig,
+        recovery_id: recid,
+    })
 }
 
 /// Verify that `sig` is a valid signature over `message_hash` by `pk`.
@@ -210,7 +213,10 @@ mod tests {
         let h = keccak256(b"original");
         let sig = sign(&sk, &h).unwrap();
         let other = keccak256(b"tampered");
-        assert!(matches!(verify(&sig, &other, &pk), Err(CryptoError::BadSignature)));
+        assert!(matches!(
+            verify(&sig, &other, &pk),
+            Err(CryptoError::BadSignature)
+        ));
     }
 
     #[test]

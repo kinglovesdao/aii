@@ -16,8 +16,8 @@
 
 use aii_types::{BlsPubKey, BlsSignature};
 use blst::min_pk::{
-    AggregatePublicKey, AggregateSignature, PublicKey as BlstPubKey,
-    SecretKey as BlstSecretKey, Signature as BlstSignature,
+    AggregatePublicKey, AggregateSignature, PublicKey as BlstPubKey, SecretKey as BlstSecretKey,
+    Signature as BlstSignature,
 };
 use blst::BLST_ERROR;
 
@@ -236,7 +236,10 @@ mod tests {
         let sk = sk_from_seed(7);
         let pk = sk.public_key();
         let sig = sk.sign(b"original");
-        assert!(matches!(sig.verify(b"tampered", &pk), Err(CryptoError::BadSignature)));
+        assert!(matches!(
+            sig.verify(b"tampered", &pk),
+            Err(CryptoError::BadSignature)
+        ));
     }
 
     #[test]
