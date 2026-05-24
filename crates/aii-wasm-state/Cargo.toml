@@ -1,0 +1,21 @@
+[package]
+name = "aii-wasm-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Bridge crate: lets aii-wasm sub-chain contracts read/write aii-state::StateDb."
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-wasm.workspace = true
+aii-state.workspace = true
+aii-storage.workspace = true
+aii-types.workspace = true
+
+[dev-dependencies]
+wat = "1"
