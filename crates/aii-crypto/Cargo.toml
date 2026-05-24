@@ -19,6 +19,7 @@ tracing = { workspace = true }
 hex = { workspace = true }
 tiny-keccak = { version = "2", features = ["keccak"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+blst = "0.3"
 
 [dev-dependencies]
 proptest = { workspace = true }
