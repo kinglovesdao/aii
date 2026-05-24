@@ -5,6 +5,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16] — 2026-05-24
+
+### Added — `aii-evm` revm 18 integration (contract execution)
+
+- **`aii-evm::RevmDb`** — `revm::Database` adapter over
+  `aii_state::StateDb`. Reads accounts on demand; emits empty bytecode
+  / empty storage as a stop-gap (per-account storage trie lands in
+  v0.0.17+).
+- **`aii-evm::execute_with_revm`** — runs a tx through revm 18 and
+  commits the resulting state diff back to `StateDb`. Handles:
+  - Value transfer (sender/recipient balance + nonce updates).
+  - Contract CALL with arbitrary calldata.
+  - Contract CREATE — returns the deployed address.
+  - Insufficient balance / invalid signature paths produce
+    `ExecError::Revm` from revm's pre-tx validation.
+- **`ExecutionSummary`** — `success` / `gas_used` / `output` /
+  `deployed_contract`.
+
+### Tests (4 new revm-driven cases, 10 total in `aii-evm`)
+- `revm_value_transfer_advances_balances` — balance + nonce diff after
+  a 123-Wei transfer.
+- `revm_insufficient_balance_returns_failure_or_error` — sender below
+  required value rejected by revm's pre-tx validation.
+- `revm_empty_create_deploys_an_address` — empty init code lands at
+  CREATE-derived address.
+- `revm_call_to_eoa_with_zero_value_is_a_no_op_success` — sanity check
+  that revm accepts trivial CALLs.
+
+### Changed
+- Workspace 0.0.15 → 0.0.16.
+- `aii-evm` deps: `revm = "18"`, `derive_more = { version = "1",
+  features = ["full"] }` (revm pulls derive_more without enabling any
+  feature; force the full set).
+
+### Limitations carried into v0.0.17+
+- `RevmDb::storage` returns `U256::ZERO`. Real ERC-20 etc. need a
+  per-account storage trie + storage CF in `aii-storage`.
+- `RevmDb::code_by_hash` returns empty bytecode. Persistent bytecode
+  by `code_hash` is part of the same v0.0.17 work.
+- `block_hash` returns a deterministic placeholder; harmless for tests.
+
 ## [0.0.15] — 2026-05-24
 
 ### Added — `aii-consensus-bft` (scoped) + live block production

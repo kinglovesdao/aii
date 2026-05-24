@@ -1,15 +1,22 @@
 //! # aii-evm
 //!
-//! Execution layer for AII. v0.0.9 supports native value-transfer
-//! execution; EVM bytecode + precompile dispatch land via `revm` later.
+//! Execution layer for AII.
 //!
 //! ## Public API
-//! - [`execute_transfer`] — debit / credit / nonce-bump for a
-//!   `Tx::Legacy` or `Tx::Eip1559` value transfer. Returns a `Receipt`.
-//! - [`ExecError`] umbrella
+//! - [`execute_transfer`] — fast-path value-transfer execution (no
+//!   contract code). Validates nonce + balance and mutates `StateDb`.
+//! - [`execute_with_revm`] — full EVM execution via `revm` 18. Handles
+//!   contract calls, deployments, gas metering, and event logs.
+//! - [`ExecError`] umbrella.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod revm_db;
+pub mod revm_exec;
+
+pub use revm_db::RevmDb;
+pub use revm_exec::{execute_with_revm, ExecutionSummary};
 
 use aii_block::{Bloom, Receipt, Tx, TxType};
 use aii_state::{Account, StateDb, StateError};
@@ -17,11 +24,11 @@ use aii_storage::KvBackend;
 use aii_types::{Address, U256};
 use thiserror::Error;
 
-/// Execute a value-transfer transaction. Mutates the world-state via
-/// `state` and returns a `Receipt`.
+/// Execute a value-transfer transaction (no contract code). Faster than
+/// the full revm path and useful as a sanity oracle.
 ///
-/// `sender` is recovered upstream (via `aii_crypto::secp::recover`) —
-/// this crate trusts it, just like `aii-net-txpool`.
+/// For contract call / CREATE / arbitrary bytecode execution use
+/// [`execute_with_revm`] instead.
 pub fn execute_transfer<B: KvBackend>(
     state: &StateDb<B>,
     sender: Address,
@@ -31,7 +38,6 @@ pub fn execute_transfer<B: KvBackend>(
 
     let to = to.ok_or(ExecError::ContractCallsNotYetSupported)?;
 
-    // Sender must exist and have correct nonce + enough balance for value.
     let mut sender_acc = state.account(&sender)?.unwrap_or(Account::EMPTY);
     if sender_acc.nonce != nonce {
         return Err(ExecError::NonceMismatch {
@@ -43,15 +49,11 @@ pub fn execute_transfer<B: KvBackend>(
         return Err(ExecError::InsufficientBalance);
     }
 
-    // Credit recipient.
     let mut to_acc = state.account(&to)?.unwrap_or(Account::EMPTY);
     if !to_acc.is_eoa() {
-        // For v0.0.9 we only handle EOA→EOA; bail loudly so an integrator
-        // notices that contract receivers need the revm path.
         return Err(ExecError::ContractCallsNotYetSupported);
     }
 
-    // Apply.
     sender_acc.balance -= value;
     sender_acc.nonce = sender_acc.nonce.wrapping_add(1);
     to_acc.balance = to_acc.balance.wrapping_add(value);
@@ -59,7 +61,6 @@ pub fn execute_transfer<B: KvBackend>(
     state.set_account(&sender, &sender_acc)?;
     state.set_account(&to, &to_acc)?;
 
-    // Build receipt — value transfers consume the base 21,000 gas; no logs.
     Ok(Receipt {
         tx_type: match tx {
             Tx::Legacy(_) => TxType::Legacy,
@@ -102,10 +103,14 @@ pub enum ExecError {
     #[error("insufficient balance")]
     InsufficientBalance,
 
-    /// Contract creation / call (or contract recipient) — revm integration
-    /// hasn't landed yet.
-    #[error("contract call/creation not yet supported (revm integration pending)")]
+    /// Contract creation or call path on the *fast* `execute_transfer`
+    /// route. Use [`execute_with_revm`] for contract execution.
+    #[error("contract execution requires execute_with_revm")]
     ContractCallsNotYetSupported,
+
+    /// REVM execution failure.
+    #[error("revm: {0}")]
+    Revm(String),
 }
 
 #[cfg(test)]
@@ -117,12 +122,12 @@ mod tests {
     use aii_types::{AlgoId, H256};
     use std::sync::Arc;
 
-    fn fresh_state_with_alice() -> (StateDb<MemoryBackend>, Address) {
-        let state = StateDb::new(Arc::new(MemoryBackend::new()));
+    fn fresh_state_with_alice() -> (Arc<StateDb<MemoryBackend>>, Address) {
+        let state = Arc::new(StateDb::new(Arc::new(MemoryBackend::new())));
         let alice = Address::new([0x01; 20]);
         let acc = Account {
             nonce: 0,
-            balance: U256::from(1_000_000_000_000_000_000u64), // 1 AII
+            balance: U256::from(1_000_000_000_000_000_000u64),
             ..Account::EMPTY
         };
         state.set_account(&alice, &acc).unwrap();
@@ -165,7 +170,7 @@ mod tests {
     fn nonce_mismatch_rejects() {
         let (state, alice) = fresh_state_with_alice();
         let bob = Address::new([0x02; 20]);
-        let tx = make_tx(5, Some(bob), 100); // Alice's nonce is 0
+        let tx = make_tx(5, Some(bob), 100);
         let err = execute_transfer(&state, alice, &tx);
         match err {
             Err(ExecError::NonceMismatch {
@@ -187,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_creation_rejected() {
+    fn contract_creation_rejected_on_fast_path() {
         let (state, alice) = fresh_state_with_alice();
         let tx = make_tx(0, None, 0);
         let err = execute_transfer(&state, alice, &tx);
@@ -195,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_recipient_rejected() {
+    fn contract_recipient_rejected_on_fast_path() {
         let (state, alice) = fresh_state_with_alice();
         let contract = Address::new([0x03; 20]);
         state
