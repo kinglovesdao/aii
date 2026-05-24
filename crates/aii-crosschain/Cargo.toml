@@ -1,0 +1,21 @@
+[package]
+name = "aii-crosschain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Cross-chain primitives for AII — HTLC, multisig bridges, IBC adapters."
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types.workspace = true
+aii-crypto.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+hex.workspace = true

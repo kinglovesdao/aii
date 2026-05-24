@@ -79,19 +79,26 @@ proptest! {
             0..10
         )
     ) {
-        let db = MemoryBackend::new();
+        // Collapse duplicate keys to last-write-wins so the verification
+        // sees the same state the backend actually holds.
+        let mut expected: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
         for (k, v) in &seed_pairs {
+            expected.insert(k.clone(), v.clone());
+        }
+
+        let db = MemoryBackend::new();
+        for (k, v) in &expected {
             db.put(ColumnFamily::State, k, v).unwrap();
         }
         let snap = db.snapshot();
 
         // Mutate after the snapshot.
-        for (k, _) in &seed_pairs {
+        for k in expected.keys() {
             db.put(ColumnFamily::State, k, b"OVERWRITTEN").unwrap();
         }
 
         // Snapshot must still report the original values.
-        for (k, v) in &seed_pairs {
+        for (k, v) in &expected {
             let got = snap.get(ColumnFamily::State, k).unwrap();
             prop_assert_eq!(got.as_deref(), Some(&v[..]));
         }
