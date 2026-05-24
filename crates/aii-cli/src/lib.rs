@@ -8,7 +8,7 @@
 #![warn(missing_docs)]
 
 use aii_onboarding::{detect, recommend_tier, score, Tier};
-use aii_wallet::{EncryptedKeystore, LocalWallet, ScryptParams};
+use aii_wallet::{EncryptedKeystore, LocalWallet, MnemonicPhrase, ScryptParams};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
@@ -132,6 +132,45 @@ pub fn run_account_verify(
     Ok(w.address())
 }
 
+/// Result of `aii account mnemonic`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MnemonicReport {
+    /// Space-separated BIP-39 phrase.
+    pub phrase: String,
+    /// Number of words (12 / 15 / 18 / 21 / 24).
+    pub word_count: usize,
+    /// First derived address (BIP-44 path m/44'/60'/0'/0/0, empty passphrase).
+    pub address: String,
+}
+
+/// Generate a fresh BIP-39 mnemonic + derive its first ETH-compatible
+/// address. The phrase is returned; the caller is responsible for
+/// recording it somewhere safe.
+pub fn run_account_mnemonic(word_count: usize) -> Result<MnemonicReport, CliError> {
+    let m = MnemonicPhrase::generate(word_count).map_err(|e| CliError::Client(e.to_string()))?;
+    let w = m
+        .to_wallet("", 0)
+        .map_err(|e| CliError::Client(e.to_string()))?;
+    Ok(MnemonicReport {
+        phrase: m.to_phrase(),
+        word_count: m.word_count(),
+        address: format!("0x{}", hex::encode(w.address().as_bytes())),
+    })
+}
+
+/// Re-derive an address from a known mnemonic + index.
+pub fn run_account_from_mnemonic(
+    phrase: &str,
+    passphrase: &str,
+    index: u32,
+) -> Result<aii_types::Address, CliError> {
+    let m = MnemonicPhrase::from_phrase(phrase).map_err(|e| CliError::Client(e.to_string()))?;
+    let w = m
+        .to_wallet(passphrase, index)
+        .map_err(|e| CliError::Client(e.to_string()))?;
+    Ok(w.address())
+}
+
 /// Run `aii tier`.
 #[must_use]
 pub fn run_tier() -> TierReport {
@@ -201,6 +240,31 @@ mod tests {
         let json = run_account_new_encrypted("right").unwrap();
         let err = run_account_verify(&json, "wrong");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn account_mnemonic_returns_12_word_phrase_and_address() {
+        let r = run_account_mnemonic(12).unwrap();
+        assert_eq!(r.word_count, 12);
+        assert_eq!(r.phrase.split_whitespace().count(), 12);
+        assert!(r.address.starts_with("0x"));
+        assert_eq!(r.address.len(), 42);
+    }
+
+    #[test]
+    fn account_from_mnemonic_matches_canonical_fixture() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let addr = run_account_from_mnemonic(phrase, "", 0).unwrap();
+        // Canonical MetaMask / ethers fixture.
+        assert_eq!(
+            hex::encode(addr.as_bytes()).to_lowercase(),
+            "9858effd232b4033e47d90003d41ec34ecaeda94"
+        );
+    }
+
+    #[test]
+    fn account_from_mnemonic_rejects_bad_phrase() {
+        assert!(run_account_from_mnemonic("not a real phrase", "", 0).is_err());
     }
 
     #[test]

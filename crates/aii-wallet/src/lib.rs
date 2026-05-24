@@ -16,7 +16,9 @@
 #![warn(missing_docs)]
 
 pub mod keystore;
+pub mod mnemonic;
 mod wallet;
 
 pub use keystore::{EncryptedKeystore, ScryptParams};
+pub use mnemonic::{MnemonicError, MnemonicPhrase, ETH_BIP44_PREFIX};
 pub use wallet::{LocalWallet, WalletError};

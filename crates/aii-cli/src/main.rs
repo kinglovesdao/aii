@@ -1,8 +1,8 @@
 //! `aii` — user-facing CLI for the AII protocol.
 
 use aii_cli::{
-    run_account_new, run_account_new_encrypted, run_account_verify, run_chain_id, run_status,
-    run_tier, CliError,
+    run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
+    run_account_verify, run_chain_id, run_status, run_tier, CliError,
 };
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -60,6 +60,24 @@ enum AccountCmd {
         /// Password to test.
         #[arg(long)]
         password: String,
+    },
+    /// Generate a fresh BIP-39 mnemonic + first ETH-compatible address.
+    Mnemonic {
+        /// Word count (12, 15, 18, 21, or 24). Defaults to 12.
+        #[arg(long, default_value = "12")]
+        words: usize,
+    },
+    /// Derive an address from an existing mnemonic phrase.
+    FromMnemonic {
+        /// BIP-39 phrase (quote it on the shell).
+        #[arg(long)]
+        phrase: String,
+        /// Optional BIP-39 passphrase ("25th word"); defaults to empty.
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        /// BIP-44 address index. Defaults to 0.
+        #[arg(long, default_value = "0")]
+        index: u32,
     },
 }
 
@@ -127,6 +145,39 @@ async fn main() -> Result<(), CliError> {
                 );
             } else {
                 println!("ok — address: 0x{}", hex::encode(addr.as_bytes()));
+            }
+        }
+        Cmd::Account {
+            sub: AccountCmd::Mnemonic { words },
+        } => {
+            let r = run_account_mnemonic(words)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&r)?);
+            } else {
+                println!("phrase:  {}", r.phrase);
+                println!("words:   {}", r.word_count);
+                println!("address: {}", r.address);
+            }
+        }
+        Cmd::Account {
+            sub:
+                AccountCmd::FromMnemonic {
+                    phrase,
+                    passphrase,
+                    index,
+                },
+        } => {
+            let addr = run_account_from_mnemonic(&phrase, &passphrase, index)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "address": format!("0x{}", hex::encode(addr.as_bytes())), "index": index })
+                );
+            } else {
+                println!(
+                    "address: 0x{} (index {index})",
+                    hex::encode(addr.as_bytes())
+                );
             }
         }
         Cmd::Tier => {

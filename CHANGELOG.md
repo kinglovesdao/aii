@@ -5,6 +5,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13] — 2026-05-24
+
+### Added — BIP-39 Mnemonic + BIP-32 HD Derivation
+- `aii-wallet::MnemonicPhrase` — BIP-39 mnemonics in English wordlist:
+  - `generate(word_count)` for 12 / 15 / 18 / 21 / 24-word phrases (from
+    OS RNG via `rand::thread_rng`).
+  - `from_phrase(s)` validates checksum + wordlist membership.
+  - `to_seed(passphrase)` produces the canonical 64-byte BIP-39 seed.
+  - `to_wallet(passphrase, index)` derives a `LocalWallet` at BIP-44
+    path `m/44'/60'/0'/0/{index}` (the MetaMask + ethers default).
+- 11 unit tests including:
+  - BIP-39 Trezor official seed test vector (`abandon × 11 about` +
+    "TREZOR" → canonical 64-byte seed).
+  - **MetaMask interop test**: same phrase + empty passphrase + index 0
+    yields `0x9858EfFD232B4033E47d90003D41EC34EcaEda94` — bit-exact
+    match with ethers-rs / web3.js / MetaMask.
+- `aii-cli`: two new commands
+  - `aii account mnemonic [--words 12]`
+    → fresh phrase + first ETH-compatible address.
+  - `aii account from-mnemonic --phrase "..." [--passphrase X] [--index N]`
+    → re-derive any address.
+  - 3 new lib tests + live-verified `aii` binary smoke.
+
+### Changed
+- Workspace version 0.0.12 → 0.0.13.
+- `aii-wallet` deps: `bip39 = "2"`, `bip32 = "0.5"` (RustCrypto).
+
+### Notes
+- BIP-44 coin type `60` (Ethereum) is the default for full MetaMask
+  interop. An AII-native path (coin type ~9999) can ship later as
+  `to_wallet_aii(...)` without breaking the default API.
+- The `aii-mcp` write tools (`send_transaction`, `account_import`)
+  planned for v0.0.14 can now consume a phrase + index instead of a
+  raw secret.
+
 ## [0.0.12] — 2026-05-24
 
 ### Added — Encrypted Keystore (Web3 Secret Storage v3)
