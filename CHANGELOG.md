@@ -5,6 +5,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11] — 2026-05-24
+
+### Added — RPC extension wired to real StateDb
+- `aii-rpc::RpcState` trait gains `gas_price()` and
+  `account(addr) -> Option<AccountView>`. `AccountView` is the JSON
+  shape returned by `aii_getAccount` (nonce + balance hex + roots hex).
+- New methods:
+  - `eth_gasPrice` — returns chain-spec floor as `0x…` hex Wei.
+  - `eth_getBalance(address, blockTag)` — looks up `StateDb` via
+    `RpcState::account`. `blockTag` is accepted but only the head is
+    supported in v0.0.11.
+  - `aii_getAccount(address)` — returns the full Account record or
+    `null`.
+- `aii-node::NodeState` now owns an in-memory `StateDb<MemoryBackend>`
+  and exposes it via `state()`. Pre-populating accounts before booting
+  the RPC server is now a one-liner (`state.state().set_account(...)`).
+
+### Tests
+- 4 new lib tests in `aii-rpc` covering all new methods (happy paths
+  + missing-account + bad-address error).
+- 2 new lib tests in `aii-node` end-to-ending the new methods through
+  jsonrpsee.
+- Live-verified against `aiid` binary:
+  ```
+  $ curl … eth_gasPrice     → "0x3b9aca00"
+  $ curl … eth_getBalance   → "0x0" / "0xde0b6b3a7640000"
+  $ curl … aii_getAccount   → null / {nonce, balance, ...}
+  ```
+
+### Changed
+- Workspace version 0.0.10 → 0.0.11.
+
 ## [0.0.10] — 2026-05-24
 
 ### Added — User-facing surfaces + AI integration
