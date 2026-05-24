@@ -5,6 +5,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.18] — 2026-05-24
+
+### Added — aii-crosschain (scoped HTLC)
+
+- New crate `aii-crosschain` providing the on-chain state machine for
+  Hash Time-Locked Contracts — the building block for trustless atomic
+  swaps between AII and external chains.
+  - `Htlc` record (sender, recipient, amount, secret_hash, timeout,
+    state) with a `Locked → Claimed | Refunded` finite state machine.
+  - `Htlc::claim(preimage)` — transitions iff `keccak256(preimage) ==
+    secret_hash`. Wrong preimage rejected; state preserved.
+  - `Htlc::refund(now)` — transitions iff `now ≥ timeout`. Early refund
+    rejected; state preserved.
+  - `Htlc::new()` rejects zero amount and `sender == recipient`.
+  - Terminal states are sticky: double-claim, claim-after-refund, and
+    refund-after-claim are all rejected via `HtlcError::NotLocked`.
+  - `htlc_id(&Htlc)` — content-addressed identifier
+    `keccak256(sender ‖ recipient ‖ amount ‖ secret_hash ‖ timeout)`
+    used by cross-chain protocols to reference a lock without an
+    index. Stable across nodes; independent of lifecycle state.
+- 14 unit tests including TDD RED → GREEN cycle verification.
+
+### Fixed
+
+- `aii-storage` proptest `snapshot_unchanged_under_concurrent_writer`
+  no longer fails on duplicate-key inputs. The test now dedups
+  `seed_pairs` via `BTreeMap` (last-write-wins) before seeding and
+  verifying, matching the backend's actual semantics.
+
+### Scope notes
+
+Out of scope for this release: multi-sig bridge federation (Aii ↔
+Ethereum custodial), IBC light clients, Polkadot XCM adapters. These
+build on the HTLC primitive and will land in later releases.
+
 ## [0.0.17] — 2026-05-24
 
 ### Added — devp2p Discovery v4 (UDP) — Ping / Pong
