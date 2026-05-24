@@ -21,6 +21,7 @@ members = [
     "crates/aii-net-sync",
     "crates/aii-onboarding",
     "crates/aii-cli",
+    "crates/aii-mcp",
 ]
 
 [workspace.package]
@@ -63,6 +64,7 @@ aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.9" }
 aii-net-sync = { path = "crates/aii-net-sync", version = "0.0.9" }
 aii-onboarding = { path = "crates/aii-onboarding", version = "0.0.9" }
 aii-cli = { path = "crates/aii-cli", version = "0.0.9" }
+aii-mcp = { path = "crates/aii-mcp", version = "0.0.9" }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [workspace.lints.rust]
