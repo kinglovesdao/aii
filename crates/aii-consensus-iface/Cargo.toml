@@ -1,0 +1,18 @@
+[package]
+name = "aii-consensus-iface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Consensus-engine traits for AII (Engine + Proposer + Voter)."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-block = { workspace = true }
+thiserror = { workspace = true }
