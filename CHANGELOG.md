@@ -5,6 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4] — 2026-05-24
+
+### Added
+- New crate `aii-storage` (M0 #4 — final basestone crate):
+  - `KvBackend` trait (sync get/put/delete/write/snapshot/iter/iter_prefix)
+    and `Snapshot` trait (read-only consistent view).
+  - `ColumnFamily` closed enum: 10 variants covering headers / bodies /
+    receipts / transactions / state / account_storage / tx_lookup / meta
+    / microchain / default. Stable snake_case wire names; adding a
+    variant requires a spec revision.
+  - `WriteBatch` backend-agnostic op log; cross-CF atomic on commit.
+  - `RocksDbBackend` (default feature `rocksdb`) — wraps rocksdb 0.22
+    with lz4 compression, opens every CF via `ColumnFamily::ALL`.
+  - `MemoryBackend` (always on) — `Arc<RwLock<HashMap<CF, BTreeMap>>>`
+    for downstream-crate unit tests; snapshot via `Arc` clone.
+  - `StorageError` umbrella (`Backend` / `InvalidColumnFamily` / `Io`).
+- 8-test conformance suite parametrised over both backends (16 runs);
+  2 property tests (Op-sequence equivalence + snapshot isolation);
+  criterion benchmark meeting the M0 >=50k op/s sequential-write gate;
+  `scripts/check_storage_perf.sh` CI helper.
+- Workspace deps: `rocksdb 0.22`, `tempfile 3`, `criterion 0.5`.
+
+### Changed
+- Workspace version 0.0.3 → 0.0.4.
+
+### Notes
+- All four M0 basestone crates are now landed (types / codec / crypto /
+  storage). M1 (state / EVM / block / net-*) begins next.
+- Per spec §5.3, `aii-storage` is **not** published to crates.io until M2.
+
 ## [0.0.3] — 2026-05-24
 
 ### Added

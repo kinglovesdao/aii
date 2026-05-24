@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -27,10 +27,10 @@ proptest = "1"
 quickcheck = "1"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-aii-types = { path = "crates/aii-types", version = "0.0.3" }
-aii-codec = { path = "crates/aii-codec", version = "0.0.3" }
-aii-crypto = { path = "crates/aii-crypto", version = "0.0.3" }
-aii-storage = { path = "crates/aii-storage", version = "0.0.3" }
+aii-types = { path = "crates/aii-types", version = "0.0.4" }
+aii-codec = { path = "crates/aii-codec", version = "0.0.4" }
+aii-crypto = { path = "crates/aii-crypto", version = "0.0.4" }
+aii-storage = { path = "crates/aii-storage", version = "0.0.4" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
