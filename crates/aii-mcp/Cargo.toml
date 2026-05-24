@@ -1,0 +1,32 @@
+[package]
+name = "aii-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Model Context Protocol (MCP) server for AII — read-only tools exposed to Claude / Cursor / Cline."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "aii-mcp"
+path = "src/main.rs"
+
+[dependencies]
+aii-types = { workspace = true }
+aii-cli = { workspace = true }
+aii-onboarding = { workspace = true }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "io-util", "time"] }
