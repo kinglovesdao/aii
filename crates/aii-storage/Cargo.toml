@@ -9,22 +9,35 @@ authors.workspace = true
 description = "Key-value storage abstraction for the AII protocol (RocksDB + in-memory backends)"
 readme = "README.md"
 
-[lints]
-workspace = true
+[lints.rust]
+# Workspace forbids `unsafe_code`, but RocksDbBackend needs ONE
+# std::mem::transmute to lift the snapshot lifetime to 'static (the
+# Arc<DB> we keep alive guarantees correctness). We downgrade to `deny`
+# at the crate level so the gated `#[allow(unsafe_code)]` in `rocksdb.rs`
+# is honored; all other modules still reject unsafe.
+unsafe_code = "deny"
+missing_docs = "warn"
 
-[features]
-default = ["rocksdb"]
-rocksdb = ["dep:rocksdb"]
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = "warn"
+nursery = "warn"
 
 [dependencies]
 aii-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"], optional = true }
+# `tempfile` is needed at non-dev-build time because `RocksDbBackend::open_in_temp`
+# is a public API surface (used by downstream crates' integration tests + benches).
+tempfile = { version = "3", optional = true }
+
+[features]
+default = ["rocksdb"]
+rocksdb = ["dep:rocksdb", "dep:tempfile"]
 
 [dev-dependencies]
 proptest = { workspace = true }
-tempfile = "3"
 
 [[bench]]
 name = "write_throughput"

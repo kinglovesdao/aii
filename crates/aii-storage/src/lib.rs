@@ -14,8 +14,9 @@
 //! | [`backend`] | [`KvBackend`] trait — the public abstraction.                  |
 //! | [`snapshot`]| [`Snapshot`] trait — read-only consistent view.                |
 //! | [`memory`]  | [`MemoryBackend`] — `BTreeMap` per CF, for tests.              |
+//! | [`rocksdb`] | [`RocksDbBackend`] — production RocksDB backend (feature `rocksdb`). |
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(not(any(test, feature = "rocksdb")), forbid(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod backend;
@@ -23,6 +24,8 @@ pub mod batch;
 pub mod cf;
 pub mod error;
 pub mod memory;
+#[cfg(feature = "rocksdb")]
+pub mod rocksdb;
 pub mod snapshot;
 
 pub use backend::KvBackend;
@@ -30,4 +33,6 @@ pub use batch::{Op, WriteBatch};
 pub use cf::ColumnFamily;
 pub use error::StorageError;
 pub use memory::{MemoryBackend, MemorySnapshot};
+#[cfg(feature = "rocksdb")]
+pub use rocksdb::{RocksDbBackend, RocksDbSnapshot};
 pub use snapshot::{KvIter, Snapshot};
