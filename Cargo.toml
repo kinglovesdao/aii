@@ -15,6 +15,7 @@ members = [
     "crates/aii-net-txpool",
     "crates/aii-microchain",
     "crates/aii-rpc",
+    "crates/aii-node",
 ]
 
 [workspace.package]
@@ -51,6 +52,7 @@ aii-vnode = { path = "crates/aii-vnode", version = "0.0.7" }
 aii-net-txpool = { path = "crates/aii-net-txpool", version = "0.0.7" }
 aii-microchain = { path = "crates/aii-microchain", version = "0.0.7" }
 aii-rpc = { path = "crates/aii-rpc", version = "0.0.7" }
+aii-node = { path = "crates/aii-node", version = "0.0.7" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
