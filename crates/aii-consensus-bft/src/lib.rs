@@ -18,6 +18,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bft;
+pub use bft::{
+    LeaderProof, PrecommitCertificate, PrecommitTallier, PrecommitVote, TallyState, Validator,
+    ValidatorSet, MAX_VALIDATORS,
+};
+
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
 use aii_types::{Address, H256, U256};
@@ -158,6 +164,10 @@ impl Engine for DevModeEngine {
 const fn static_msg(e: &BftError) -> &'static str {
     match e {
         BftError::Overflow => "block number overflowed u64",
+        // The block-producer path only ever raises `Overflow`. The bft
+        // submodule's errors are surfaced through its own API, never
+        // through `static_msg`.
+        _ => "bft error (see BftError variant for details)",
     }
 }
 
@@ -167,6 +177,56 @@ pub enum BftError {
     /// Block number would overflow `u64` (impossible in practice).
     #[error("block number overflow")]
     Overflow,
+
+    /// `ValidatorSet::new` called with no validators.
+    #[error("validator set must be non-empty")]
+    EmptyValidatorSet,
+
+    /// `ValidatorSet::new` called with more than [`MAX_VALIDATORS`] entries.
+    #[error("validator set size {got} exceeds maximum {max}")]
+    ValidatorSetTooLarge {
+        /// Validators supplied.
+        got: usize,
+        /// Maximum permitted.
+        max: usize,
+    },
+
+    /// `Σ stake` would overflow `u64`.
+    #[error("total stake overflows u64")]
+    TotalStakeOverflow,
+
+    /// `Σ stake == 0` — no validator has any stake.
+    #[error("total stake is zero")]
+    ZeroTotalStake,
+
+    /// Vote's `block_hash` does not match the tallier's block.
+    #[error("vote targets a different block hash than this tallier")]
+    WrongBlockHash,
+
+    /// Vote's `height` does not match the tallier's height.
+    #[error("vote targets a different height than this tallier")]
+    WrongHeight,
+
+    /// Vote's `validator_index` is outside the set.
+    #[error("validator index {index} out of bounds for set of size {size}")]
+    ValidatorIndexOutOfBounds {
+        /// Index supplied by the vote.
+        index: u32,
+        /// Validator set size at tally time.
+        size: usize,
+    },
+
+    /// Validator at this index has already voted.
+    #[error("validator {0} has already voted")]
+    DuplicateVote(u32),
+
+    /// BLS signature failed to verify against the validator's pubkey.
+    #[error("invalid BLS signature")]
+    InvalidBlsSignature,
+
+    /// VRF proof failed to verify.
+    #[error("invalid VRF proof")]
+    InvalidVrfProof,
 }
 
 #[cfg(test)]
