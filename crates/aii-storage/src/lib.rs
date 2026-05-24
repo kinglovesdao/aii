@@ -10,12 +10,15 @@
 //! |------------|----------------------------------------------------------------|
 //! | [`cf`]     | [`ColumnFamily`] closed enum + stable wire names.              |
 //! | [`error`]  | [`StorageError`] umbrella over per-backend errors.             |
+//! | [`batch`]  | [`WriteBatch`] backend-agnostic op log.                        |
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![warn(missing_docs)]
 
+pub mod batch;
 pub mod cf;
 pub mod error;
 
+pub use batch::{Op, WriteBatch};
 pub use cf::ColumnFamily;
 pub use error::StorageError;
