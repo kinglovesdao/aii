@@ -5,6 +5,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14] — 2026-05-24
+
+### Added — `aii-mcp` keystore + mnemonic tools (4 new MCP tools)
+- `account_new_encrypted(password)` — generate a fresh secp256k1 key
+  and return a Web3 v3 keystore JSON encrypted under `password`.
+- `account_verify(keystore_json, password)` — confirm a password
+  unlocks a keystore; return the embedded address on success.
+- `mnemonic_new(words)` — generate a fresh BIP-39 phrase (12 / 15 /
+  18 / 21 / 24 words) + derive the first ETH-compatible address.
+- `account_from_mnemonic(phrase, passphrase, index)` — re-derive any
+  address from a known phrase. Verified live against the canonical
+  `0x9858EfFD…` ethers/MetaMask fixture.
+
+These tools let MCP clients (Claude Desktop / Claude Code / Cursor /
+Cline) walk a user through creating, securing, and recovering an AII
+account *without* ever touching the protocol RPC layer — the keystore
+and mnemonic primitives are pure local computation.
+
+### Tests
+- 14 lib tests in `aii-mcp` (up from 7) covering all 4 new tools +
+  the updated `tools/list` count + arg validation.
+- Live stdio smoke verified end-to-end via piped JSON-RPC over
+  `target/debug/aii-mcp` (4 tools roundtripped through the stdio
+  parser).
+
+### Changed
+- Workspace version 0.0.13 → 0.0.14.
+- `aii-mcp::handle_tools_call` now reads `arguments` from the MCP
+  `tools/call` envelope (was previously ignoring it because the four
+  v0.0.10 tools took no args).
+
+### Notes
+- Write tools (`send_transaction`, etc.) that *do* require RPC
+  submission land in v0.0.15+ once `aii-rpc::eth_sendRawTransaction`
+  + a wired mempool exist.
+
 ## [0.0.13] — 2026-05-24
 
 ### Added — BIP-39 Mnemonic + BIP-32 HD Derivation
