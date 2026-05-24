@@ -5,6 +5,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.21] — 2026-05-24
+
+### Added — federated multisig bridge `Vault`
+
+aii-crosschain grows a second cross-chain primitive next to HTLC: a
+BLS-aggregated threshold multisig `Vault`. A federation of `n` validators
+signs a `LockReceipt` (proof of asset lock on the source chain); the
+on-chain `Vault` accepts the release iff at least `t` signers participate,
+the aggregated BLS signature verifies over the receipt digest, and the
+nonce has not been used before.
+
+#### aii-crosschain
+
+- Module split: existing HTLC content moved from `lib.rs` into a new
+  `htlc` submodule. Public path is now `aii_crosschain::htlc::{Htlc, ...}`
+  (no external consumers existed; no compat shim).
+- New `federation` submodule:
+  - `FederationSet { pubkeys, threshold }` — static `t`-of-`n` validator
+    set, content-addressed by `keccak256(threshold_be8 ‖ pubkey₁_compressed
+    ‖ … ‖ pubkeyₙ_compressed)`. Caps `n ≤ 64` so a `u64` signer bitmap is
+    sufficient.
+  - `LockReceipt { src_chain_id, asset, amount, recipient, nonce }` —
+    `digest(federation_id)` domain-separates by federation so receipts
+    cannot be replayed across different federation sets.
+  - `AttestationBundle { receipt, aggregated_sig, signer_bitmap }` — what
+    the off-chain aggregator submits.
+  - `Vault::release(&bundle)` — validates bitmap bounds, threshold,
+    nonce replay, and BLS `fast_aggregate_verify`, in that order. On
+    success returns `Released { receipt }`; the caller performs the
+    actual asset transfer.
+- 13 new TDD tests covering construction validation, content-addressed
+  id, digest determinism, threshold success/failure, signature forgery
+  rejection, replay protection, and bitmap-bounds enforcement.
+
+### Scope discipline (unchanged from HTLC release)
+
+`aii-crosschain` is the on-chain state machine only. Off-chain attester
+clients, source-chain listeners, federation set rotation, IBC light
+clients, and full XCM adapters remain explicit non-goals — they will
+land in later releases.
+
 ## [0.0.20] — 2026-05-24
 
 ### Added — persistent contract state (bytecode + storage)
