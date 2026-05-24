@@ -9,7 +9,7 @@
 //! | [`keccak`] | Keccak-256 hashing — message digests, MPT leaves, address hash. | ✅     |
 //! | [`secp`]   | secp256k1 ECDSA sign / verify / public-key recovery (ETH-style).| ✅     |
 //! | [`bls`]    | BLS12-381 single + aggregate sign / verify (V-node consensus).  | ✅     |
-//! | `vrf`      | Schnorrkel VRF for V-node leader election.                      | ⚪ next|
+//! | [`vrf`]    | Schnorrkel VRF for V-node leader election.                      | ✅     |
 //! | [`error`]  | [`CryptoError`] umbrella over the per-module errors.            | ✅     |
 //!
 //! ## Public API
@@ -29,6 +29,7 @@ pub mod bls;
 pub mod error;
 pub mod keccak;
 pub mod secp;
+pub mod vrf;
 
 pub use error::CryptoError;
 pub use keccak::keccak256;
