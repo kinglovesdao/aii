@@ -24,7 +24,9 @@ aii-rpc = { workspace = true }
 aii-metrics = { workspace = true }
 aii-block = { workspace = true }
 aii-state = { workspace = true }
+aii-consensus-bft = { workspace = true }
 hex = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 async-trait = "0.1"
 serde = { workspace = true }
@@ -32,7 +34,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal"] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "net", "time"] }
