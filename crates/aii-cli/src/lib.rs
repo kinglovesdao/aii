@@ -8,7 +8,7 @@
 #![warn(missing_docs)]
 
 use aii_onboarding::{detect, recommend_tier, score, Tier};
-use aii_wallet::LocalWallet;
+use aii_wallet::{EncryptedKeystore, LocalWallet, ScryptParams};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
@@ -100,6 +100,38 @@ pub struct TierReport {
     pub tier: Tier,
 }
 
+/// Generate a fresh keypair, encrypt it under `password`, and return the
+/// keystore as JSON. The plaintext secret never leaves this function.
+pub fn run_account_new_encrypted(password: &str) -> Result<String, CliError> {
+    let mut rng = rand::thread_rng();
+    for _ in 0..16 {
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        if let Ok(w) = LocalWallet::from_secret_bytes(&bytes) {
+            let ks = EncryptedKeystore::encrypt(&w, password, ScryptParams::light())
+                .map_err(|e| CliError::Client(e.to_string()))?;
+            return Ok(ks.to_json());
+        }
+    }
+    Err(CliError::Client(
+        "RNG produced 16 invalid scalars in a row".into(),
+    ))
+}
+
+/// Verify that `password` decrypts the supplied keystore JSON and return
+/// the embedded address. Used by `aii account verify`.
+pub fn run_account_verify(
+    keystore_json: &str,
+    password: &str,
+) -> Result<aii_types::Address, CliError> {
+    let ks =
+        EncryptedKeystore::from_json(keystore_json).map_err(|e| CliError::Client(e.to_string()))?;
+    let w = ks
+        .decrypt(password)
+        .map_err(|e| CliError::Client(e.to_string()))?;
+    Ok(w.address())
+}
+
 /// Run `aii tier`.
 #[must_use]
 pub fn run_tier() -> TierReport {
@@ -153,6 +185,22 @@ mod tests {
         let a = run_account_new().unwrap();
         let b = run_account_new().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn account_new_encrypted_then_verify_round_trip() {
+        let json = run_account_new_encrypted("hunter2").unwrap();
+        let addr = run_account_verify(&json, "hunter2").unwrap();
+        // JSON is canonical and contains the embedded address — make sure
+        // both paths agree.
+        assert!(json.contains(&hex::encode(addr.as_bytes())));
+    }
+
+    #[test]
+    fn account_verify_wrong_password_errors() {
+        let json = run_account_new_encrypted("right").unwrap();
+        let err = run_account_verify(&json, "wrong");
+        assert!(err.is_err());
     }
 
     #[test]
