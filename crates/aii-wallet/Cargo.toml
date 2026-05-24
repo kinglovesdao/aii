@@ -1,0 +1,25 @@
+[package]
+name = "aii-wallet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Local keystore + transaction signing for AII (secp256k1)."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-crypto = { workspace = true }
+aii-block = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { version = "1.8", default-features = false, features = ["zeroize_derive"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+hex = { workspace = true }
