@@ -1,4 +1,4 @@
-//! ColumnFamily — closed enum of every CF the AII protocol uses.
+//! `ColumnFamily` — closed enum of every CF the AII protocol uses.
 //!
 //! Adding a variant requires a spec revision (`docs/superpowers/specs/
 //! 2026-05-24-aii-storage-design.md` §3). Names are stable wire strings
@@ -9,7 +9,7 @@ use core::fmt;
 /// Every column family in the AII protocol. Closed set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColumnFamily {
-    /// RocksDB default CF (required, almost never written by AII).
+    /// `RocksDB` default CF (required, almost never written by AII).
     Default,
     /// `block_hash → header bytes`.
     Headers,
@@ -46,7 +46,7 @@ impl ColumnFamily {
         Self::MicroChain,
     ];
 
-    /// Stable wire name (snake_case). Used as the RocksDB column-family name.
+    /// Stable wire name (`snake_case`). Used as the `RocksDB` column-family name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

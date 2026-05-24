@@ -1,9 +1,16 @@
 //! In-process [`KvBackend`] backed by `BTreeMap` per column family.
 //!
 //! Intended for unit tests in downstream crates (aii-state, aii-block, ...)
-//! that need a real storage backend without spinning up RocksDB. Snapshot
+//! that need a real storage backend without spinning up `RocksDB`. Snapshot
 //! semantics are achieved by cloning the entire per-CF map into an `Arc`
 //! at snapshot time — O(N) but acceptable for test data sizes.
+
+// The RwLock guard is intentionally held for the duration of each method —
+// the work is bounded (one CF lookup + a clone or collect), so tightening
+// the scope with an explicit `drop` adds noise without measurable benefit.
+// `match … Some(map) => … None => err` is more readable than `map_or_else`
+// for a 2-arm branch that returns different shapes.
+#![allow(clippy::significant_drop_tightening, clippy::option_if_let_else)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -96,10 +103,13 @@ impl KvBackend for MemoryBackend {
         }
     }
 
-    fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a> {
+    fn iter(&self, cf: ColumnFamily) -> KvIter<'_> {
         let store = self.inner.read().expect("memory backend lock poisoned");
         let items: Vec<KvItem> = match store.get(&cf) {
-            Some(map) => map.iter().map(|(k, v)| Ok((k.clone(), v.clone()))).collect(),
+            Some(map) => map
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), v.clone())))
+                .collect(),
             None => vec![Err(StorageError::InvalidColumnFamily(cf))],
         };
         Box::new(items.into_iter())
@@ -134,9 +144,12 @@ impl Snapshot for MemorySnapshot {
         Ok(cf_map.get(key).cloned())
     }
 
-    fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a> {
+    fn iter(&self, cf: ColumnFamily) -> KvIter<'_> {
         let items: Vec<KvItem> = match self.store.get(&cf) {
-            Some(map) => map.iter().map(|(k, v)| Ok((k.clone(), v.clone()))).collect(),
+            Some(map) => map
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), v.clone())))
+                .collect(),
             None => vec![Err(StorageError::InvalidColumnFamily(cf))],
         };
         Box::new(items.into_iter())
@@ -151,7 +164,10 @@ mod tests {
     fn put_then_get_round_trips() {
         let b = MemoryBackend::new();
         b.put(ColumnFamily::State, b"k", b"v").unwrap();
-        assert_eq!(b.get(ColumnFamily::State, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(
+            b.get(ColumnFamily::State, b"k").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
     }
 
     #[test]
@@ -168,7 +184,13 @@ mod tests {
         b.put(ColumnFamily::State, b"k", b"v1").unwrap();
         let snap = b.snapshot();
         b.put(ColumnFamily::State, b"k", b"v2").unwrap();
-        assert_eq!(snap.get(ColumnFamily::State, b"k").unwrap().as_deref(), Some(&b"v1"[..]));
-        assert_eq!(b.get(ColumnFamily::State, b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(
+            snap.get(ColumnFamily::State, b"k").unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(
+            b.get(ColumnFamily::State, b"k").unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
     }
 }

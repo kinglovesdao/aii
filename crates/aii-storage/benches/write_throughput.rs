@@ -5,7 +5,7 @@
 //! so the number reported is the worst case the protocol layer hits when it
 //! has to write one record at a time.
 //!
-//! The target is 50k op/s on commodity NVMe; failing that, the M0 exit
+//! The target is 50k op/s on commodity `NVMe`; failing that, the M0 exit
 //! criterion is not met. `scripts/check_storage_perf.sh` parses criterion's
 //! output and asserts the threshold for CI.
 

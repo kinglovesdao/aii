@@ -1,6 +1,11 @@
 //! [`KvBackend`] — the abstract storage trait every backend implements.
 
-use crate::{batch::WriteBatch, cf::ColumnFamily, error::StorageError, snapshot::{KvIter, Snapshot}};
+use crate::{
+    batch::WriteBatch,
+    cf::ColumnFamily,
+    error::StorageError,
+    snapshot::{KvIter, Snapshot},
+};
 
 /// Backend-abstracted KV store.
 ///
@@ -39,7 +44,7 @@ pub trait KvBackend: Send + Sync + 'static {
     fn snapshot(&self) -> Self::Snapshot;
 
     /// Iterate every `(key, value)` pair in `cf` in ascending key order.
-    fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a>;
+    fn iter(&self, cf: ColumnFamily) -> KvIter<'_>;
 
     /// Iterate `(key, value)` pairs in `cf` whose key starts with `prefix`,
     /// in ascending order.

@@ -12,7 +12,7 @@ use crate::cf::ColumnFamily;
 /// Umbrella error returned by every `aii-storage` API.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    /// Backend-native error (e.g. RocksDB), captured as its `Display` text.
+    /// Backend-native error (e.g. `RocksDB`), captured as its `Display` text.
     #[error("backend error: {0}")]
     Backend(String),
 

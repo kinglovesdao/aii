@@ -2,7 +2,7 @@
 //!
 //! Callers build a [`WriteBatch`] of [`Op`] entries and hand it to
 //! [`crate::backend::KvBackend::write`]. Each backend replays the ops
-//! into its native batch type (RocksDB `WriteBatch` / BTreeMap mutation)
+//! into its native batch type (`RocksDB` `WriteBatch` / `BTreeMap` mutation)
 //! atomically — all ops in the batch land together or not at all.
 
 use crate::cf::ColumnFamily;
@@ -113,17 +113,36 @@ mod tests {
             .put(ColumnFamily::Meta, b"c", b"3");
         let ops: Vec<_> = b.iter().collect();
         assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0], Op::Put { cf: ColumnFamily::State, .. }));
-        assert!(matches!(ops[1], Op::Delete { cf: ColumnFamily::State, .. }));
-        assert!(matches!(ops[2], Op::Put { cf: ColumnFamily::Meta, .. }));
+        assert!(matches!(
+            ops[0],
+            Op::Put {
+                cf: ColumnFamily::State,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[1],
+            Op::Delete {
+                cf: ColumnFamily::State,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[2],
+            Op::Put {
+                cf: ColumnFamily::Meta,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn fluent_chaining_works() {
         let mut b = WriteBatch::new();
-        let n = b.put(ColumnFamily::State, b"a", b"1")
-                 .put(ColumnFamily::State, b"b", b"2")
-                 .len();
+        let n = b
+            .put(ColumnFamily::State, b"a", b"1")
+            .put(ColumnFamily::State, b"b", b"2")
+            .len();
         assert_eq!(n, 2);
     }
 }

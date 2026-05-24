@@ -1,7 +1,7 @@
-//! Property: any random sequence of `Op`s applied to MemoryBackend and
-//! RocksDbBackend leaves the two with identical contents.
+//! Property: any random sequence of `Op`s applied to `MemoryBackend` and
+//! `RocksDbBackend` leaves the two with identical contents.
 
-use aii_storage::{ColumnFamily, KvBackend, MemoryBackend, Op, WriteBatch};
+use aii_storage::{ColumnFamily, KvBackend, MemoryBackend, Op, Snapshot, WriteBatch};
 use proptest::prelude::*;
 
 fn cf_strategy() -> impl Strategy<Value = ColumnFamily> {
@@ -14,7 +14,11 @@ fn cf_strategy() -> impl Strategy<Value = ColumnFamily> {
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        (cf_strategy(), proptest::collection::vec(any::<u8>(), 1..16), proptest::collection::vec(any::<u8>(), 0..32))
+        (
+            cf_strategy(),
+            proptest::collection::vec(any::<u8>(), 1..16),
+            proptest::collection::vec(any::<u8>(), 0..32)
+        )
             .prop_map(|(cf, key, value)| Op::Put { cf, key, value }),
         (cf_strategy(), proptest::collection::vec(any::<u8>(), 1..16))
             .prop_map(|(cf, key)| Op::Delete { cf, key }),
@@ -25,8 +29,12 @@ fn apply(db: &impl KvBackend, ops: &[Op]) {
     let mut wb = WriteBatch::new();
     for op in ops {
         match op {
-            Op::Put { cf, key, value } => { wb.put(*cf, key, value); }
-            Op::Delete { cf, key } => { wb.delete(*cf, key); }
+            Op::Put { cf, key, value } => {
+                wb.put(*cf, key, value);
+            }
+            Op::Delete { cf, key } => {
+                wb.delete(*cf, key);
+            }
         }
     }
     db.write(wb).unwrap();
@@ -83,7 +91,6 @@ proptest! {
         }
 
         // Snapshot must still report the original values.
-        use aii_storage::Snapshot;
         for (k, v) in &seed_pairs {
             let got = snap.get(ColumnFamily::State, k).unwrap();
             prop_assert_eq!(got.as_deref(), Some(&v[..]));

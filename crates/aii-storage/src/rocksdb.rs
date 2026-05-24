@@ -32,7 +32,7 @@ impl RocksDbBackend {
     /// [`ColumnFamily::ALL`]) if absent.
     ///
     /// # Errors
-    /// Returns [`StorageError::Backend`] if RocksDB fails to open / create.
+    /// Returns [`StorageError::Backend`] if `RocksDB` fails to open / create.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -129,12 +129,16 @@ impl KvBackend for RocksDbBackend {
             // `db` so the snapshot's `release_snapshot` FFI call runs
             // against a still-live DB. Rust drops struct fields in
             // declaration order — `snap` is declared first below.
-            snap: unsafe { std::mem::transmute::<rocksdb::Snapshot<'_>, rocksdb::Snapshot<'static>>(self.db.snapshot()) },
+            snap: unsafe {
+                std::mem::transmute::<rocksdb::Snapshot<'_>, rocksdb::Snapshot<'static>>(
+                    self.db.snapshot(),
+                )
+            },
             db: Arc::clone(&self.db),
         }
     }
 
-    fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a> {
+    fn iter(&self, cf: ColumnFamily) -> KvIter<'_> {
         let handle = match self.cf_handle(cf) {
             Ok(h) => h,
             Err(e) => return Box::new(std::iter::once(Err(e))),
@@ -207,15 +211,19 @@ impl Snapshot for RocksDbSnapshot {
             .map_err(|e| StorageError::Backend(e.to_string()))
     }
 
-    fn iter<'a>(&'a self, cf: ColumnFamily) -> KvIter<'a> {
+    fn iter(&self, cf: ColumnFamily) -> KvIter<'_> {
         let handle = match self.cf_handle(cf) {
             Ok(h) => h,
             Err(e) => return Box::new(std::iter::once(Err(e))),
         };
-        Box::new(self.snap.iterator_cf(handle, IteratorMode::Start).map(|kv| {
-            kv.map(|(k, v)| (k.to_vec(), v.to_vec()))
-                .map_err(|e| StorageError::Backend(e.to_string()))
-        }))
+        Box::new(
+            self.snap
+                .iterator_cf(handle, IteratorMode::Start)
+                .map(|kv| {
+                    kv.map(|(k, v)| (k.to_vec(), v.to_vec()))
+                        .map_err(|e| StorageError::Backend(e.to_string()))
+                }),
+        )
     }
 }
 
@@ -268,7 +276,10 @@ mod tests {
     #[test]
     fn next_prefix_upper_bound_works() {
         assert_eq!(next_prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
-        assert_eq!(next_prefix_upper_bound(&[0xFF, 0x00]), Some(vec![0xFF, 0x01]));
+        assert_eq!(
+            next_prefix_upper_bound(&[0xFF, 0x00]),
+            Some(vec![0xFF, 0x01])
+        );
         assert_eq!(next_prefix_upper_bound(&[0xFF, 0xFF]), None);
     }
 
@@ -284,7 +295,7 @@ mod tests {
         b.put(ColumnFamily::State, b"k", b"v").unwrap();
         let snap = b.snapshot();
         drop(b); // release the original strong ref
-        // Snapshot now holds the only Arc<DB> strong ref.
+                 // Snapshot now holds the only Arc<DB> strong ref.
         assert_eq!(
             snap.get(ColumnFamily::State, b"k").unwrap().as_deref(),
             Some(&b"v"[..])

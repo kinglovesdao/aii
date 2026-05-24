@@ -48,8 +48,14 @@ macro_rules! backend_tests {
                     .put(ColumnFamily::Headers, b"h1", b"hv")
                     .delete(ColumnFamily::Meta, b"absent");
                 db.write(wb).unwrap();
-                assert_eq!(db.get(ColumnFamily::State, b"s1").unwrap().as_deref(), Some(&b"sv"[..]));
-                assert_eq!(db.get(ColumnFamily::Headers, b"h1").unwrap().as_deref(), Some(&b"hv"[..]));
+                assert_eq!(
+                    db.get(ColumnFamily::State, b"s1").unwrap().as_deref(),
+                    Some(&b"sv"[..])
+                );
+                assert_eq!(
+                    db.get(ColumnFamily::Headers, b"h1").unwrap().as_deref(),
+                    Some(&b"hv"[..])
+                );
             }
 
             #[test]
@@ -58,7 +64,10 @@ macro_rules! backend_tests {
                 db.put(ColumnFamily::State, b"k", b"v1").unwrap();
                 let snap = db.snapshot();
                 db.put(ColumnFamily::State, b"k", b"v2").unwrap();
-                assert_eq!(snap.get(ColumnFamily::State, b"k").unwrap().as_deref(), Some(&b"v1"[..]));
+                assert_eq!(
+                    snap.get(ColumnFamily::State, b"k").unwrap().as_deref(),
+                    Some(&b"v1"[..])
+                );
             }
 
             #[test]
@@ -67,10 +76,8 @@ macro_rules! backend_tests {
                 db.put(ColumnFamily::State, b"b", b"2").unwrap();
                 db.put(ColumnFamily::State, b"a", b"1").unwrap();
                 db.put(ColumnFamily::State, b"c", b"3").unwrap();
-                let keys: Vec<Vec<u8>> = db
-                    .iter(ColumnFamily::State)
-                    .map(|r| r.unwrap().0)
-                    .collect();
+                let keys: Vec<Vec<u8>> =
+                    db.iter(ColumnFamily::State).map(|r| r.unwrap().0).collect();
                 assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
             }
 
@@ -91,7 +98,8 @@ macro_rules! backend_tests {
             fn cross_cf_keys_dont_collide() {
                 let db = make_backend();
                 db.put(ColumnFamily::State, b"k", b"state-value").unwrap();
-                db.put(ColumnFamily::Headers, b"k", b"headers-value").unwrap();
+                db.put(ColumnFamily::Headers, b"k", b"headers-value")
+                    .unwrap();
                 assert_eq!(
                     db.get(ColumnFamily::State, b"k").unwrap().as_deref(),
                     Some(&b"state-value"[..])
@@ -108,4 +116,7 @@ macro_rules! backend_tests {
 backend_tests!(memory, MemoryBackend::new());
 
 #[cfg(feature = "rocksdb")]
-backend_tests!(rocksdb, aii_storage::RocksDbBackend::open_in_temp().unwrap());
+backend_tests!(
+    rocksdb,
+    aii_storage::RocksDbBackend::open_in_temp().unwrap()
+);
