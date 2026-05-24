@@ -5,6 +5,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8] — 2026-05-24
+
+### Added — RPC + node binary
+- `aii-rpc` (M2 #15) — `jsonrpsee` HTTP server with `eth_chainId`,
+  `eth_blockNumber`, and `aii_status` methods. `RpcState` trait keeps
+  the crate state-free; embedders provide chain id / head / network.
+  3 in-process end-to-end tests.
+- `aii-node` (M2 #19) — library `NodeState` + binary **`aiid`**.
+  `aiid` opens RocksDB at `--data-dir`, serves RPC at `--rpc`, and
+  waits for SIGINT. 3 library tests + verified live-binary smoke:
+  ```
+  $ target/debug/aiid --data-dir /tmp/aiid-smoke --rpc 127.0.0.1:18545 &
+  $ curl … aii_status   → {"chain_id":99,"network":"aii-mainnet",…}
+  $ curl … eth_chainId  → "0x63"
+  ```
+
+### Changed
+- Workspace version 0.0.7 → 0.0.8.
+
+### Notes
+- Day-0 footprint progress: **15 of 18 crates landed**. Remaining:
+  `aii-evm` (revm wrapper), `aii-net-p2p` (devp2p), `aii-net-sync`
+  (each is multi-week work and not attemptable as a one-PR scaffold).
+- Day-0 binary `aiid` ships and serves real JSON-RPC over HTTP — this
+  is the first user-facing deployment artefact in the workspace.
+
 ## [0.0.7] — 2026-05-24
 
 ### Added — 7 new crates (M2 leaves)
