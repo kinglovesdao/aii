@@ -11,7 +11,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use aii_cli::{run_account_new, run_chain_id, run_status, run_tier};
+use aii_cli::{
+    run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
+    run_account_verify, run_chain_id, run_status, run_tier,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -139,6 +142,52 @@ impl Server {
                     "inputSchema": { "type": "object", "properties": {} },
                 },
                 {
+                    "name": "account_new_encrypted",
+                    "description": "Generate a fresh secp256k1 key and return a Web3 v3 encrypted keystore (JSON) under the supplied password.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "password": { "type": "string", "description": "Password to encrypt the keystore under." }
+                        },
+                        "required": ["password"]
+                    },
+                },
+                {
+                    "name": "account_verify",
+                    "description": "Verify that a password decrypts a Web3 v3 keystore JSON, returning the embedded address on success.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "keystore_json": { "type": "string", "description": "The full keystore JSON string." },
+                            "password": { "type": "string", "description": "Password to test." }
+                        },
+                        "required": ["keystore_json", "password"]
+                    },
+                },
+                {
+                    "name": "mnemonic_new",
+                    "description": "Generate a fresh BIP-39 mnemonic + derive its first ETH-compatible address (BIP-44 m/44'/60'/0'/0/0).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "words": { "type": "integer", "description": "Word count: 12 / 15 / 18 / 21 / 24. Defaults to 12.", "minimum": 12, "maximum": 24 }
+                        }
+                    },
+                },
+                {
+                    "name": "account_from_mnemonic",
+                    "description": "Re-derive an ETH-compatible address from a BIP-39 phrase at BIP-44 path m/44'/60'/0'/0/{index}.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "phrase":     { "type": "string", "description": "Space-separated BIP-39 phrase." },
+                            "passphrase": { "type": "string", "description": "Optional BIP-39 passphrase (\"25th word\"); defaults to empty." },
+                            "index":      { "type": "integer", "description": "Address index. Defaults to 0.", "minimum": 0 }
+                        },
+                        "required": ["phrase"]
+                    },
+                },
+                {
                     "name": "tier_recommend",
                     "description": "Probe local hardware and return the recommended AII node Tier (T1–T7).",
                     "inputSchema": { "type": "object", "properties": {} },
@@ -149,6 +198,7 @@ impl Server {
 
     async fn handle_tools_call(&self, params: Value) -> Result<Value, RpcErrorObject> {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = params.get("arguments").cloned().unwrap_or(Value::Null);
         match name {
             "chain_status" => {
                 let s = run_status(&self.rpc_url).await.map_err(|e| rpc_err(&e))?;
@@ -160,6 +210,38 @@ impl Server {
             }
             "account_new" => {
                 let addr = run_account_new().map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(format!("0x{}", hex::encode(addr.as_bytes()))))
+            }
+            "account_new_encrypted" => {
+                let password = string_arg(&args, "password")?;
+                let json = run_account_new_encrypted(&password).map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(json))
+            }
+            "account_verify" => {
+                let keystore_json = string_arg(&args, "keystore_json")?;
+                let password = string_arg(&args, "password")?;
+                let addr =
+                    run_account_verify(&keystore_json, &password).map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(format!("0x{}", hex::encode(addr.as_bytes()))))
+            }
+            "mnemonic_new" => {
+                let words = args
+                    .get("words")
+                    .and_then(Value::as_u64)
+                    .map_or(12usize, |n| n as usize);
+                let r = run_account_mnemonic(words).map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(serde_json::to_string_pretty(&r).unwrap()))
+            }
+            "account_from_mnemonic" => {
+                let phrase = string_arg(&args, "phrase")?;
+                let passphrase = args
+                    .get("passphrase")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let index = args.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let addr = run_account_from_mnemonic(&phrase, &passphrase, index)
+                    .map_err(|e| rpc_err(&e))?;
                 Ok(tool_text(format!("0x{}", hex::encode(addr.as_bytes()))))
             }
             "tier_recommend" => {
@@ -179,6 +261,16 @@ fn rpc_err(e: &aii_cli::CliError) -> RpcErrorObject {
         code: -32000,
         message: e.to_string(),
     }
+}
+
+fn string_arg(args: &Value, key: &str) -> Result<String, RpcErrorObject> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| RpcErrorObject {
+            code: -32602,
+            message: format!("missing or non-string argument: {key}"),
+        })
 }
 
 fn tool_text(s: impl Into<String>) -> Value {
@@ -222,7 +314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_four_tools() {
+    async fn tools_list_includes_eight_tools() {
         let s = Server::new("http://127.0.0.1:0");
         let req = Request {
             jsonrpc: "2.0".into(),
@@ -231,8 +323,167 @@ mod tests {
             params: None,
         };
         let resp = s.handle(req).await.unwrap();
-        let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 4);
+        let result = resp.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 8);
+        // Spot-check the new ones.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        for expected in [
+            "chain_status",
+            "chain_id",
+            "account_new",
+            "account_new_encrypted",
+            "account_verify",
+            "mnemonic_new",
+            "account_from_mnemonic",
+            "tier_recommend",
+        ] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn call(name: &str, args: Value) -> Request {
+        Request {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: Some(json!({ "name": name, "arguments": args })),
+        }
+    }
+
+    #[tokio::test]
+    async fn account_new_encrypted_returns_valid_keystore_json() {
+        let s = Server::new("http://127.0.0.1:0");
+        let req = call("account_new_encrypted", json!({ "password": "pw" }));
+        let resp = s.handle(req).await.unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["version"], 3);
+        assert_eq!(parsed["crypto"]["cipher"], "aes-128-ctr");
+    }
+
+    #[tokio::test]
+    async fn account_verify_round_trip() {
+        let s = Server::new("http://127.0.0.1:0");
+        // Generate a keystore first.
+        let gen = s
+            .handle(call(
+                "account_new_encrypted",
+                json!({ "password": "secret" }),
+            ))
+            .await
+            .unwrap();
+        let ks_json = gen.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Then verify it.
+        let verify = s
+            .handle(call(
+                "account_verify",
+                json!({ "keystore_json": ks_json, "password": "secret" }),
+            ))
+            .await
+            .unwrap();
+        let addr = verify.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(addr.starts_with("0x"));
+        assert_eq!(addr.len(), 42);
+    }
+
+    #[tokio::test]
+    async fn account_verify_wrong_password_errors() {
+        let s = Server::new("http://127.0.0.1:0");
+        let gen = s
+            .handle(call(
+                "account_new_encrypted",
+                json!({ "password": "right" }),
+            ))
+            .await
+            .unwrap();
+        let ks_json = gen.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let verify = s
+            .handle(call(
+                "account_verify",
+                json!({ "keystore_json": ks_json, "password": "wrong" }),
+            ))
+            .await
+            .unwrap();
+        assert!(verify.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn mnemonic_new_returns_phrase_and_address() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s
+            .handle(call("mnemonic_new", json!({ "words": 12 })))
+            .await
+            .unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["word_count"], 12);
+        assert!(
+            parsed["phrase"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .count()
+                == 12
+        );
+        assert!(parsed["address"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn mnemonic_new_defaults_to_12_words() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s.handle(call("mnemonic_new", json!({}))).await.unwrap();
+        let result = resp.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["word_count"], 12);
+    }
+
+    #[tokio::test]
+    async fn account_from_mnemonic_matches_canonical_fixture() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s.handle(call(
+            "account_from_mnemonic",
+            json!({
+                "phrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "index": 0
+            }),
+        )).await.unwrap();
+        let addr = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            addr.to_lowercase(),
+            "0x9858effd232b4033e47d90003d41ec34ecaeda94"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_from_mnemonic_missing_phrase_errors() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s
+            .handle(call("account_from_mnemonic", json!({})))
+            .await
+            .unwrap();
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
     }
 
     #[tokio::test]
