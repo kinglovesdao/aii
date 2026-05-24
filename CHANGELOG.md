@@ -5,6 +5,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7] — 2026-05-24
+
+### Added — 7 new crates (M2 leaves)
+- `aii-config` (M2 #17) — `ChainSpec` (chain id 99 default) + `Genesis`
+  (alloc + `to_header(state_root)`). 12 tests.
+- `aii-consensus-iface` (M2 #10) — trait-only crate: `Engine`, `Proposer`,
+  `Voter`, `Validation`, `ConsensusError`, `EngineProgress`, `Vote`. 4 tests.
+- `aii-metrics` (M2 #18) — lock-protected counter/gauge registry +
+  Prometheus text render. 6 tests.
+- `aii-wallet` (M2 #16) — `LocalWallet` (in-memory secp256k1 + `Address`
+  derivation + `sign_message_hash`). 5 tests. Encrypted keystore +
+  BIP-39 land later.
+- `aii-vnode` (M2 #12) — `VNode` / `VSet` with 100,000 AII stake floor
+  + 80/20 reward split (`split_reward`). 11 tests.
+- `aii-net-txpool` (M2 #14) — capacity-bounded mempool keyed by
+  `(sender, nonce)`; price-replacement; lowest-gas-first eviction.
+  `effective_gas_price` helper. 8 tests.
+- `aii-microchain` (M2 #13) — `MicroChainId`/`MicroChainSpec` registry
+  + `FlushAnchor` bookkeeping. 8 tests.
+
+### Changed
+- `aii-types::Address` + `H256`: derive `PartialOrd` + `Ord` (needed for
+  BTreeMap keys in vnode / txpool / microchain).
+- Workspace version 0.0.6 → 0.0.7.
+
+### Notes
+- M0 (4 crates) + M1 (2 crates: block, state) + M2 (7 crates) =
+  **13 of 18 Day-0 crates landed**. Remaining Day-0:
+  `aii-evm`, `aii-net-p2p`, `aii-net-sync`, `aii-consensus-bft`,
+  `aii-rpc`, `aii-node` (binary).
+- All 54 new tests passing; workspace clippy clean under `-D warnings`.
+- Tags: v0.0.5, v0.0.6, v0.0.7 (local only — push pending remote setup).
+
 ## [0.0.6] — 2026-05-24
 
 ### Added
