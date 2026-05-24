@@ -1,0 +1,21 @@
+[package]
+name = "aii-onboarding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "First-run hardware detection + Tier recommendation for the AII client."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+
+[dev-dependencies]

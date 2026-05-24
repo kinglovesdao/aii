@@ -19,6 +19,7 @@ members = [
     "crates/aii-evm",
     "crates/aii-net-p2p",
     "crates/aii-net-sync",
+    "crates/aii-onboarding",
 ]
 
 [workspace.package]
@@ -59,6 +60,7 @@ aii-node = { path = "crates/aii-node", version = "0.0.9" }
 aii-evm = { path = "crates/aii-evm", version = "0.0.9" }
 aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.9" }
 aii-net-sync = { path = "crates/aii-net-sync", version = "0.0.9" }
+aii-onboarding = { path = "crates/aii-onboarding", version = "0.0.9" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
