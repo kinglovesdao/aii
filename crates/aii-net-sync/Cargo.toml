@@ -1,0 +1,23 @@
+[package]
+name = "aii-net-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Block-sync state machine for AII (Idle → Headers → Bodies → Done)."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-block = { workspace = true }
+aii-storage = { workspace = true }
+aii-net-p2p = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
