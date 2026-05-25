@@ -106,6 +106,217 @@ pub async fn run_send_raw_tx(rpc: &str, raw_hex: &str) -> Result<String, CliErro
     Ok(h)
 }
 
+// ──────────────────────── Sub-chain runner (v0.0.38) ────────────────────────
+
+/// One sub-chain → parent-chain flush record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlushRecord {
+    /// Sub-chain height at the time of the flush.
+    pub sub_block_number: u64,
+    /// Sub-chain block hash being anchored (`0x…` hex).
+    pub sub_block_hash: String,
+    /// Parent-chain tx hash returned by `eth_sendRawTransaction`
+    /// (`0x…` hex). If the parent rejected, this is the error string
+    /// prefixed by `err:`.
+    pub parent_tx: String,
+}
+
+/// Final report from a sub-chain run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubchainRunReport {
+    /// Sub-chain id we ran.
+    pub sub_chain_id: u64,
+    /// Parent-chain id we anchored into.
+    pub parent_chain_id: u64,
+    /// Total sub-chain blocks produced.
+    pub sub_blocks_produced: u64,
+    /// Sub-chain head hash at exit.
+    pub sub_head_hash: String,
+    /// All flushes that were attempted (newest last).
+    pub flushes: Vec<FlushRecord>,
+}
+
+/// Run an in-process PoA sub-chain and flush anchors to the parent
+/// chain on schedule.
+///
+/// The sub-chain uses a fresh secp256k1 authority key (the
+/// "operator") for both block signing (via PoA `authorities[0]`)
+/// and for signing the EIP-155 flush tx to the parent. The flush tx
+/// is a self-transfer (value=0, gas=21000) whose calldata is
+/// `sub_block_hash ‖ sub_block_number_be8` so the parent block
+/// explorer can witness which sub-chain block was anchored.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_subchain(
+    sub_chain_id: u64,
+    parent_chain_id: u64,
+    parent_rpc: &str,
+    slot_seconds: u64,
+    flush_interval_blocks: u64,
+    duration_blocks: u64,
+) -> Result<SubchainRunReport, CliError> {
+    use aii_block::tx::{Tx, TxLegacy};
+    use aii_block::{
+        Block, BlockBody, Bloom, Hashable as _, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH,
+    };
+    use aii_consensus_poa::{PoaConfig, PoaEngine};
+    use aii_crypto::keccak::keccak256;
+    use aii_crypto::secp::{sign, SecretKey};
+    use aii_types::{AlgoId, H256, U256};
+
+    if sub_chain_id == parent_chain_id {
+        return Err(CliError::Client(
+            "sub_chain_id must differ from parent_chain_id".into(),
+        ));
+    }
+    // Operator key — fresh, in-memory only. Generate before the
+    // async loop so the non-Send `ThreadRng` is dropped before any
+    // `.await`.
+    let sk = {
+        let mut rng = rand::thread_rng();
+        let mut bytes = [0u8; 32];
+        loop {
+            rng.fill_bytes(&mut bytes);
+            if let Ok(s) = SecretKey::from_bytes(&bytes) {
+                break s;
+            }
+        }
+    };
+    let coinbase = sk.public_key().address();
+
+    let genesis = Block {
+        header: Header {
+            parent_hash: H256::ZERO,
+            ommers_hash: EMPTY_LIST_HASH,
+            beneficiary: coinbase,
+            state_root: EMPTY_TRIE_HASH,
+            transactions_root: EMPTY_TRIE_HASH,
+            receipts_root: EMPTY_TRIE_HASH,
+            logs_bloom: Bloom::ZERO,
+            difficulty: U256::ZERO,
+            number: 0,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 1_700_000_000,
+            extra_data: format!("aii-sub-{sub_chain_id}").into_bytes(),
+            mix_hash: H256::ZERO,
+            nonce: [0u8; 8],
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            withdrawals_root: EMPTY_TRIE_HASH,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            parent_beacon_block_root: None,
+        },
+        body: BlockBody::default(),
+    };
+    let cfg = PoaConfig {
+        authorities: vec![coinbase],
+        coinbase,
+        slot_seconds,
+        gas_limit: 30_000_000,
+        base_fee_per_gas: U256::from(1_000_000_000u64),
+    };
+    let engine =
+        PoaEngine::new(cfg, &genesis).map_err(|e| CliError::Client(format!("poa engine: {e}")))?;
+
+    let parent_client = client(parent_rpc)?;
+
+    let mut flushes: Vec<FlushRecord> = Vec::new();
+    let mut sub_head_hash = genesis.hash();
+    let mut parent_nonce: u64 = 0;
+
+    for _ in 1..=duration_blocks {
+        tokio::time::sleep(std::time::Duration::from_secs(slot_seconds)).await;
+        let (h, n, _block) = engine
+            .produce_block()
+            .map_err(|e| CliError::Client(format!("produce: {e}")))?;
+        sub_head_hash = h;
+
+        if n % flush_interval_blocks == 0 {
+            // Build flush tx: self-transfer with calldata = sub_hash || u64::be(n)
+            let mut data = Vec::with_capacity(40);
+            data.extend_from_slice(h.as_bytes());
+            data.extend_from_slice(&n.to_be_bytes());
+            let mut tx = TxLegacy {
+                nonce: parent_nonce,
+                gas_price: U256::from(1_000_000_000u64),
+                gas_limit: 100_000,
+                to: Some(coinbase),
+                value: U256::ZERO,
+                data,
+                v: 0,
+                r: H256::ZERO,
+                s: H256::ZERO,
+                algo_id: AlgoId::Secp256k1,
+            };
+            let hash = compute_legacy_eip155_hash(&tx, parent_chain_id);
+            let sig = sign(&sk, &hash).map_err(|e| CliError::Client(format!("sign: {e}")))?;
+            let raw = sig.to_bytes();
+            tx.r = H256::new(raw[..32].try_into().unwrap());
+            tx.s = H256::new(raw[32..64].try_into().unwrap());
+            tx.v = parent_chain_id * 2 + 35 + u64::from(raw[64]);
+
+            let mut out = alloy_rlp::bytes::BytesMut::new();
+            Tx::Legacy(tx).encode(&mut out);
+            let raw_hex = format!("0x{}", hex::encode(out));
+            let parent_tx_result = parent_client
+                .request::<String, _>("eth_sendRawTransaction", rpc_params![raw_hex])
+                .await;
+            let parent_tx = match parent_tx_result {
+                Ok(s) => {
+                    parent_nonce += 1;
+                    s
+                }
+                Err(e) => format!("err: {e}"),
+            };
+            // Compute keccak256 of the encoded tx purely for the
+            // sub-block-hash field of the FlushRecord.
+            let _ = keccak256;
+            flushes.push(FlushRecord {
+                sub_block_number: n,
+                sub_block_hash: format!("0x{}", hex::encode(h.as_bytes())),
+                parent_tx,
+            });
+        }
+    }
+    Ok(SubchainRunReport {
+        sub_chain_id,
+        parent_chain_id,
+        sub_blocks_produced: duration_blocks,
+        sub_head_hash: format!("0x{}", hex::encode(sub_head_hash.as_bytes())),
+        flushes,
+    })
+}
+
+fn compute_legacy_eip155_hash(t: &aii_block::tx::TxLegacy, chain_id: u64) -> aii_types::H256 {
+    use aii_crypto::keccak::keccak256;
+    use aii_types::U256;
+    let mut buf = alloy_rlp::bytes::BytesMut::new();
+    let zero = U256::ZERO;
+    let payload_length = t.nonce.length()
+        + u256_len(&t.gas_price)
+        + t.gas_limit.length()
+        + 21
+        + u256_len(&t.value)
+        + t.data.as_slice().length()
+        + chain_id.length()
+        + u256_len(&zero) * 2;
+    alloy_rlp::Header {
+        list: true,
+        payload_length,
+    }
+    .encode(&mut buf);
+    t.nonce.encode(&mut buf);
+    encode_u256_local(&t.gas_price, &mut buf);
+    t.gas_limit.encode(&mut buf);
+    t.to.as_ref().expect("self-transfer").encode(&mut buf);
+    encode_u256_local(&t.value, &mut buf);
+    t.data.as_slice().encode(&mut buf);
+    chain_id.encode(&mut buf);
+    encode_u256_local(&zero, &mut buf);
+    encode_u256_local(&zero, &mut buf);
+    aii_types::H256::new(keccak256(&buf).0)
+}
+
 // ──────────────────────── Stress harness (v0.0.37) ──────────────────────────
 
 /// Outcome of one stress run.

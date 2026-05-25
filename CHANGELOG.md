@@ -5,6 +5,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.38] — 2026-05-25
+
+### Added — Sub-chain runtime + flush to parent chain
+
+**Sub-chains can now produce their own blocks AND periodically
+anchor checkpoints to the parent chain.** `aii subchain run`
+spawns an in-process PoA sub-chain, signs a flush tx whose
+calldata is `sub_block_hash ‖ sub_block_number_be8`, and submits
+it to `--parent-rpc` via `eth_sendRawTransaction`.
+
+**Live testnet result** (sub-chain on laptop, parent at
+`https://aii.allfund.xyz/api`):
+
+```
+sub_chain_id:    10001
+parent_chain_id: 9999
+sub blocks:      20
+flushes attempted / accepted: 4 / 4
+parent blocks containing flush tx: #893, #899, #904, #909
+parent_tx hashes (all confirmed via aii_getBlockHeader):
+  0x209895ecff50…  (sub #5)
+  0x3e7c72f5b443…  (sub #10)
+  0x7297209f41ed…  (sub #15)
+  0xc50da8afe4e8…  (sub #20)
+```
+
+#### `aii-cli`
+
+- New `aii subchain run` subcommand + library `run_subchain`.
+- Spawns a fresh secp256k1 operator key, instantiates a single-
+  authority `PoaEngine`, produces `--duration-blocks` blocks at
+  `--slot-seconds` cadence. Every `--flush-interval-blocks` blocks,
+  signs a legacy EIP-155 self-transfer (gas 100,000, calldata
+  carrying the anchor) and submits to the parent.
+- New `FlushRecord` and `SubchainRunReport` JSON types.
+
+#### Scope discipline
+
+- **In scope**: in-process sub-chain producer + flush-tx anchoring
+  to a parent chain (live-verified end to end).
+- **Not in this release**:
+  - **Persistent sub-chain state** — sub-chain head + history are
+    in-memory only. Each `aii subchain run` starts fresh.
+  - **Anchor decode + on-chain registry update** — the parent
+    doesn't yet decode flush-tx calldata into
+    `aii-microchain::FlushAnchor` / update its `Registry`. Today
+    the anchor exists as a regular tx; explorers read it from the
+    calldata field.
+  - **Sub-chain consensus modes other than PoA**.
+  - **Multi-validator BFT block-body gossip** — still on the
+    roadmap (deferred from v0.0.37).
+
 ## [0.0.37] — 2026-05-25
 
 ### Added — Transaction pipeline + live stress test
