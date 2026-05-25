@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 pub mod bft_bootstrap;
+pub mod bft_p2p;
 
 use aii_config::ChainSpec;
 use aii_rpc::{AccountView, RpcState};

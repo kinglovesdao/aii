@@ -44,15 +44,24 @@ pub enum Message {
     Pong(u64),
     /// Graceful disconnect with a numeric reason.
     Disconnect(u32),
+    /// BFT consensus payload — the bytes are an already-encoded
+    /// `aii_consensus_bft::wire::BftMessage`. The transport treats
+    /// them as opaque; only the consumer decodes them.
+    Bft(Vec<u8>),
 }
 
 const TYPE_HELLO: u8 = 0x01;
 const TYPE_PING: u8 = 0x02;
 const TYPE_PONG: u8 = 0x03;
 const TYPE_DISCONNECT: u8 = 0x04;
+const TYPE_BFT: u8 = 0x05;
 
 impl Message {
-    fn encode(&self) -> Vec<u8> {
+    /// Serialize to bytes (length-tagged inside, but does NOT prepend
+    /// the 4-byte big-endian length used at the framing layer — that
+    /// happens in [`Peer::send`]).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
         let mut buf = alloy_rlp::bytes::BytesMut::new();
         match self {
             Self::Hello { version, name } => {
@@ -96,11 +105,24 @@ impl Message {
                 .encode(&mut buf);
                 r.encode(&mut buf);
             }
+            Self::Bft(payload) => {
+                buf.extend_from_slice(&[TYPE_BFT]);
+                let bytes_ref: &[u8] = payload.as_slice();
+                let inner = bytes_ref.length();
+                RlpHeader {
+                    list: true,
+                    payload_length: inner,
+                }
+                .encode(&mut buf);
+                bytes_ref.encode(&mut buf);
+            }
         }
         buf.to_vec()
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, P2pError> {
+    /// Decode a single message from its body bytes (without the
+    /// 4-byte length prefix).
+    pub fn decode(bytes: &[u8]) -> Result<Self, P2pError> {
         if bytes.is_empty() {
             return Err(P2pError::Frame("empty frame".into()));
         }
@@ -130,6 +152,17 @@ impl Message {
             TYPE_DISCONNECT => {
                 let r = u32::decode(&mut buf).map_err(|e| P2pError::Frame(e.to_string()))?;
                 Ok(Self::Disconnect(r))
+            }
+            TYPE_BFT => {
+                let payload = <alloy_rlp::bytes::Bytes as Decodable>::decode(&mut buf)
+                    .map_err(|e| P2pError::Frame(e.to_string()))?;
+                if payload.len() > MAX_FRAME_BYTES as usize {
+                    return Err(P2pError::Frame(format!(
+                        "Bft payload too large: {}",
+                        payload.len()
+                    )));
+                }
+                Ok(Self::Bft(payload.to_vec()))
             }
             other => Err(P2pError::Frame(format!(
                 "unknown message type 0x{other:02x}"
@@ -284,6 +317,51 @@ mod tests {
             }
         );
 
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn bft_envelope_round_trip_preserves_payload() {
+        // BftMessage bytes are opaque to the transport: we just need a
+        // black-box round trip.
+        let payload: Vec<u8> = (0..173u16).map(|i| (i & 0xff) as u8).collect();
+        let m = Message::Bft(payload.clone());
+        let bytes = m.encode();
+        match Message::decode(&bytes).unwrap() {
+            Message::Bft(p) => assert_eq!(p, payload),
+            other => panic!("expected Bft, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bft_envelope_rejects_oversized_frame() {
+        // Any Bft payload bigger than MAX_FRAME_BYTES must be rejected
+        // at encode-or-decode time so a hostile peer can't flood us.
+        let p2 = vec![0u8; (MAX_FRAME_BYTES as usize) + 1];
+        let m2 = Message::Bft(p2);
+        // We allow encode to produce the bytes, but send/recv enforce
+        // MAX_FRAME_BYTES. The Message::decode path also enforces it.
+        let bytes = m2.encode();
+        assert!(Message::decode(&bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn bft_envelope_round_trip_over_tcp() {
+        // End-to-end: encode + frame + send + recv + decode on real
+        // tokio sockets.
+        let server = Server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let payload = vec![0xab, 0xcd, 0xef, 0x01, 0x02];
+        let p_clone = payload.clone();
+        let server_task = tokio::spawn(async move {
+            let mut peer = server.accept().await.unwrap();
+            match peer.recv().await.unwrap() {
+                Message::Bft(p) => assert_eq!(p, p_clone),
+                other => panic!("expected Bft, got {other:?}"),
+            }
+        });
+        let mut client = dial(addr).await.unwrap();
+        client.send(&Message::Bft(payload)).await.unwrap();
         server_task.await.unwrap();
     }
 

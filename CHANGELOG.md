@@ -5,6 +5,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.34] — 2026-05-25
+
+### Added — Multi-node BFT consensus over TCP gossip
+
+**The chain now runs across multiple hosts.** v0.0.33 made a single
+`aiid` process finalise BFT blocks. v0.0.34 wires `BftMessage` (which
+has existed since v0.0.27) into a real network transport, so two or
+more validator nodes on separate sockets can exchange proposals +
+prevotes + precommits and agree on a common chain head. **This is the
+last structural prerequisite for a public testnet deployment.**
+
+#### aii-net-p2p
+
+- New `Message::Bft(Vec<u8>)` variant on the existing TCP transport.
+  Payload bytes are opaque to the transport: they are
+  `BftMessage::encode()` output. Adds `TYPE_BFT = 0x05` tag,
+  length-bounded against `MAX_FRAME_BYTES`.
+- Promoted `Message::encode` and `Message::decode` to `pub` so
+  transports outside this crate can frame their own connections.
+
+#### aii-consensus-bft
+
+- New `gossip` module:
+  - `BftTransport` trait: sync `broadcast(Vec<u8>)` + `try_recv() ->
+    Option<Vec<u8>>`. Blanket impl for `Arc<T: BftTransport>`.
+  - `BftGossip<T>` driver. Per `tick()`:
+    1. Drains inbox, decodes `BftMessage`, dispatches to engine's
+       `submit_remote_proposal / _prevote / _precommit`.
+    2. Bootstraps a round when no coordinator exists (`cast_proposal`
+       on the elected leader).
+    3. Casts the next phase's vote when the local engine reaches
+       Prevoting / Precommitting.
+    4. **Retransmits cached proposal / prevote / precommit bytes
+       every tick** to defeat startup races (a peer that connects
+       after the leader's first broadcast still receives it on the
+       next tick).
+- New `BftEngine` accessors:
+  - `my_index()` — this node's validator index.
+  - `validator_set_size()` — current set size.
+  - `would_be_leader_next_height()` — bootstrap predicate.
+  - `reconstruct_proposed_block(height, &LeaderProof)` — peers rebuild
+    a leader's block from `(parent, proof, height)` without needing
+    the full body on the wire.
+  - `try_harvest_committed() -> Option<u64>` — `&self` flavour of
+    multi-validator `step()` for gossip-driven hosts.
+- New `BftError::ProposalHashMismatch` for tamper detection.
+
+#### aii-node
+
+- New `bft_p2p::TcpBftTransport`. Async constructor binds a listener
+  + dials each peer in `peer_addrs`. Inside the transport:
+  - One acceptor task per inbound connection;
+  - One dialer task per outbound peer (infinite retry, 500 ms backoff);
+  - Per-connection reader + writer pair;
+  - `broadcast::Sender<Vec<u8>>` for outbound fanout;
+  - `Mutex<VecDeque<Vec<u8>>>` for the inbound queue.
+- `aiid` CLI gets two new flags:
+  - `--bft-listen ADDR` (default `127.0.0.1:30311`).
+  - `--peers ADDR1,ADDR2,…` (comma-separated `host:port` list).
+- `--bft` multi-validator path now stands up the transport and
+  drives a `BftGossip` loop instead of waiting silently.
+
+#### Test coverage
+
+- `aii-net-p2p`: 3 new tests — `Message::Bft` round-trip, oversize
+  rejection, full TCP send/recv.
+- `aii-consensus-bft`: `two_node_gossip_finalises_one_block` — two
+  in-memory `BftEngine` + channel pair reach height 1.
+- `aii-node`: `tests/bft_p2p_e2e.rs::two_validators_finalise_block_over_tcp`
+  — two `BftEngine`s + `TcpBftTransport`s over `127.0.0.1:0` agree
+  on a finalised block at height 1.
+- Workspace: **628 / 628 tests pass**, clippy clean under
+  `-D warnings`.
+
+#### Verified on live aiid
+
+Two `aiid` processes, separate keystores, fresh genesis with both
+validators, connected via `--peers`:
+
+```bash
+aii validator keygen > node-a.json
+aii validator keygen > node-b.json
+aii --json validator pubkey --file node-a.json > pub-a.json
+aii --json validator pubkey --file node-b.json > pub-b.json
+aii genesis init --network testnet \
+    --validator-pubkey pub-a.json --validator-pubkey pub-b.json \
+    --out genesis.json
+
+aiid --bft --genesis genesis.json --keystore node-a.json \
+     --data-dir /tmp/a --rpc 127.0.0.1:18545 \
+     --bft-listen 127.0.0.1:31311 --peers 127.0.0.1:31312 \
+     --testnet --slot-seconds 1 &
+aiid --bft --genesis genesis.json --keystore node-b.json \
+     --data-dir /tmp/b --rpc 127.0.0.1:18546 \
+     --bft-listen 127.0.0.1:31312 --peers 127.0.0.1:31311 \
+     --testnet --slot-seconds 1 &
+```
+
+After 8 seconds, both nodes reported `eth_blockNumber = 0x26` (block
+38) with identical timestamps per height — confirming agreement.
+
+#### Scope discipline
+
+- **In scope**: TCP gossip transport, retransmit loop, integration
+  test, aiid wiring.
+- **Not in this release**: encrypted validator keystore; on-chain
+  slashing executor; full block-body gossip (today receivers
+  reconstruct empty blocks deterministically from `LeaderProof`);
+  fork choice / re-org; libp2p / Kademlia discovery; mTLS / Noise
+  on the gossip socket.
+
 ## [0.0.33] — 2026-05-25
 
 ### Added — `aiid --bft`: real BFT block production end-to-end

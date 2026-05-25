@@ -206,6 +206,70 @@ impl BftEngine {
         g.coordinator.as_ref().map(RoundCoordinator::leader_index)
     }
 
+    /// This node's index inside its `validator_set`.
+    #[must_use]
+    pub const fn my_index(&self) -> usize {
+        self.config.my_index as usize
+    }
+
+    /// `true` iff this node would be the elected leader for the
+    /// *next* height's round-0 proposal, given the current head and
+    /// rolled-forward seed. Used by the gossip layer to bootstrap a
+    /// round when no coordinator exists yet.
+    #[must_use]
+    pub fn would_be_leader_next_height(&self) -> bool {
+        let g = self.state.lock();
+        let next_h = g.head_number.saturating_add(1);
+        let leader = self.config.validator_set.select_leader(next_h, 0, &g.seed);
+        leader == self.config.my_index as usize
+    }
+
+    /// Validator-set size in force.
+    #[must_use]
+    pub fn validator_set_size(&self) -> usize {
+        self.config.validator_set.size()
+    }
+
+    /// Reconstruct the exact block the engine would `cast_proposal` at
+    /// `height` against its current head + `leader_proof`. Used by the
+    /// gossip layer to recover the full block from a `Proposal` wire
+    /// message that only carries `block_hash + leader_proof`.
+    #[must_use]
+    pub fn reconstruct_proposed_block(&self, height: u64, leader_proof: &LeaderProof) -> Block {
+        let g = self.state.lock();
+        // `build_block` reads head_hash + head_timestamp, which mirrors
+        // what the leader did when they signed the proposal.
+        self.build_block(g.head_hash, g.head_timestamp, height, leader_proof)
+    }
+
+    /// `&self` harvest: if the coordinator is in `Committed`, commit
+    /// the captured block, advance the head, roll the seed, and clear
+    /// the coordinator. Returns `Some(new_head_number)` on harvest,
+    /// `None` if there is nothing to commit yet.
+    ///
+    /// Useful for gossip / network drivers that hold the engine in an
+    /// `Arc<BftEngine>` and cannot call the `&mut`-flavoured
+    /// [`aii_consensus_iface::Engine::step`].
+    pub fn try_harvest_committed(&self) -> Option<u64> {
+        let mut g = self.state.lock();
+        let committed = g
+            .coordinator
+            .as_ref()
+            .is_some_and(|c| c.phase() == crate::bft::Phase::Committed);
+        if !committed {
+            return None;
+        }
+        let (block, proof) = g.proposal.clone()?;
+        let block_hash = block.hash();
+        g.head_hash = block_hash;
+        g.head_number = block.header.number;
+        g.head_timestamp = block.header.timestamp;
+        g.seed = proof.vrf_output;
+        g.coordinator = None;
+        g.proposal = None;
+        Some(block.header.number)
+    }
+
     /// Build a proposal for the current round and feed it to our own
     /// coordinator. Caller is responsible for broadcasting the returned
     /// `(Block, LeaderProof)` to peers. Only valid when this node is
