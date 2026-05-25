@@ -5,6 +5,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.27] — 2026-05-24
+
+### Added — BFT-PoS stage 4: wire-format codec
+
+A typed envelope for the three BFT consensus messages, so a validator
+can serialise / parse votes and proposals on the network without
+inventing per-call encoding. Fixed-layout byte packing — no RLP, no
+SSZ — so malformed messages are rejected by length alone before any
+cryptographic check.
+
+#### aii-consensus-bft
+
+- New `wire` submodule with:
+  - `BftMessage::Proposal { height, round, block_hash, leader_proof }`
+  - `BftMessage::Prevote(PrevoteVote)`
+  - `BftMessage::Precommit(PrecommitVote)`
+- `tag()` returns the first byte (cheap routing without decoding).
+- `encoded_len()` returns the exact wire size for that variant:
+  - `PROPOSAL_LEN = 173` bytes
+  - `VOTE_LEN = 145` bytes
+- `encode()` writes the fixed layout:
+  - Proposal: `0x00 ‖ height_be8 ‖ round_be4 ‖ block[32] ‖ vrf_preout[32] ‖ vrf_proof[64] ‖ vrf_output[32]`
+  - Prevote: `0x01 ‖ block[32] ‖ height_be8 ‖ round_be4 ‖ index_be4 ‖ bls_sig[96]`
+  - Precommit: `0x02 ‖ block[32] ‖ height_be8 ‖ round_be4 ‖ index_be4 ‖ bls_sig[96]`
+- `decode(bytes)` validates length / tag / BLS signature decompression
+  and returns the typed message. Semantic checks (VRF validity,
+  BLS aggregate verification) remain at higher layers.
+- New `CodecError` with `Empty`, `UnknownTag(u8)`,
+  `WrongLength { expected, got }`, `InvalidBlsSignature` variants.
+- 15 RED→GREEN tests: tag / length, round-trip for all three variants,
+  empty / unknown-tag / truncated / malformed-BLS rejection, and an
+  end-to-end check that a round-tripped PRE-VOTE still verifies under
+  the original signer's pubkey.
+
+### Scope discipline
+
+Still NOT in this release: actual networking (the host crate plugs the
+codec into its transport); message authentication beyond per-vote BLS
+(no top-level peer signature); rate-limiting / mempool. These remain
+explicit non-goals and will land separately.
+
 ## [0.0.26] — 2026-05-24
 
 ### Added — BFT-PoS stage 3: round-change coordinator
