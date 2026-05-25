@@ -20,12 +20,16 @@
 
 pub mod bft;
 pub mod coordinator;
+pub mod wire;
 pub use bft::{
     LeaderProof, Phase, PolcCertificate, PrecommitCertificate, PrecommitTallier, PrecommitVote,
     PrevoteTallier, PrevoteVote, TallyState, Validator, ValidatorSet, MAX_VALIDATORS,
     PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
 };
 pub use coordinator::RoundCoordinator;
+pub use wire::{
+    BftMessage, CodecError, PROPOSAL_LEN, TAG_PRECOMMIT, TAG_PREVOTE, TAG_PROPOSAL, VOTE_LEN,
+};
 
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
