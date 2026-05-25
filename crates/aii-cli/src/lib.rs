@@ -72,6 +72,29 @@ pub async fn run_chain_id(rpc: &str) -> Result<u64, CliError> {
     parse_hex_u64(&hex).ok_or_else(|| CliError::Client(format!("bad eth_chainId hex: {hex}")))
 }
 
+/// Run `aii block --rpc URL <number|hash>`. Returns the block header
+/// as a `HeaderView`, or `None` if unknown.
+pub async fn run_get_block_header(
+    rpc: &str,
+    query: &str,
+) -> Result<Option<aii_rpc::HeaderView>, CliError> {
+    let c = client(rpc)?;
+    let r: Option<aii_rpc::HeaderView> =
+        c.request("aii_getBlockHeader", rpc_params![query]).await?;
+    Ok(r)
+}
+
+/// Run `aii recent --rpc URL --limit N`. Returns the N most-recent
+/// block headers, newest first. `limit` is server-capped at 100.
+pub async fn run_recent_blocks(
+    rpc: &str,
+    limit: u64,
+) -> Result<Vec<aii_rpc::HeaderView>, CliError> {
+    let c = client(rpc)?;
+    let r: Vec<aii_rpc::HeaderView> = c.request("aii_recentBlocks", rpc_params![limit]).await?;
+    Ok(r)
+}
+
 /// Run `aii account new`. Generates a fresh secp256k1 wallet from OS RNG
 /// and returns its address (the private key is **dropped** before return
 /// — v0.0.10 has no keystore yet; users must wait for v0.0.11).

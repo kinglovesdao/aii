@@ -2,9 +2,9 @@
 
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
-    run_account_verify, run_chain_id, run_genesis_init, run_genesis_validate, run_random_seed_hex,
-    run_status, run_tier, run_validator_keygen, run_validator_pubkey, CliError, ValidatorEntry,
-    ValidatorPubkeys,
+    run_account_verify, run_chain_id, run_genesis_init, run_genesis_validate, run_get_block_header,
+    run_random_seed_hex, run_recent_blocks, run_status, run_tier, run_validator_keygen,
+    run_validator_pubkey, CliError, ValidatorEntry, ValidatorPubkeys,
 };
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -47,6 +47,17 @@ enum Cmd {
     Genesis {
         #[command(subcommand)]
         sub: GenesisCmd,
+    },
+    /// Look up a block header by number or hash.
+    Block {
+        /// Decimal or 0x… hex block number, or 0x… 32-byte block hash.
+        query: String,
+    },
+    /// Print the N most recently finalised block headers.
+    Recent {
+        /// Max headers to return (server-capped at 100).
+        #[arg(long, default_value = "10")]
+        limit: u64,
     },
 }
 
@@ -168,6 +179,37 @@ async fn main() -> Result<(), CliError> {
                 println!("{}", serde_json::json!({ "chain_id": id }));
             } else {
                 println!("{id}");
+            }
+        }
+        Cmd::Block { query } => {
+            let h = run_get_block_header(&cli.rpc, &query).await?;
+            match h {
+                Some(v) if cli.json => println!("{}", serde_json::to_string(&v)?),
+                Some(v) => {
+                    println!("number:        {}", v.number);
+                    println!("hash:          {}", v.hash);
+                    println!("parent_hash:   {}", v.parent_hash);
+                    println!("timestamp:     {}", v.timestamp);
+                    println!("beneficiary:   {}", v.beneficiary);
+                    println!("gas_limit:     {}", v.gas_limit);
+                    println!("gas_used:      {}", v.gas_used);
+                    println!("base_fee:      {}", v.base_fee_per_gas);
+                }
+                None if cli.json => println!("null"),
+                None => println!("block not found: {query}"),
+            }
+        }
+        Cmd::Recent { limit } => {
+            let headers = run_recent_blocks(&cli.rpc, limit).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&headers)?);
+            } else if headers.is_empty() {
+                println!("no blocks yet");
+            } else {
+                println!("# {:>6}  {:>20}  hash", "number", "timestamp");
+                for h in &headers {
+                    println!("  {:>6}  {:>20}  {}", h.number, h.timestamp, h.hash);
+                }
             }
         }
         Cmd::Account {
