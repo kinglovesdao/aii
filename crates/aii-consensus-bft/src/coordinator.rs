@@ -37,6 +37,28 @@ use crate::bft::{
 };
 use crate::BftError;
 
+/// POL state (v0.0.28): the most recent [`PolcCertificate`] observed
+/// at this height, preserved across `fire_timeout`.
+///
+/// Once any round's PRE-VOTE quorum forms, the coordinator records a
+/// `LockedState`. Later rounds at the same height can read this to
+/// know which block the network has previously locked on; a freshly
+/// formed POLC at a higher round supersedes it.
+///
+/// This struct is information-only — the coordinator does not enforce
+/// any voting policy on top of it. Validator clients consult `locked()`
+/// to decide whether to PRE-VOTE for the proposed block in the new
+/// round or to keep their lock.
+#[derive(Clone, Debug)]
+pub struct LockedState {
+    /// Block hash that was locked on.
+    pub block_hash: H256,
+    /// Round in which the POLC formed.
+    pub round: u32,
+    /// The POLC itself.
+    pub polc: PolcCertificate,
+}
+
 /// Round-change coordinator. One instance per height.
 pub struct RoundCoordinator {
     height: u64,
@@ -48,6 +70,7 @@ pub struct RoundCoordinator {
     prevote_tally: Option<PrevoteTallier>,
     precommit_tally: Option<PrecommitTallier>,
     polc: Option<PolcCertificate>,
+    locked: Option<LockedState>,
     final_cert: Option<PrecommitCertificate>,
 }
 
@@ -65,8 +88,17 @@ impl RoundCoordinator {
             prevote_tally: None,
             precommit_tally: None,
             polc: None,
+            locked: None,
             final_cert: None,
         }
+    }
+
+    /// Most recent locked state at this height, if any POLC has ever
+    /// formed (across all rounds). Preserved across `fire_timeout` and
+    /// superseded only by a strictly newer POLC.
+    #[must_use]
+    pub const fn locked(&self) -> Option<&LockedState> {
+        self.locked.as_ref()
     }
 
     /// Current phase.
@@ -173,6 +205,21 @@ impl RoundCoordinator {
                 self.round,
                 self.vs.clone(),
             ));
+            // Update lock: any newly-formed POLC strictly supersedes the
+            // prior lock at this height. Equal round can only happen if
+            // we're forming the same POLC twice, which the tally guards
+            // against — but compare for safety.
+            let supersedes = self
+                .locked
+                .as_ref()
+                .is_none_or(|prev| self.round >= prev.round);
+            if supersedes {
+                self.locked = Some(LockedState {
+                    block_hash: block,
+                    round: self.round,
+                    polc: polc.clone(),
+                });
+            }
             self.polc = Some(polc);
             self.phase = Phase::Precommitting;
         }
@@ -543,5 +590,81 @@ mod tests {
             coord.submit_prevote(bad_vote).unwrap_err(),
             BftError::WrongBlockHash,
         );
+    }
+
+    // ───────────────────────── stage 5: POL preservation ────────────────────────
+
+    #[test]
+    fn coordinator_locked_starts_none() {
+        let (vs, _) = three_equal();
+        let coord = RoundCoordinator::new(1, SEED, vs);
+        assert!(coord.locked().is_none());
+    }
+
+    #[test]
+    fn polc_formation_sets_locked() {
+        let (vs, keys) = three_equal();
+        let mut coord = RoundCoordinator::new(1, SEED, vs);
+        let block = drive_to_precommitting(&mut coord, &keys);
+        let locked = coord.locked().expect("POLC should have armed the lock");
+        assert_eq!(locked.block_hash, block);
+        assert_eq!(locked.round, 0);
+    }
+
+    #[test]
+    fn fire_timeout_preserves_lock_across_rounds() {
+        let (vs, keys) = three_equal();
+        let mut coord = RoundCoordinator::new(1, SEED, vs);
+        let block = drive_to_precommitting(&mut coord, &keys);
+        coord.fire_timeout();
+        // polc cleared, but lock preserved.
+        assert!(coord.polc().is_none());
+        let locked = coord.locked().expect("lock preserved across timeout");
+        assert_eq!(locked.block_hash, block);
+        assert_eq!(locked.round, 0);
+        assert_eq!(coord.round(), 1);
+    }
+
+    #[test]
+    fn multiple_timeouts_keep_lock() {
+        let (vs, keys) = three_equal();
+        let mut coord = RoundCoordinator::new(1, SEED, vs);
+        drive_to_precommitting(&mut coord, &keys);
+        for _ in 0..5 {
+            coord.fire_timeout();
+        }
+        assert_eq!(coord.round(), 5);
+        assert!(coord.locked().is_some(), "lock should survive 5 timeouts");
+    }
+
+    #[test]
+    fn new_polc_in_higher_round_supersedes_lock() {
+        let (vs, keys) = three_equal();
+        let mut coord = RoundCoordinator::new(1, SEED, vs);
+        let r0_block = drive_to_precommitting(&mut coord, &keys);
+        assert_eq!(coord.locked().unwrap().round, 0);
+
+        // Advance to round 1; new proposal for a DIFFERENT block.
+        coord.fire_timeout();
+        let r1_leader = coord.leader_index();
+        let r1_proof = LeaderProof::produce(&keys[r1_leader].1, 1, 1, &SEED);
+        let r1_block = H256::new([0xcc; 32]);
+        assert_ne!(r0_block, r1_block);
+        coord.submit_proposal(r1_block, &r1_proof).unwrap();
+        for (i, (bls, _)) in keys.iter().enumerate() {
+            coord
+                .submit_prevote(PrevoteVote::sign(
+                    bls,
+                    r1_block,
+                    1,
+                    1,
+                    u32::try_from(i).unwrap(),
+                ))
+                .unwrap();
+        }
+        // Lock now points at r1_block @ round 1.
+        let locked = coord.locked().unwrap();
+        assert_eq!(locked.block_hash, r1_block);
+        assert_eq!(locked.round, 1);
     }
 }

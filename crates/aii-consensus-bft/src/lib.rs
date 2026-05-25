@@ -20,6 +20,7 @@
 
 pub mod bft;
 pub mod coordinator;
+pub mod slashing;
 pub mod wire;
 pub use bft::{
     LeaderProof, Phase, PolcCertificate, PrecommitCertificate, PrecommitTallier, PrecommitVote,
@@ -27,6 +28,7 @@ pub use bft::{
     PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
 };
 pub use coordinator::RoundCoordinator;
+pub use slashing::{EquivocationDetector, EquivocationEvidence, SlashingError};
 pub use wire::{
     BftMessage, CodecError, PROPOSAL_LEN, TAG_PRECOMMIT, TAG_PREVOTE, TAG_PROPOSAL, VOTE_LEN,
 };
