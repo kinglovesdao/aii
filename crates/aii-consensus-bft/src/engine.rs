@@ -33,10 +33,16 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
 use aii_crypto::{bls, vrf};
 use aii_types::{Address, H256, U256};
+
+/// Gas cost charged per included tx in the v0.0.37 placeholder
+/// pipeline (no actual EVM execution — every tx is treated as a
+/// 21,000-gas transfer).
+pub const PLACEHOLDER_TX_GAS: u64 = 21_000;
 
 use crate::bft::{LeaderProof, PrecommitCertificate, PrecommitVote, PrevoteVote, ValidatorSet};
 use crate::coordinator::RoundCoordinator;
@@ -142,6 +148,7 @@ pub struct AdvanceOutput {
 pub struct BftEngine {
     config: BftConfig,
     state: Arc<Mutex<BftEngineState>>,
+    pending_txs: Mutex<Vec<Tx>>,
 }
 
 struct BftEngineState {
@@ -174,7 +181,14 @@ impl BftEngine {
         Self {
             config,
             state: Arc::new(Mutex::new(state)),
+            pending_txs: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Stage transactions to include in the next produced block.
+    /// Overwrites any previously-staged batch.
+    pub fn set_pending_txs(&self, txs: Vec<Tx>) {
+        *self.pending_txs.lock() = txs;
     }
 
     /// Snapshot the chain head.
@@ -470,6 +484,14 @@ impl BftEngine {
         // Build the leader proof for the new height's round 0.
         let leader_proof = LeaderProof::produce(&self.config.my_vrf_sk, new_number, 0, &seed);
 
+        // Drain pending txs up to the block's gas budget.
+        let max_txs = (self.config.gas_limit / PLACEHOLDER_TX_GAS) as usize;
+        let mut pending = self.pending_txs.lock();
+        let take = pending.len().min(max_txs);
+        let txs: Vec<Tx> = pending.drain(..take).collect();
+        drop(pending);
+        let gas_used = (txs.len() as u64) * PLACEHOLDER_TX_GAS;
+
         // Build the block. Carry the VRF output into mix_hash so
         // consecutive blocks differ even with identical bodies.
         let header = Header {
@@ -483,7 +505,7 @@ impl BftEngine {
             difficulty: U256::ZERO,
             number: new_number,
             gas_limit: self.config.gas_limit,
-            gas_used: 0,
+            gas_used,
             timestamp: new_timestamp,
             extra_data: b"aii-bft".to_vec(),
             mix_hash: H256::new(leader_proof.vrf_output),
@@ -496,7 +518,11 @@ impl BftEngine {
         };
         let block = Block {
             header,
-            body: BlockBody::default(),
+            body: BlockBody {
+                transactions: txs,
+                ommers: Vec::new(),
+                withdrawals: Vec::new(),
+            },
         };
         let block_hash = block.hash();
 

@@ -102,6 +102,34 @@ pub trait RpcState: Send + Sync + 'static {
     async fn recent_headers(&self, _limit: usize) -> Vec<HeaderView> {
         Vec::new()
     }
+
+    /// Submit a signed raw transaction. Default rejects; node impls
+    /// that own a mempool should override.
+    ///
+    /// Returns the transaction's hash (`0x…` 32-byte hex) on success.
+    async fn submit_raw_tx(&self, _raw_hex: &str) -> Result<String, SubmitTxError> {
+        Err(SubmitTxError::Unsupported)
+    }
+}
+
+/// Errors from `RpcState::submit_raw_tx`.
+#[derive(Debug, thiserror::Error)]
+pub enum SubmitTxError {
+    /// Node was not built with mempool support.
+    #[error("eth_sendRawTransaction not supported by this node")]
+    Unsupported,
+    /// Hex decode failed.
+    #[error("invalid hex: {0}")]
+    Hex(String),
+    /// RLP / EIP-2718 decode failed.
+    #[error("invalid tx encoding: {0}")]
+    Decode(String),
+    /// secp256k1 signer recovery failed.
+    #[error("signer recovery: {0}")]
+    Signer(String),
+    /// Mempool rejected the tx (full, underpriced, etc.).
+    #[error("mempool: {0}")]
+    Pool(String),
 }
 
 /// `aii_status` response body.
@@ -133,6 +161,13 @@ pub trait EthRpc {
     /// `blockTag` is currently ignored (only the head is supported).
     #[method(name = "getBalance")]
     async fn get_balance(&self, address: String, block_tag: Option<String>) -> RpcResult<String>;
+
+    /// `eth_sendRawTransaction(rawHex)` — accepts an EIP-2718-encoded
+    /// signed transaction (`0x…` hex), verifies the signer via
+    /// secp256k1 ecrecover, and admits it to the mempool. Returns the
+    /// 32-byte transaction hash as `0x…` hex.
+    #[method(name = "sendRawTransaction")]
+    async fn send_raw_transaction(&self, raw_hex: String) -> RpcResult<String>;
 }
 
 #[rpc(server, namespace = "aii")]
@@ -185,6 +220,17 @@ impl<S: RpcState> EthRpcServer for EthRpcImpl<S> {
             .await
             .map_or_else(|| "0x0".to_string(), |a| a.balance);
         Ok(bal)
+    }
+
+    async fn send_raw_transaction(&self, raw_hex: String) -> RpcResult<String> {
+        match self.state.submit_raw_tx(&raw_hex).await {
+            Ok(hash) => Ok(hash),
+            Err(e) => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32000,
+                e.to_string(),
+                None::<()>,
+            )),
+        }
     }
 }
 

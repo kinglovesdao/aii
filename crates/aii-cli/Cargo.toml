@@ -24,6 +24,8 @@ aii-onboarding = { workspace = true }
 aii-config = { workspace = true }
 aii-crypto = { workspace = true }
 aii-consensus-bft = { workspace = true }
+aii-block = { workspace = true }
+alloy-rlp = { workspace = true }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

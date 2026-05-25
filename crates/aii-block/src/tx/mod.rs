@@ -3,10 +3,12 @@
 pub mod eip1559;
 pub mod eip4844;
 pub mod legacy;
+pub mod signer;
 
 pub use eip1559::TxEip1559;
 pub use eip4844::TxEip4844;
 pub use legacy::TxLegacy;
+pub use signer::RecoveryError;
 
 use crate::Hashable;
 use aii_crypto::keccak::keccak256;

@@ -3,7 +3,7 @@
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
     run_account_verify, run_chain_id, run_genesis_init, run_genesis_validate, run_get_block_header,
-    run_random_seed_hex, run_recent_blocks, run_status, run_tier, run_validator_keygen,
+    run_random_seed_hex, run_recent_blocks, run_status, run_stress, run_tier, run_validator_keygen,
     run_validator_pubkey, CliError, ValidatorEntry, ValidatorPubkeys,
 };
 use clap::{Parser, Subcommand};
@@ -58,6 +58,28 @@ enum Cmd {
         /// Max headers to return (server-capped at 100).
         #[arg(long, default_value = "10")]
         limit: u64,
+    },
+    /// Flood the node with signed self-transfers and report
+    /// observed txs/block + throughput.
+    Stress {
+        /// Chain id of the target network (must match node's).
+        #[arg(long, default_value = "9999")]
+        chain_id: u64,
+        /// Total number of txs to submit.
+        #[arg(long, default_value = "5000")]
+        total: u64,
+        /// Distinct signer addresses (more = wider parallel nonce streams).
+        #[arg(long, default_value = "32")]
+        senders: u32,
+        /// Concurrent RPC workers.
+        #[arg(long, default_value = "16")]
+        parallel: u32,
+        /// Seconds to wait after submission before sampling blocks.
+        #[arg(long, default_value = "5")]
+        settle_sec: u64,
+        /// How many recent blocks to sample for the txs/block stats.
+        #[arg(long, default_value = "20")]
+        sample_blocks: u64,
     },
 }
 
@@ -197,6 +219,37 @@ async fn main() -> Result<(), CliError> {
                 }
                 None if cli.json => println!("null"),
                 None => println!("block not found: {query}"),
+            }
+        }
+        Cmd::Stress {
+            chain_id,
+            total,
+            senders,
+            parallel,
+            settle_sec,
+            sample_blocks,
+        } => {
+            let r = run_stress(
+                &cli.rpc,
+                chain_id,
+                total,
+                senders,
+                parallel,
+                settle_sec,
+                sample_blocks,
+            )
+            .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("submitted:        {}", r.submitted);
+                println!("accepted:         {}", r.accepted);
+                println!("blocks observed:  {}", r.blocks_observed);
+                println!("txs in blocks:    {}", r.txs_in_blocks);
+                println!("peak txs / block: {}", r.peak_txs_per_block);
+                println!("mean txs / block: {}", r.mean_txs_per_block);
+                println!("submit rate:      {:.0} tx/s", r.submit_tx_per_sec);
+                println!("elapsed:          {:.1} s", r.elapsed_sec);
             }
         }
         Cmd::Recent { limit } => {

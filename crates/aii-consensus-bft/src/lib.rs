@@ -30,7 +30,7 @@ pub use bft::{
     PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
 };
 pub use coordinator::RoundCoordinator;
-pub use engine::{AdvanceOutput, BftConfig, BftEngine};
+pub use engine::{AdvanceOutput, BftConfig, BftEngine, PLACEHOLDER_TX_GAS};
 pub use gossip::{BftGossip, BftTransport};
 pub use slashing::{EquivocationDetector, EquivocationEvidence, SlashingError};
 pub use wire::{

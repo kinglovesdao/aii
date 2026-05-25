@@ -5,6 +5,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.37] — 2026-05-25
+
+### Added — Transaction pipeline + live stress test
+
+**The chain accepts real signed transactions and packs them into
+blocks.** `aii_getBlockHeader` now reports non-zero `gas_used`,
+explorers and wallets can submit via `eth_sendRawTransaction`, and
+the `aii stress` CLI command measures actual throughput.
+
+**Live testnet result** (single-validator BFT on `8.211.135.234`,
+15,000 self-transfers from a local stress client):
+
+| Metric | Value |
+|---|---|
+| Submitted / Accepted | 15,000 / 15,000 |
+| Peak txs / block | **1,428** (`gas_limit 30M ÷ 21k`) |
+| Sustained 7 consecutive blocks at peak | yes |
+| Mean txs / block (over 20 sampled) | 750 |
+| Submit rate (single-process HTTP) | 1,459 tx/s |
+| Wall clock | 10.3 s |
+
+#### `aii-block` — signer recovery
+
+- New module `tx::signer` with `Tx::recover_signer(chain_id) -> Address`.
+- Pre-EIP-155 legacy (v ∈ {27, 28}), EIP-155 legacy (v = chain*2+35),
+  and EIP-1559 (v ∈ {0, 1}). Round-trip tests with a fresh secp256k1
+  key prove the recovered address matches `sk.public_key().address()`.
+- PQ-mode (`algo_id != Secp256k1`) is rejected explicitly with
+  `RecoveryError::NotSecp256k1`.
+
+#### `aii-net-txpool`
+
+- New `drain_up_to(n)` for FCFS bulk drain — producers pull a batch
+  for the next block without enforcing per-sender nonce ordering
+  across sender boundaries.
+
+#### `aii-rpc`
+
+- New `RpcState::submit_raw_tx(raw_hex)` default impl + matching
+  `eth_sendRawTransaction(rawHex)` RPC method. Parses EIP-2718,
+  recovers signer, admits to mempool, returns the 32-byte tx hash.
+- New `SubmitTxError` enum with `Unsupported / Hex / Decode / Signer
+  / Pool` variants.
+
+#### `aii-node`
+
+- `NodeState` owns an `Arc<TxPool>` (capacity 100,000) and exposes
+  `tx_pool()` to the producer loop.
+- `submit_raw_tx` implementation: hex → EIP-2718 decode → secp256k1
+  recover → `TxPool::add` keyed by `(sender, nonce)`. Returns the
+  tx's keccak256 hash.
+
+#### `aii-consensus-bft` + `aii-consensus-poa`
+
+- Both engines gain a `pending_txs: Mutex<Vec<Tx>>` slot and a
+  `set_pending_txs(Vec<Tx>)` setter.
+- `BftEngine::advance_single` and `PoaEngine::produce_block` drain
+  pending txs up to `gas_limit / PLACEHOLDER_TX_GAS` and include
+  them in `block.body.transactions`. `header.gas_used = N * 21,000`
+  (placeholder until EVM execution lands).
+- `PLACEHOLDER_TX_GAS = 21_000` is re-exported for the producer
+  loop's batch-size math.
+
+#### `aii-cli`
+
+- New `aii stress` subcommand and library entry point `run_stress`.
+  Generates `--senders` distinct signers, signs N legacy
+  self-transfers (EIP-155 chain-id-bound), submits via
+  `eth_sendRawTransaction` across `--parallel` workers, samples
+  `--sample-blocks` after `--settle-sec`, and prints
+  `submitted / accepted / peak txs/block / mean / throughput`.
+- New `aii block <q>` and `aii recent --limit N` (carried from
+  v0.0.36).
+
+#### Tests + verification
+
+- Workspace: **653 / 653** tests (was 647), clippy clean under
+  `-D warnings`.
+- 6 new RED→GREEN tests in `aii-block::tx::signer`.
+- Live stress numbers above — reproducible by anyone with a JP/CN
+  shell:
+  ```bash
+  aii --rpc http://8.211.135.234:8545 stress \
+      --chain-id 9999 --total 15000 --senders 64 --parallel 64
+  ```
+
+#### Scope discipline
+
+- **In scope**: signer recovery, mempool wire-in, producer drain,
+  CLI stress harness.
+- **Not in this release**:
+  - **Block-body gossip for multi-validator BFT**:
+    `BftMessage::Proposal` still carries only `(hash, leader_proof)`,
+    so peers reconstruct an empty block. The 2-node JP+CN BFT
+    deployment was temporarily switched to single-validator on JP
+    for this release; v0.0.38 will extend the wire format so
+    multi-validator BFT can carry tx-bearing blocks too.
+  - **Real EVM execution** — every tx is currently treated as a
+    21,000-gas transfer with no balance / nonce check (placeholder).
+    Real `revm` execution lands in v0.0.39+.
+  - **Subchain → main chain flush** — v0.0.38 scope.
+
 ## [0.0.36] — 2026-05-25
 
 ### Added — Block explorer API + MCP integration

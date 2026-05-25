@@ -11,12 +11,15 @@
 pub mod bft_bootstrap;
 pub mod bft_p2p;
 
+use aii_block::tx::Tx;
 use aii_block::{Block, Hashable, Header};
 use aii_config::ChainSpec;
-use aii_rpc::{AccountView, HeaderView, RpcState};
+use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
+use aii_rpc::{AccountView, HeaderView, RpcState, SubmitTxError};
 use aii_state::StateDb;
 use aii_storage::MemoryBackend;
 use aii_types::{Address, H256, U256};
+use alloy_rlp::Decodable;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +38,8 @@ pub struct NodeState {
     state: StateDb<MemoryBackend>,
     /// In-memory header store. Persistent RocksDB lands in v0.0.36+.
     blocks: RwLock<BlockStore>,
+    /// Mempool for incoming signed transactions (v0.0.37).
+    tx_pool: TxPool,
 }
 
 /// Headers keyed by hash + a number→hash index, plus an insertion-order
@@ -56,7 +61,14 @@ impl NodeState {
             head: AtomicU64::new(0),
             state: StateDb::new(Arc::new(MemoryBackend::new())),
             blocks: RwLock::new(BlockStore::default()),
+            tx_pool: TxPool::new(100_000),
         })
+    }
+
+    /// Borrow the mempool (for the producer drain loop).
+    #[must_use]
+    pub const fn tx_pool(&self) -> &TxPool {
+        &self.tx_pool
     }
 
     /// Update the head block number — called when a new block is finalised.
@@ -161,6 +173,52 @@ impl RpcState for NodeState {
             .take(limit)
             .filter_map(|h| s.by_hash.get(h).map(|hdr| header_to_view(*h, hdr)))
             .collect()
+    }
+
+    async fn submit_raw_tx(&self, raw_hex: &str) -> Result<String, SubmitTxError> {
+        let s = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
+        let bytes = hex::decode(s).map_err(|e| SubmitTxError::Hex(format!("hex decode: {e}")))?;
+        if bytes.is_empty() {
+            return Err(SubmitTxError::Decode("empty body".into()));
+        }
+        let mut buf: &[u8] = &bytes;
+        // EIP-2718: a leading byte < 0xc0 selects the envelope; >= 0xc0
+        // is the start of an RLP list (legacy).
+        let tx = if bytes[0] < 0xc0 {
+            Tx::decode_2718(&mut buf)
+                .map_err(|e| SubmitTxError::Decode(format!("EIP-2718: {e}")))?
+        } else {
+            let mut buf: &[u8] = &bytes;
+            let legacy = aii_block::tx::TxLegacy::decode(&mut buf)
+                .map_err(|e| SubmitTxError::Decode(format!("legacy RLP: {e}")))?;
+            Tx::Legacy(legacy)
+        };
+        let chain_id = self.spec.chain_id;
+        let sender = tx
+            .recover_signer(chain_id)
+            .map_err(|e| SubmitTxError::Signer(e.to_string()))?;
+        let nonce = match &tx {
+            Tx::Legacy(t) => t.nonce,
+            Tx::Eip1559(t) => t.nonce,
+            Tx::Eip4844(t) => t.nonce,
+        };
+        let gas_price = effective_gas_price(&tx);
+        let tx_hash = tx.hash();
+        let entry = PoolEntry {
+            sender,
+            nonce,
+            effective_gas_price: gas_price,
+            tx,
+        };
+        match self.tx_pool.add(entry) {
+            Ok(AddOutcome::Inserted | AddOutcome::Replaced(_)) => {
+                Ok(format!("0x{}", hex::encode(tx_hash.as_bytes())))
+            }
+            Ok(AddOutcome::RejectedUnderpriced) => Err(SubmitTxError::Pool(
+                "rejected: same-nonce tx with equal/lower gas price already in pool".into(),
+            )),
+            Err(e) => Err(SubmitTxError::Pool(e.to_string())),
+        }
     }
 
     async fn account(&self, addr: &Address) -> Option<AccountView> {

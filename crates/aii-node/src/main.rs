@@ -203,9 +203,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let interval = Duration::from_secs(cli.slot_seconds);
             if is_single {
                 let engine_for_loop = engine.clone();
+                let state_for_pool = node_state.clone();
+                let max_txs_per_block =
+                    (spec.initial_gas_limit / aii_consensus_bft::PLACEHOLDER_TX_GAS) as usize;
                 Some(tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(interval).await;
+                        // Pull a batch of txs from the mempool, stage them on
+                        // the engine for inclusion in the next block.
+                        let txs = state_for_pool.tx_pool().drain_up_to(max_txs_per_block);
+                        let tx_count = txs.len();
+                        engine_for_loop.set_pending_txs(txs);
                         match engine_for_loop.advance_single() {
                             Ok(out) => {
                                 state_for_loop.commit_block(&out.block);
@@ -214,6 +222,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     number = out.block.header.number,
                                     hash = ?out.block_hash,
                                     round = out.certificate.round,
+                                    txs = tx_count,
+                                    gas_used = out.block.header.gas_used,
                                     "BFT block finalised"
                                 );
                             }
@@ -282,16 +292,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "PoA engine ready"
             );
             let state_for_loop = node_state.clone();
+            let state_for_pool = node_state.clone();
             let interval = Duration::from_secs(cli.slot_seconds);
+            let max_txs_per_block =
+                (spec.initial_gas_limit / aii_consensus_poa::PLACEHOLDER_TX_GAS) as usize;
             Some(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(interval).await;
                     if engine.is_my_turn() {
+                        let txs = state_for_pool.tx_pool().drain_up_to(max_txs_per_block);
+                        let tx_count = txs.len();
+                        engine.set_pending_txs(txs);
                         match engine.produce_block() {
                             Ok((hash, number, block)) => {
                                 state_for_loop.commit_block(&block);
                                 state_for_loop.set_head(number);
-                                tracing::info!(number, ?hash, "PoA block produced");
+                                tracing::info!(
+                                    number,
+                                    ?hash,
+                                    txs = tx_count,
+                                    gas_used = block.header.gas_used,
+                                    "PoA block produced"
+                                );
                             }
                             Err(e) => {
                                 tracing::error!(?e, "PoA produce failed");
