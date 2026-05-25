@@ -8,16 +8,65 @@ Spec: see `docs/superpowers/specs/2026-05-21-aii-core-design.md` and the 14-docu
 
 ## Status
 
-**v0.0.1 — Workspace bootstrap + `aii-types` primitive types.**
+**v0.0.36 — Live 2-node BFT testnet + block explorer.**
 
-Workspace skeleton is live; downstream crates (consensus/state/EVM/...) coming in subsequent plans.
+| | |
+|---|---|
+| Chain ID | `9999` (aii-testnet) |
+| Explorer | https://aii.allfund.xyz/ |
+| Validators | 2 (JP + CN), TCP gossip on port 30311 |
+| Consensus | BFT-PoS — VRF leader election + ⅔ BLS aggregate finality |
+| Block time | ~1–2 s |
+| Tests | 647 / 647 passing, `clippy -D warnings` clean |
+
+### Public RPC endpoints
+
+| URL | Notes |
+|---|---|
+| `https://aii.allfund.xyz/api` | HTTPS, Let's Encrypt, reverse-proxied to JP |
+| `http://8.211.135.234:8545` | JP node direct (Aliyun Tokyo) |
+| `http://106.14.223.128:8545` | CN node direct (Aliyun Shanghai) |
+
+Wallets (MetaMask etc.) can use any of these as the RPC URL with chain id `9999`.
+
+### Testnet topology
+
+```
+                ┌──────────────────┐
+   ╔══DNS══════►│ aii.allfund.xyz  │  HTTPS + static explorer
+   ║            │  nginx (Ubuntu)  │  /api → 127.0.0.1:8545
+   ║            └────────┬─────────┘
+   ║                     │
+   ║                     ▼
+┌──╨─────────────┐                   ┌────────────────────┐
+│ JP 8.211.135.. │◄── TCP :30311 ───►│ CN 106.14.223..    │
+│ aiid (native)  │   BftMessage      │ aiid (docker)      │
+│ Ubuntu 24.04   │   gossip          │ CentOS 7 + ubuntu  │
+│ validator #0   │                   │ validator #1       │
+└────────────────┘                   └────────────────────┘
+```
+
+Both nodes finalise the same block at every height — verified by hash agreement on `aii_getBlockHeader` queries. If one node drops, the other halts on quorum (BFT-safe) and resumes after reconnect.
+
+### Release lineage
+
+| Tag | Highlight |
+|---|---|
+| `v0.0.34` | Multi-host BFT over TCP gossip |
+| `v0.0.35` | Pluggable consensus — BFT + PoA engines |
+| `v0.0.36` | Block explorer API (`aii_getBlockHeader`, `aii_recentBlocks`) + MCP tools + live mainnet-ready deployment |
 
 ## Quickstart (developers)
 
 ```bash
-git clone https://github.com/AII-Network/aii.git
+git clone https://github.com/kinglovesdao/aii.git
 cd aii
 cargo test --workspace
+cargo build --release -p aii-node -p aii-cli
+
+# Talk to the live testnet:
+./target/release/aii --rpc https://aii.allfund.xyz/api status
+./target/release/aii --rpc https://aii.allfund.xyz/api recent --limit 5
 ```
 
 ## License
