@@ -2,7 +2,8 @@
 
 use aii_block::{Block, BlockBody, Bloom, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_config::ChainSpec;
-use aii_consensus_bft::{DevModeEngine, EngineConfig};
+use aii_consensus_bft::{BftGossip, DevModeEngine, EngineConfig};
+use aii_node::bft_p2p::TcpBftTransport;
 use aii_node::{bft_bootstrap, NodeState};
 use aii_storage::RocksDbBackend;
 use aii_types::{Address, H256, U256};
@@ -64,6 +65,17 @@ struct Cli {
     /// Defaults to all-zero.
     #[arg(long)]
     coinbase: Option<String>,
+
+    /// TCP address to bind the BFT gossip listener to. Defaults to
+    /// `127.0.0.1:30311`. Only used when `--bft` is set.
+    #[arg(long, default_value = "127.0.0.1:30311")]
+    bft_listen: SocketAddr,
+
+    /// Comma-separated list of `host:port` addresses of peer BFT
+    /// nodes. Each entry will be dialed on startup and reconnect on
+    /// failure. Example: `--peers 10.0.0.2:30311,10.0.0.3:30311`.
+    #[arg(long, value_delimiter = ',')]
+    peers: Vec<SocketAddr>,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -159,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .unwrap_or(Address::ZERO);
             let (engine, genesis) =
                 bft_bootstrap::boot_bft_engine(genesis_path, keystore_path, coinbase)?;
+            let engine = Arc::new(engine);
             let is_single = engine.is_single_validator();
             tracing::info!(
                 single_validator = is_single,
@@ -168,11 +181,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             let state_for_loop = node_state.clone();
             let interval = Duration::from_secs(cli.slot_seconds);
-            Some(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    if is_single {
-                        match engine.advance_single() {
+            if is_single {
+                let engine_for_loop = engine.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        match engine_for_loop.advance_single() {
                             Ok(out) => {
                                 state_for_loop.set_head(out.block.header.number);
                                 tracing::info!(
@@ -187,14 +201,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 break;
                             }
                         }
-                    } else {
-                        // Multi-validator drive: peer events arrive via the
-                        // network layer (v0.0.34+). For now, just log that
-                        // we're waiting.
-                        tracing::debug!("multi-validator mode — waiting for peer events");
                     }
-                }
-            }))
+                }))
+            } else {
+                // Multi-validator: stand up the TCP gossip transport,
+                // then loop driving the gossip + harvest pair.
+                let transport =
+                    Arc::new(TcpBftTransport::new(cli.bft_listen, cli.peers.clone()).await?);
+                tracing::info!(
+                    listen = %transport.local_addr(),
+                    peers = ?cli.peers,
+                    "BFT gossip transport listening"
+                );
+                let gossip = Arc::new(BftGossip::new(engine.clone(), transport));
+                let engine_for_loop = engine.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        gossip.tick();
+                        if let Some(n) = engine_for_loop.try_harvest_committed() {
+                            state_for_loop.set_head(n);
+                            tracing::info!(number = n, "BFT block finalised (multi)");
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }))
+            }
         } else if cli.produce_blocks {
             // Legacy dev-mode producer.
             let genesis = genesis_block(&spec);

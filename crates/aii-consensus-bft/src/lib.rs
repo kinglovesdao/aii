@@ -21,6 +21,7 @@
 pub mod bft;
 pub mod coordinator;
 pub mod engine;
+pub mod gossip;
 pub mod slashing;
 pub mod wire;
 pub use bft::{
@@ -30,6 +31,7 @@ pub use bft::{
 };
 pub use coordinator::RoundCoordinator;
 pub use engine::{AdvanceOutput, BftConfig, BftEngine};
+pub use gossip::{BftGossip, BftTransport};
 pub use slashing::{EquivocationDetector, EquivocationEvidence, SlashingError};
 pub use wire::{
     BftMessage, CodecError, PROPOSAL_LEN, TAG_PRECOMMIT, TAG_PREVOTE, TAG_PROPOSAL, VOTE_LEN,
@@ -280,6 +282,12 @@ pub enum BftError {
         /// Which key: `"bls"` or `"vrf"`.
         kind: &'static str,
     },
+
+    /// A peer's `Proposal` message carries a `block_hash` that does
+    /// not match the block we'd reconstruct from `(height, round,
+    /// leader_proof)` — likely a forged or mis-encoded proposal.
+    #[error("proposal block-hash mismatch")]
+    ProposalHashMismatch,
 }
 
 #[cfg(test)]
