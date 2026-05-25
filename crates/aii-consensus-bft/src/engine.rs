@@ -64,6 +64,70 @@ pub struct BftConfig {
     pub slot_seconds: u64,
 }
 
+impl BftConfig {
+    /// Build a [`BftConfig`] from a genesis file plus this node's
+    /// private keys + coinbase. The validator set, chain-spec
+    /// parameters (gas limit, base fee, slot time), and the initial
+    /// seed are sourced from the genesis; the secret keys and coinbase
+    /// stay node-local.
+    ///
+    /// Returns:
+    /// - [`BftError::EmptyValidatorSet`] if `genesis.validators` is empty
+    /// - [`BftError::InvalidValidatorPubkey`] if any entry has an
+    ///   undecodable BLS or VRF pubkey
+    /// - [`BftError::ValidatorIndexOutOfBounds`] if `my_index >=
+    ///   genesis.validators.len()` (`size` is the validator-set size)
+    pub fn from_genesis(
+        genesis: &aii_config::Genesis,
+        my_index: u32,
+        my_bls_sk: bls::SecretKey,
+        my_vrf_sk: vrf::SecretKey,
+        coinbase: Address,
+    ) -> Result<Self, BftError> {
+        if genesis.validators.is_empty() {
+            return Err(BftError::EmptyValidatorSet);
+        }
+        let mut runtime = Vec::with_capacity(genesis.validators.len());
+        for (i, gv) in genesis.validators.iter().enumerate() {
+            let bls_pubkey = bls::PublicKey::from_compressed(&gv.bls_pubkey.0).map_err(|_| {
+                BftError::InvalidValidatorPubkey {
+                    index: i,
+                    kind: "bls",
+                }
+            })?;
+            let vrf_pubkey = vrf::PublicKey::from_bytes(&gv.vrf_pubkey.0).map_err(|_| {
+                BftError::InvalidValidatorPubkey {
+                    index: i,
+                    kind: "vrf",
+                }
+            })?;
+            runtime.push(crate::bft::Validator {
+                bls_pubkey,
+                vrf_pubkey,
+                stake: gv.stake,
+            });
+        }
+        let validator_set = ValidatorSet::new(runtime)?;
+        if (my_index as usize) >= validator_set.size() {
+            return Err(BftError::ValidatorIndexOutOfBounds {
+                index: my_index,
+                size: validator_set.size(),
+            });
+        }
+        Ok(Self {
+            validator_set,
+            my_index,
+            my_bls_sk,
+            my_vrf_sk,
+            initial_seed: genesis.initial_seed,
+            coinbase,
+            gas_limit: genesis.chain_spec.initial_gas_limit,
+            base_fee_per_gas: U256::from(genesis.chain_spec.min_base_fee_per_gas),
+            slot_seconds: genesis.chain_spec.block_time_seconds,
+        })
+    }
+}
+
 /// Outcome of a single-validator advance.
 pub struct AdvanceOutput {
     /// The block that was just committed.
@@ -1074,5 +1138,242 @@ mod tests {
         // Touch coordinator via cast_proposal.
         leader_e.cast_proposal().unwrap();
         assert_eq!(leader_e.current_leader_index(), Some(leader));
+    }
+
+    // ─────────────────── BftConfig::from_genesis (v0.0.31) ────────────────────
+
+    use aii_config::{ChainSpec, Genesis, GenesisValidator};
+    use aii_types::{BlsPubKey, VrfPubKey};
+
+    /// Build a `Genesis` with `n` validators of stake 100 each. Returns
+    /// the genesis plus each node's `(bls_sk, vrf_sk)`.
+    fn genesis_with_n_validators(n: u8) -> (Genesis, Vec<(BlsSecretKey, VrfSecretKey)>) {
+        let mut keys = Vec::new();
+        let mut gen_validators = Vec::new();
+        for i in 0..n {
+            let bls = bls_sk(i + 1);
+            let vrf = vrf_sk();
+            gen_validators.push(GenesisValidator {
+                bls_pubkey: BlsPubKey::new(bls.public_key().to_compressed()),
+                vrf_pubkey: VrfPubKey::new(vrf.public_key().to_bytes()),
+                stake: 100,
+            });
+            keys.push((bls, vrf));
+        }
+        let g = Genesis {
+            chain_spec: ChainSpec::testnet(),
+            timestamp: 1_700_000_000,
+            extra_data: vec![],
+            alloc: vec![],
+            validators: gen_validators,
+            initial_seed: [0x9a; 32],
+        };
+        (g, keys)
+    }
+
+    fn config_err(r: Result<BftConfig, BftError>) -> BftError {
+        match r {
+            Ok(_) => panic!("expected error but got Ok(BftConfig)"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn bft_config_from_genesis_empty_validators_rejected() {
+        let g = Genesis {
+            chain_spec: ChainSpec::testnet(),
+            timestamp: 0,
+            extra_data: vec![],
+            alloc: vec![],
+            validators: vec![],
+            initial_seed: [0; 32],
+        };
+        let err = config_err(BftConfig::from_genesis(
+            &g,
+            0,
+            bls_sk(1),
+            vrf_sk(),
+            Address::ZERO,
+        ));
+        assert_eq!(err, BftError::EmptyValidatorSet);
+    }
+
+    #[test]
+    fn bft_config_from_genesis_with_invalid_bls_pubkey_rejected() {
+        let (mut g, keys) = genesis_with_n_validators(1);
+        // Corrupt the BLS pubkey to all-zero (off-curve).
+        g.validators[0].bls_pubkey = BlsPubKey::ZERO;
+        let err = config_err(BftConfig::from_genesis(
+            &g,
+            0,
+            keys[0].0.clone(),
+            keys[0].1.clone(),
+            Address::ZERO,
+        ));
+        assert_eq!(
+            err,
+            BftError::InvalidValidatorPubkey {
+                index: 0,
+                kind: "bls"
+            },
+        );
+    }
+
+    #[test]
+    fn bft_config_from_genesis_my_index_out_of_bounds_rejected() {
+        let (g, keys) = genesis_with_n_validators(3);
+        let err = config_err(BftConfig::from_genesis(
+            &g,
+            5, // outside the 3-validator set
+            keys[0].0.clone(),
+            keys[0].1.clone(),
+            Address::ZERO,
+        ));
+        assert!(matches!(
+            err,
+            BftError::ValidatorIndexOutOfBounds { index: 5, size: 3 },
+        ));
+    }
+
+    #[test]
+    fn bft_config_from_genesis_populates_chain_spec_params() {
+        let (g, keys) = genesis_with_n_validators(1);
+        let cfg = BftConfig::from_genesis(
+            &g,
+            0,
+            keys[0].0.clone(),
+            keys[0].1.clone(),
+            Address::new([0xab; 20]),
+        )
+        .unwrap();
+        assert_eq!(cfg.gas_limit, g.chain_spec.initial_gas_limit);
+        assert_eq!(
+            cfg.base_fee_per_gas,
+            U256::from(g.chain_spec.min_base_fee_per_gas),
+        );
+        assert_eq!(cfg.slot_seconds, g.chain_spec.block_time_seconds);
+        assert_eq!(cfg.initial_seed, g.initial_seed);
+        assert_eq!(cfg.coinbase, Address::new([0xab; 20]));
+        assert_eq!(cfg.validator_set.size(), 1);
+    }
+
+    #[test]
+    fn bft_engine_from_genesis_single_validator_advances() {
+        let (g, keys) = genesis_with_n_validators(1);
+        let cfg =
+            BftConfig::from_genesis(&g, 0, keys[0].0.clone(), keys[0].1.clone(), Address::ZERO)
+                .unwrap();
+        let genesis_block = Block {
+            header: g.to_header(EMPTY_TRIE_HASH),
+            body: BlockBody::default(),
+        };
+        let vs = cfg.validator_set.clone();
+        let engine = BftEngine::new(cfg, &genesis_block);
+        let out = engine.advance_single().unwrap();
+        out.certificate.verify(&vs).unwrap();
+        assert_eq!(out.block.header.number, 1);
+    }
+
+    #[test]
+    fn three_validator_genesis_drives_e2e_consensus() {
+        // Same flow as `three_node_consensus_produces_same_block` but
+        // every BftEngine is built from the SAME genesis file.
+        let (g, keys) = genesis_with_n_validators(3);
+        let genesis_block = Block {
+            header: g.to_header(EMPTY_TRIE_HASH),
+            body: BlockBody::default(),
+        };
+        let engines: Vec<BftEngine> = (0..3u32)
+            .map(|i| {
+                let cfg = BftConfig::from_genesis(
+                    &g,
+                    i,
+                    keys[i as usize].0.clone(),
+                    keys[i as usize].1.clone(),
+                    Address::ZERO,
+                )
+                .unwrap();
+                BftEngine::new(cfg, &genesis_block)
+            })
+            .collect();
+
+        // Recompute the leader from genesis (BftEngine intentionally
+        // hides its config; the host derives leader externally if
+        // needed — same data, same algorithm).
+        let mut runtime_validators = Vec::new();
+        for gv in &g.validators {
+            runtime_validators.push(crate::bft::Validator {
+                bls_pubkey: bls::PublicKey::from_compressed(&gv.bls_pubkey.0).unwrap(),
+                vrf_pubkey: vrf::PublicKey::from_bytes(&gv.vrf_pubkey.0).unwrap(),
+                stake: gv.stake,
+            });
+        }
+        let vs_external = ValidatorSet::new(runtime_validators).unwrap();
+        let leader = vs_external.select_leader(1, 0, &g.initial_seed);
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        let block_hash = block.hash();
+
+        for (i, e) in engines.iter().enumerate() {
+            if i != leader {
+                e.submit_remote_proposal(block.clone(), proof.clone())
+                    .unwrap();
+            }
+        }
+
+        let prevotes: Vec<PrevoteVote> =
+            engines.iter().map(|e| e.cast_prevote().unwrap()).collect();
+        for (vi, v) in prevotes.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_prevote(v.clone()).unwrap();
+                }
+            }
+        }
+        let precommits: Vec<PrecommitVote> = engines
+            .iter()
+            .map(|e| e.cast_precommit().unwrap())
+            .collect();
+        for (vi, v) in precommits.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_precommit(v.clone()).unwrap();
+                }
+            }
+        }
+        for mut e in engines {
+            let progress = <BftEngine as Engine>::step(&mut e).unwrap();
+            assert_eq!(progress, EngineProgress::NewBlock(block_hash));
+            assert_eq!(e.head().0, block_hash);
+        }
+    }
+
+    #[test]
+    fn genesis_with_validators_json_round_trip() {
+        let (g, _keys) = genesis_with_n_validators(3);
+        let json = serde_json::to_string_pretty(&g).unwrap();
+        let parsed: Genesis = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, g);
+        // The JSON must surface validator pubkeys as 0x-prefixed hex.
+        assert!(json.contains("\"bls_pubkey\""));
+        assert!(json.contains("\"vrf_pubkey\""));
+        assert!(json.contains("\"0x"));
+    }
+
+    #[test]
+    fn bft_config_from_genesis_round_trip_via_json() {
+        let (g, keys) = genesis_with_n_validators(2);
+        let json = serde_json::to_string(&g).unwrap();
+        let parsed: Genesis = serde_json::from_str(&json).unwrap();
+        // Build engine config from the parsed (not original) Genesis.
+        let cfg = BftConfig::from_genesis(
+            &parsed,
+            1,
+            keys[1].0.clone(),
+            keys[1].1.clone(),
+            Address::new([0xcd; 20]),
+        )
+        .unwrap();
+        assert_eq!(cfg.validator_set.size(), 2);
+        assert_eq!(cfg.my_index, 1);
     }
 }

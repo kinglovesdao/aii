@@ -271,6 +271,15 @@ pub enum BftError {
         /// Validator index that *is* the leader.
         expected: u32,
     },
+
+    /// Genesis validator entry has a malformed public key.
+    #[error("genesis validator {index}: invalid {kind} pubkey")]
+    InvalidValidatorPubkey {
+        /// Index in `Genesis::validators` array.
+        index: usize,
+        /// Which key: `"bls"` or `"vrf"`.
+        kind: &'static str,
+    },
 }
 
 #[cfg(test)]
