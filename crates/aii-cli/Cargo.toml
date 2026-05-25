@@ -24,6 +24,7 @@ aii-onboarding = { workspace = true }
 aii-config = { workspace = true }
 aii-crypto = { workspace = true }
 aii-consensus-bft = { workspace = true }
+aii-consensus-poa = { workspace = true }
 aii-block = { workspace = true }
 alloy-rlp = { workspace = true }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

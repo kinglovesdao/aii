@@ -3,8 +3,8 @@
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
     run_account_verify, run_chain_id, run_genesis_init, run_genesis_validate, run_get_block_header,
-    run_random_seed_hex, run_recent_blocks, run_status, run_stress, run_tier, run_validator_keygen,
-    run_validator_pubkey, CliError, ValidatorEntry, ValidatorPubkeys,
+    run_random_seed_hex, run_recent_blocks, run_status, run_stress, run_subchain, run_tier,
+    run_validator_keygen, run_validator_pubkey, CliError, ValidatorEntry, ValidatorPubkeys,
 };
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -59,6 +59,12 @@ enum Cmd {
         #[arg(long, default_value = "10")]
         limit: u64,
     },
+    /// Run an in-process PoA sub-chain and periodically flush
+    /// anchors to a parent chain via `eth_sendRawTransaction`.
+    Subchain {
+        #[command(subcommand)]
+        sub: SubchainCmd,
+    },
     /// Flood the node with signed self-transfers and report
     /// observed txs/block + throughput.
     Stress {
@@ -80,6 +86,32 @@ enum Cmd {
         /// How many recent blocks to sample for the txs/block stats.
         #[arg(long, default_value = "20")]
         sample_blocks: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SubchainCmd {
+    /// Spawn a fresh PoA sub-chain in-process and flush anchors to
+    /// `--parent-rpc` every `--flush-interval-blocks` blocks.
+    Run {
+        /// Sub-chain id (must differ from the parent chain's id).
+        #[arg(long, default_value = "10000")]
+        sub_chain_id: u64,
+        /// Parent chain id (used to EIP-155-sign the flush tx).
+        #[arg(long, default_value = "9999")]
+        parent_chain_id: u64,
+        /// Parent chain JSON-RPC endpoint.
+        #[arg(long)]
+        parent_rpc: String,
+        /// Seconds between sub-chain blocks (PoA slot interval).
+        #[arg(long, default_value = "1")]
+        slot_seconds: u64,
+        /// Every N sub-chain blocks, sign + post one flush anchor tx.
+        #[arg(long, default_value = "5")]
+        flush_interval_blocks: u64,
+        /// Total sub-chain blocks to produce before exiting.
+        #[arg(long, default_value = "20")]
+        duration_blocks: u64,
     },
 }
 
@@ -219,6 +251,44 @@ async fn main() -> Result<(), CliError> {
                 }
                 None if cli.json => println!("null"),
                 None => println!("block not found: {query}"),
+            }
+        }
+        Cmd::Subchain {
+            sub:
+                SubchainCmd::Run {
+                    sub_chain_id,
+                    parent_chain_id,
+                    parent_rpc,
+                    slot_seconds,
+                    flush_interval_blocks,
+                    duration_blocks,
+                },
+        } => {
+            let r = run_subchain(
+                sub_chain_id,
+                parent_chain_id,
+                &parent_rpc,
+                slot_seconds,
+                flush_interval_blocks,
+                duration_blocks,
+            )
+            .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("sub_chain_id:    {}", r.sub_chain_id);
+                println!("parent_chain_id: {}", r.parent_chain_id);
+                println!("sub blocks:      {}", r.sub_blocks_produced);
+                println!("sub head:        {}", r.sub_head_hash);
+                println!("flushes:");
+                for f in &r.flushes {
+                    println!(
+                        "  sub #{:>4}  hash={}…  parent_tx={}",
+                        f.sub_block_number,
+                        &f.sub_block_hash[..14],
+                        &f.parent_tx
+                    );
+                }
             }
         }
         Cmd::Stress {
