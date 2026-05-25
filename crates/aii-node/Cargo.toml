@@ -30,6 +30,8 @@ aii-cli = { workspace = true }
 aii-net-p2p = { workspace = true }
 aii-consensus-iface = { workspace = true }
 aii-consensus-poa = { workspace = true }
+aii-net-txpool = { workspace = true }
+alloy-rlp = { workspace = true }
 hex = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

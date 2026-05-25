@@ -117,6 +117,26 @@ impl TxPool {
         out
     }
 
+    /// Drain up to `n` entries in BTreeMap key order — used by block
+    /// producers to pull a batch without enforcing per-sender nonce
+    /// ordering across sender boundaries. (For v0.0.37 stress testing
+    /// where each signer files monotonically-increasing nonces, this
+    /// is good enough: the BTreeMap order is `(sender, nonce)` so
+    /// within one sender the nonces are sequential.)
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn drain_up_to(&self, n: usize) -> Vec<Tx> {
+        let mut g = self.inner.write();
+        // Collect keys first (need owned copies before mutating the map).
+        let keys: Vec<(Address, u64)> = g.entries.keys().take(n).copied().collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(e) = g.entries.remove(&k) {
+                out.push(e.tx);
+            }
+        }
+        out
+    }
+
     /// Evict lowest-gas-price entries until size ≤ `target`.
     pub fn evict_to(&self, target: usize) {
         let mut g = self.inner.write();

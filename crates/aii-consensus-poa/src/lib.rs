@@ -14,11 +14,17 @@
 
 use std::sync::Arc;
 
+use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
 use aii_types::{Address, H256, U256};
 use parking_lot::Mutex;
 use thiserror::Error;
+
+/// Gas cost charged per included tx in the v0.0.37 placeholder
+/// pipeline (no actual EVM execution — every tx is treated as a
+/// 21,000-gas transfer).
+pub const PLACEHOLDER_TX_GAS: u64 = 21_000;
 
 /// Errors from the PoA engine.
 #[derive(Debug, Error)]
@@ -51,6 +57,7 @@ pub struct PoaConfig {
 pub struct PoaEngine {
     config: PoaConfig,
     state: Arc<Mutex<PoaState>>,
+    pending_txs: Mutex<Vec<Tx>>,
 }
 
 #[allow(clippy::struct_field_names)]
@@ -75,7 +82,14 @@ impl PoaEngine {
         Ok(Self {
             config,
             state: Arc::new(Mutex::new(state)),
+            pending_txs: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Stage transactions to include in the next produced block.
+    /// Overwrites any previously-staged batch.
+    pub fn set_pending_txs(&self, txs: Vec<Tx>) {
+        *self.pending_txs.lock() = txs;
     }
 
     /// Snapshot the chain head.
@@ -108,6 +122,15 @@ impl PoaEngine {
         let mut g = self.state.lock();
         let new_number = g.head_number.checked_add(1).ok_or(PoaError::Overflow)?;
         let new_timestamp = g.head_timestamp + self.config.slot_seconds;
+
+        // Drain pending txs up to the block's gas budget.
+        let max_txs = (self.config.gas_limit / PLACEHOLDER_TX_GAS) as usize;
+        let mut pending = self.pending_txs.lock();
+        let take = pending.len().min(max_txs);
+        let txs: Vec<Tx> = pending.drain(..take).collect();
+        drop(pending);
+        let gas_used = (txs.len() as u64) * PLACEHOLDER_TX_GAS;
+
         let header = Header {
             parent_hash: g.head_hash,
             ommers_hash: EMPTY_LIST_HASH,
@@ -119,7 +142,7 @@ impl PoaEngine {
             difficulty: U256::ZERO,
             number: new_number,
             gas_limit: self.config.gas_limit,
-            gas_used: 0,
+            gas_used,
             timestamp: new_timestamp,
             extra_data: b"aii-poa".to_vec(),
             mix_hash: H256::ZERO,
@@ -132,7 +155,11 @@ impl PoaEngine {
         };
         let block = Block {
             header,
-            body: BlockBody::default(),
+            body: BlockBody {
+                transactions: txs,
+                ommers: Vec::new(),
+                withdrawals: Vec::new(),
+            },
         };
         let hash = block.hash();
         g.head_hash = hash;

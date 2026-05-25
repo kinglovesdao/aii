@@ -9,6 +9,7 @@
 
 use aii_onboarding::{detect, recommend_tier, score, Tier};
 use aii_wallet::{EncryptedKeystore, LocalWallet, MnemonicPhrase, ScryptParams};
+use alloy_rlp::Encodable;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
@@ -93,6 +94,243 @@ pub async fn run_recent_blocks(
     let c = client(rpc)?;
     let r: Vec<aii_rpc::HeaderView> = c.request("aii_recentBlocks", rpc_params![limit]).await?;
     Ok(r)
+}
+
+/// Single-tx submission via `eth_sendRawTransaction`. Returns the
+/// transaction hash returned by the node.
+pub async fn run_send_raw_tx(rpc: &str, raw_hex: &str) -> Result<String, CliError> {
+    let c = client(rpc)?;
+    let h: String = c
+        .request("eth_sendRawTransaction", rpc_params![raw_hex])
+        .await?;
+    Ok(h)
+}
+
+// ──────────────────────── Stress harness (v0.0.37) ──────────────────────────
+
+/// Outcome of one stress run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StressReport {
+    /// How many txs the harness submitted.
+    pub submitted: u64,
+    /// How many submissions were accepted by the node (200 OK).
+    pub accepted: u64,
+    /// How many block headers we sampled at the end.
+    pub blocks_observed: u64,
+    /// `Σ gas_used` across observed blocks, divided by 21 000 — the
+    /// number of (placeholder) txs that actually landed in blocks.
+    pub txs_in_blocks: u64,
+    /// Peak `gas_used / 21 000` across observed blocks.
+    pub peak_txs_per_block: u64,
+    /// Mean txs/block over observed blocks (`txs_in_blocks /
+    /// blocks_observed`, rounded).
+    pub mean_txs_per_block: u64,
+    /// Wall-clock submission throughput (txs / s).
+    pub submit_tx_per_sec: f64,
+    /// Total elapsed seconds.
+    pub elapsed_sec: f64,
+}
+
+/// Run the stress harness against a live AII node.
+///
+/// Generates `total` signed transfers across `senders` independent
+/// signers and submits them via `eth_sendRawTransaction`. Then
+/// sleeps `settle_sec` seconds and samples `sample_blocks` recent
+/// blocks to compute throughput.
+///
+/// `chain_id` must match the target chain's chain id (e.g. 9999 for
+/// the AII testnet) so the EIP-155 v field validates on the node.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_stress(
+    rpc: &str,
+    chain_id: u64,
+    total: u64,
+    senders: u32,
+    parallel: u32,
+    settle_sec: u64,
+    sample_blocks: u64,
+) -> Result<StressReport, CliError> {
+    use aii_block::tx::{Tx, TxLegacy};
+    use aii_crypto::keccak::keccak256;
+    use aii_crypto::secp::{sign, SecretKey};
+    use aii_types::{AlgoId, U256};
+    use alloy_rlp::Encodable as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let senders = senders.max(1);
+    let parallel = parallel.max(1);
+
+    // Generate deterministic-but-fresh signers.
+    let mut sks: Vec<SecretKey> = Vec::with_capacity(senders as usize);
+    for i in 1..=senders {
+        let mut bytes = [0u8; 32];
+        bytes[28..].copy_from_slice(&i.to_be_bytes());
+        sks.push(SecretKey::from_bytes(&bytes).map_err(|e| CliError::Client(e.to_string()))?);
+    }
+    let sks = Arc::new(sks);
+
+    // Build the channel of pre-signed raw hex strings.
+    let (tx_send, mut tx_recv) =
+        tokio::sync::mpsc::channel::<String>(usize::try_from(parallel * 4).unwrap_or(1024));
+    let sks_for_signer = sks.clone();
+    let signer_handle = tokio::task::spawn_blocking(move || -> Result<(), CliError> {
+        for i in 0..total {
+            let sender_idx = (i as usize) % sks_for_signer.len();
+            let nonce = i / u64::from(senders);
+            let sk = &sks_for_signer[sender_idx];
+            // Self-transfer of 0 wei — minimum payload.
+            let mut tx = TxLegacy {
+                nonce,
+                gas_price: U256::from(1_000_000_000u64),
+                gas_limit: 21_000,
+                to: Some(sk.public_key().address()),
+                value: U256::from(0u64),
+                data: vec![],
+                v: 0,
+                r: aii_types::H256::ZERO,
+                s: aii_types::H256::ZERO,
+                algo_id: AlgoId::Secp256k1,
+            };
+            // EIP-155 signing hash.
+            let mut buf = alloy_rlp::bytes::BytesMut::new();
+            let zero = U256::ZERO;
+            let payload_length = tx.nonce.length()
+                + u256_len(&tx.gas_price)
+                + tx.gas_limit.length()
+                + 21 // 20-byte address envelope
+                + u256_len(&tx.value)
+                + tx.data.as_slice().length()
+                + chain_id.length()
+                + u256_len(&zero) * 2;
+            alloy_rlp::Header {
+                list: true,
+                payload_length,
+            }
+            .encode(&mut buf);
+            tx.nonce.encode(&mut buf);
+            encode_u256_local(&tx.gas_price, &mut buf);
+            tx.gas_limit.encode(&mut buf);
+            // to: Some(addr) — encoded as 20-byte string
+            tx.to.as_ref().expect("self-transfer").encode(&mut buf);
+            encode_u256_local(&tx.value, &mut buf);
+            tx.data.as_slice().encode(&mut buf);
+            chain_id.encode(&mut buf);
+            encode_u256_local(&zero, &mut buf);
+            encode_u256_local(&zero, &mut buf);
+            let hash = aii_types::H256::new(keccak256(&buf).0);
+            let sig = sign(sk, &hash).map_err(|e| CliError::Client(e.to_string()))?;
+            let raw = sig.to_bytes();
+            tx.r = aii_types::H256::new(raw[..32].try_into().unwrap());
+            tx.s = aii_types::H256::new(raw[32..64].try_into().unwrap());
+            tx.v = chain_id * 2 + 35 + u64::from(raw[64]);
+            // Encode the full signed legacy tx.
+            let mut out = alloy_rlp::bytes::BytesMut::new();
+            Tx::Legacy(tx).encode(&mut out);
+            let hex_str = format!("0x{}", hex::encode(out));
+            if tx_send.blocking_send(hex_str).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    let accepted = Arc::new(AtomicU64::new(0));
+    let submitted = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
+    let rpc = rpc.to_string();
+    // Single-receiver fan-out: collect everything into a Vec, then chunk.
+    let mut all: Vec<String> = Vec::new();
+    while let Some(s) = tx_recv.recv().await {
+        all.push(s);
+    }
+    let signer_result = signer_handle
+        .await
+        .map_err(|e| CliError::Client(format!("signer join: {e}")))?;
+    signer_result?;
+
+    // Chunk all txs across `parallel` workers.
+    let chunk = (all.len() + (parallel as usize) - 1) / (parallel as usize).max(1);
+    let mut worker_handles = Vec::new();
+    for slice in all.chunks(chunk) {
+        let url = rpc.clone();
+        let acc = accepted.clone();
+        let sub = submitted.clone();
+        let payload: Vec<String> = slice.to_vec();
+        worker_handles.push(tokio::spawn(async move {
+            let Ok(c) = client(&url) else {
+                return;
+            };
+            for raw in payload {
+                sub.fetch_add(1, Ordering::Relaxed);
+                if c.request::<String, _>("eth_sendRawTransaction", rpc_params![&raw])
+                    .await
+                    .is_ok()
+                {
+                    acc.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for h in worker_handles {
+        let _ = h.await;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    tokio::time::sleep(std::time::Duration::from_secs(settle_sec)).await;
+
+    // Sample blocks.
+    let recent = run_recent_blocks(&rpc, sample_blocks).await?;
+    let mut tx_total: u64 = 0;
+    let mut peak: u64 = 0;
+    for h in &recent {
+        let gas_used = parse_hex_u64(&h.gas_used).unwrap_or(0);
+        let n = gas_used / 21_000;
+        tx_total += n;
+        peak = peak.max(n);
+    }
+    let blocks = recent.len() as u64;
+    let mean = if blocks > 0 { tx_total / blocks } else { 0 };
+    let submitted_n = submitted.load(Ordering::Relaxed);
+    let accepted_n = accepted.load(Ordering::Relaxed);
+    let throughput = if elapsed > 0.0 {
+        submitted_n as f64 / elapsed
+    } else {
+        0.0
+    };
+    Ok(StressReport {
+        submitted: submitted_n,
+        accepted: accepted_n,
+        blocks_observed: blocks,
+        txs_in_blocks: tx_total,
+        peak_txs_per_block: peak,
+        mean_txs_per_block: mean,
+        submit_tx_per_sec: throughput,
+        elapsed_sec: elapsed,
+    })
+}
+
+// Local helpers to avoid pulling in private items from aii-block.
+fn u256_len(v: &aii_types::U256) -> usize {
+    // U256 RLP length: number of significant big-endian bytes, with
+    // 0 encoded as the empty string (1 byte: 0x80) and any single
+    // byte < 0x80 also encoded as one literal byte.
+    let be = v.to_be_bytes::<32>();
+    let leading = be.iter().take_while(|b| **b == 0).count();
+    let n = 32 - leading;
+    if n <= 1 && (n == 0 || be[31] < 0x80) {
+        1
+    } else {
+        alloy_rlp::length_of_length(n) + n
+    }
+}
+
+fn encode_u256_local(v: &aii_types::U256, out: &mut alloy_rlp::bytes::BytesMut) {
+    let be = v.to_be_bytes::<32>();
+    let leading = be.iter().take_while(|b| **b == 0).count();
+    let bytes = &be[leading..];
+    bytes.encode(out);
 }
 
 /// Run `aii account new`. Generates a fresh secp256k1 wallet from OS RNG
