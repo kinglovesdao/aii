@@ -1,22 +1,21 @@
 [package]
-name = "aii-consensus-iface"
+name = "aii-consensus-poa"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Consensus-engine traits for AII (Engine + Proposer + Voter)."
+description = "Proof-of-Authority consensus engine for AII sub-chains (round-robin signers, no voting)."
 readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
-aii-types = { workspace = true }
 aii-block = { workspace = true }
-serde = { workspace = true }
+aii-consensus-iface = { workspace = true }
+aii-crypto = { workspace = true }
+aii-types = { workspace = true }
+parking_lot = "0.12"
 thiserror = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
