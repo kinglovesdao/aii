@@ -15,7 +15,59 @@
 
 use aii_block::{Block, Header};
 use aii_types::{Address, H256};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Tag identifying which consensus algorithm a chain (main or sub) runs.
+///
+/// Used by:
+/// - `aii_microchain::MicroChainSpec::consensus` to mark a sub-chain's
+///   algorithm in genesis;
+/// - The `aiid` `--consensus` CLI flag;
+/// - Factory code that instantiates the right `Engine` impl.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsensusKind {
+    /// VRF-PoS BFT (the AII main chain): two-phase prevote/precommit +
+    /// ⅔ BLS aggregation. Implementation in `aii-consensus-bft`.
+    Bft,
+    /// Proof-of-Authority: fixed authority list, round-robin signing.
+    /// Implementation in `aii-consensus-poa`.
+    Poa,
+}
+
+impl ConsensusKind {
+    /// Stable on-disk / on-wire string. Used in CLI args and genesis JSON.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bft => "bft",
+            Self::Poa => "poa",
+        }
+    }
+
+    /// Parse from a CLI / JSON identifier. Case-insensitive on the
+    /// accepted spellings.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(s.to_owned())` if the string doesn't match a
+    /// known kind — callers typically wrap this in their CLI error
+    /// type.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "bft" | "bft-pos" => Ok(Self::Bft),
+            "poa" | "proof-of-authority" => Ok(Self::Poa),
+            other => Err(other.to_string()),
+        }
+    }
+}
+
+impl core::fmt::Display for ConsensusKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Top-level consensus engine.
 pub trait Engine: Send + Sync {
@@ -123,6 +175,28 @@ mod tests {
         fn coinbase(&self) -> Option<Address> {
             None
         }
+    }
+
+    #[test]
+    fn consensus_kind_round_trips_via_str() {
+        assert_eq!(ConsensusKind::Bft.as_str(), "bft");
+        assert_eq!(ConsensusKind::Poa.as_str(), "poa");
+        assert_eq!(ConsensusKind::parse("bft").unwrap(), ConsensusKind::Bft);
+        assert_eq!(ConsensusKind::parse("BFT").unwrap(), ConsensusKind::Bft);
+        assert_eq!(ConsensusKind::parse("poa").unwrap(), ConsensusKind::Poa);
+        assert_eq!(
+            ConsensusKind::parse("proof-of-authority").unwrap(),
+            ConsensusKind::Poa,
+        );
+        assert!(ConsensusKind::parse("nonsense").is_err());
+    }
+
+    #[test]
+    fn consensus_kind_serialises_as_lowercase_json() {
+        let json = serde_json::to_string(&ConsensusKind::Poa).unwrap();
+        assert_eq!(json, "\"poa\"");
+        let back: ConsensusKind = serde_json::from_str("\"bft\"").unwrap();
+        assert_eq!(back, ConsensusKind::Bft);
     }
 
     #[test]

@@ -5,6 +5,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.35] — 2026-05-25
+
+### Added — Pluggable consensus (PoA alongside BFT-PoS)
+
+**Sub-chains can now choose their consensus algorithm.** v0.0.34
+proved the main chain (BFT-PoS) works across nodes. v0.0.35 introduces
+a second consensus impl — Proof-of-Authority — and the trait surface
+that lets a sub-chain genesis pick which one to run.
+
+#### New crate: `aii-consensus-poa`
+
+- `PoaConfig { authorities, coinbase, slot_seconds, gas_limit,
+  base_fee_per_gas }` — fixed authority list, no voting.
+- `PoaEngine` implements `aii_consensus_iface::Engine`. Per
+  `step()`: if `authorities[(head_number + 1) % authorities.len()]`
+  equals our `coinbase`, produce a block; otherwise return
+  `EngineProgress::Idle`.
+- `PoaError::{EmptyAuthorities, Overflow}`.
+- 8 RED→GREEN tests covering: empty-set rejection, single-authority
+  continuous production, non-authority idleness, two-authority
+  round-robin, parent-hash chain, `init` reset, coinbase pass-through.
+
+#### `aii-consensus-iface`
+
+- New `ConsensusKind` enum (`Bft | Poa`) with `as_str` +
+  case-insensitive `parse`, lowercase serde encoding. Accepts the
+  legacy spelling `proof-of-authority`.
+
+#### `aii-microchain`
+
+- `MicroChainSpec.consensus: ConsensusKind` field with `serde(default
+  = ConsensusKind::Bft)` so pre-v0.0.35 sub-chain genesis JSON
+  continues to parse.
+- Two new tests: PoA spec round-trips through JSON; a legacy spec
+  without the consensus field defaults to BFT.
+
+#### `aii-node` / `aiid`
+
+- Two new CLI flags:
+  - `--consensus bft|poa` (default `bft`).
+  - `--authorities ADDR1,ADDR2,…` — required when `--consensus poa`.
+- New PoA branch in `main()` builds a `PoaEngine` and loops
+  `is_my_turn` / `produce_block` at `--slot-seconds`. `--coinbase`
+  defaults to `authorities[0]` if omitted.
+
+#### Tests + verification
+
+- Workspace: **640 / 640 tests pass** (was 628), clippy clean under
+  `-D warnings`.
+- Live: `aiid --consensus poa --authorities 0xaaaa…aaaa --coinbase
+  0xaaaa…aaaa --slot-seconds 1` produced PoA blocks #1–#5 at 1 s
+  intervals; `eth_blockNumber` returned `0x5` after 5 s.
+
+#### Scope discipline
+
+- **In scope**: PoA engine, ConsensusKind, microchain field, aiid
+  `--consensus`/`--authorities` flags.
+- **Not in this release**: PoA signer signatures (today
+  `header.beneficiary == authorities[H % N]` is the only check);
+  PoA validator-set rotation (authority list is fixed at genesis);
+  Tendermint / DPoS engines; per-sub-chain Engine spawning (the
+  microchain registry carries the kind, but spawning multiple
+  engines lives in v0.0.36+).
+
 ## [0.0.34] — 2026-05-25
 
 ### Added — Multi-node BFT consensus over TCP gossip

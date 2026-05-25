@@ -15,10 +15,15 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use aii_consensus_iface::ConsensusKind;
 use aii_types::H256;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
+
+const fn default_consensus_kind() -> ConsensusKind {
+    ConsensusKind::Bft
+}
 
 /// Sub-chain identifier (32-bit, reserved 0 for main chain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -39,6 +44,11 @@ pub struct MicroChainSpec {
     /// Every N sub-chain blocks, the sub-chain proposer flushes a checkpoint
     /// to the main chain.
     pub flush_interval_blocks: u64,
+    /// Which consensus algorithm this sub-chain runs. Old specs that
+    /// did not carry this field deserialise as
+    /// [`ConsensusKind::Bft`] for backward compatibility.
+    #[serde(default = "default_consensus_kind")]
+    pub consensus: ConsensusKind,
 }
 
 /// Per-sub-chain "last flushed" marker.
@@ -149,6 +159,7 @@ mod tests {
             id: MicroChainId(id),
             name: format!("sub-{id}"),
             flush_interval_blocks: 100,
+            consensus: ConsensusKind::Bft,
         }
     }
 
@@ -179,6 +190,7 @@ mod tests {
             id: MicroChainId::MAIN,
             name: "x".to_string(),
             flush_interval_blocks: 1,
+            consensus: ConsensusKind::Bft,
         };
         assert_eq!(r.register(s), Err(MicroChainError::ReservedId));
     }
@@ -216,6 +228,29 @@ mod tests {
             r.record_flush(MicroChainId(99), anchor),
             Err(MicroChainError::Unknown)
         );
+    }
+
+    #[test]
+    fn spec_with_poa_consensus_round_trips_via_json() {
+        let s = MicroChainSpec {
+            id: MicroChainId(7),
+            name: "sub-poa".to_string(),
+            flush_interval_blocks: 50,
+            consensus: ConsensusKind::Poa,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"consensus\":\"poa\""));
+        let back: MicroChainSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.consensus, ConsensusKind::Poa);
+    }
+
+    #[test]
+    fn legacy_spec_without_consensus_field_defaults_to_bft() {
+        // Pre-v0.0.35 sub-chain genesis JSON did not have a "consensus"
+        // field. Make sure those still parse and pick up Bft.
+        let json = r#"{"id":1,"name":"sub-legacy","flush_interval_blocks":100}"#;
+        let parsed: MicroChainSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.consensus, ConsensusKind::Bft);
     }
 
     #[test]

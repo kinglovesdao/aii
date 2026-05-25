@@ -3,6 +3,8 @@
 use aii_block::{Block, BlockBody, Bloom, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_config::ChainSpec;
 use aii_consensus_bft::{BftGossip, DevModeEngine, EngineConfig};
+use aii_consensus_iface::ConsensusKind;
+use aii_consensus_poa::{PoaConfig, PoaEngine};
 use aii_node::bft_p2p::TcpBftTransport;
 use aii_node::{bft_bootstrap, NodeState};
 use aii_storage::RocksDbBackend;
@@ -76,6 +78,19 @@ struct Cli {
     /// failure. Example: `--peers 10.0.0.2:30311,10.0.0.3:30311`.
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
+
+    /// Consensus algorithm to run for the main chain. `bft` (default)
+    /// uses VRF-PoS + BLS finality; `poa` uses a fixed authority list
+    /// in round-robin order. `--consensus poa` requires
+    /// `--authorities`.
+    #[arg(long, default_value = "bft")]
+    consensus: String,
+
+    /// Comma-separated PoA authority addresses (hex, with or without
+    /// `0x`). Order matters: `authorities[height % N]` is the slot
+    /// proposer for height N. Required when `--consensus poa`.
+    #[arg(long, value_delimiter = ',')]
+    authorities: Vec<String>,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -134,6 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         ChainSpec::mainnet()
     };
+    let consensus_kind = ConsensusKind::parse(&cli.consensus).map_err(
+        |s| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("--consensus: unknown algorithm '{s}' (expected: bft, poa)").into()
+        },
+    )?;
 
     tracing::info!(
         data_dir = ?cli.data_dir,
@@ -226,6 +246,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }))
             }
+        } else if consensus_kind == ConsensusKind::Poa {
+            // Proof-of-Authority main chain.
+            if cli.authorities.is_empty() {
+                return Err::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    "--consensus poa requires --authorities ADDR1,ADDR2,…".into(),
+                );
+            }
+            let authorities: Vec<Address> = cli
+                .authorities
+                .iter()
+                .map(|s| parse_address(s))
+                .collect::<Result<Vec<_>, _>>()?;
+            let coinbase = cli
+                .coinbase
+                .as_deref()
+                .map(parse_address)
+                .transpose()?
+                .unwrap_or_else(|| authorities[0]);
+            let poa_cfg = PoaConfig {
+                authorities: authorities.clone(),
+                coinbase,
+                slot_seconds: cli.slot_seconds,
+                gas_limit: spec.initial_gas_limit,
+                base_fee_per_gas: U256::from(spec.min_base_fee_per_gas),
+            };
+            let genesis = genesis_block(&spec);
+            let engine = PoaEngine::new(poa_cfg, &genesis)?;
+            tracing::info!(
+                authorities = authorities.len(),
+                coinbase = ?coinbase,
+                "PoA engine ready"
+            );
+            let state_for_loop = node_state.clone();
+            let interval = Duration::from_secs(cli.slot_seconds);
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if engine.is_my_turn() {
+                        match engine.produce_block() {
+                            Ok((hash, number, _block)) => {
+                                state_for_loop.set_head(number);
+                                tracing::info!(number, ?hash, "PoA block produced");
+                            }
+                            Err(e) => {
+                                tracing::error!(?e, "PoA produce failed");
+                                break;
+                            }
+                        }
+                    } else {
+                        tracing::trace!(
+                            next_slot = engine.next_authority_index(),
+                            "not my PoA slot — idle"
+                        );
+                    }
+                }
+            }))
         } else if cli.produce_blocks {
             // Legacy dev-mode producer.
             let genesis = genesis_block(&spec);

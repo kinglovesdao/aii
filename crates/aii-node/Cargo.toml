@@ -28,6 +28,8 @@ aii-consensus-bft = { workspace = true }
 aii-crypto = { workspace = true }
 aii-cli = { workspace = true }
 aii-net-p2p = { workspace = true }
+aii-consensus-iface = { workspace = true }
+aii-consensus-poa = { workspace = true }
 hex = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
