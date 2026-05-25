@@ -5,6 +5,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.31] — 2026-05-25
+
+### Added — genesis-driven BFT bootstrap
+
+Production deployment now has a path: a single JSON `Genesis` file
+declares the full validator set and the chain's initial seed, and
+`BftConfig::from_genesis` derives the in-memory engine config (modulo
+this node's secret keys + coinbase). The node operator's job becomes
+"share the genesis file, load your keys, start the engine."
+
+#### aii-types
+
+- New `VrfPubKey` wire type (32-byte compressed schnorrkel pubkey)
+  alongside `BlsPubKey`. Serde representation is lowercase hex with
+  `0x` prefix — same convention as `Address`, so genesis JSON stays
+  human-readable.
+- `BlsPubKey` / `BlsSignature` gain custom serde for the same
+  `0x`-prefixed hex format (previously derived only by structural
+  fields; now produces stable JSON).
+
+#### aii-config
+
+- `Genesis` gains:
+  - `validators: Vec<GenesisValidator>` — `(bls_pubkey, vrf_pubkey,
+    stake)` triples. `#[serde(default)]` so older empty-validator
+    genesis files still parse.
+  - `initial_seed: [u8; 32]` — VRF seed used at height 1 round 0; later
+    rounds derive seed from the previous leader's VRF output.
+- New `GenesisValidator { bls_pubkey, vrf_pubkey, stake }` struct,
+  re-exported from the crate root.
+
+#### aii-consensus-bft
+
+- New `BftConfig::from_genesis(&genesis, my_index, my_bls_sk,
+  my_vrf_sk, coinbase)` constructor. Validates the validator set,
+  decompresses every pubkey via `aii-crypto`, checks `my_index`
+  bounds, and lifts chain-spec parameters into the engine config.
+- New `BftError::InvalidValidatorPubkey { index, kind }` for genesis
+  entries whose BLS or VRF pubkey doesn't decode.
+- 7 new tests, including:
+  - empty-validator genesis rejected (`EmptyValidatorSet`)
+  - invalid BLS pubkey at index 0 surfaces the correct error
+  - out-of-bounds `my_index` rejected
+  - chain-spec params (gas limit, base fee, slot time) and initial seed
+    flow through to the engine config
+  - single-validator engine built from genesis advances one height
+    with a verifying certificate
+  - three-validator engines all built from the same genesis JSON reach
+    consensus on the same block hash
+  - genesis with validators round-trips through JSON
+  - `BftConfig::from_genesis` works on a `Genesis` loaded back from
+    its own JSON
+
+### Why this matters
+
+Commercial deployment requires a reproducible bootstrap: a chain spec
+plus a validator-set declaration that every node can verify. Until
+v0.0.31 the BFT engine was constructed from raw runtime keys with no
+chain-level provenance. With this release, a chain operator can ship
+a single signed JSON file and every validator node can derive its
+runtime config from it.
+
+### Scope discipline
+
+Not in this release: validator key management CLI (`aii validator
+keygen`, `aii validator pubkey`), node startup wiring (replacing
+`DevModeEngine` with `BftEngine` in `aiid`), genesis distribution
+tooling. These land in v0.0.32+.
+
 ## [0.0.30] — 2026-05-25
 
 ### Added — multi-validator BFT consensus end-to-end

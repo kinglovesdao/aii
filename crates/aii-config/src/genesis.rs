@@ -3,8 +3,24 @@
 use crate::chain_spec::ChainSpec;
 use aii_block::{Bloom, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_state::{Account, EMPTY_CODE_HASH};
-use aii_types::{Address, H256, U256};
+use aii_types::{Address, BlsPubKey, VrfPubKey, H256, U256};
 use serde::{Deserialize, Serialize};
+
+/// One BFT validator entry in the [`Genesis`].
+///
+/// The wire-level pubkey types ([`BlsPubKey`] / [`VrfPubKey`]) carry
+/// the raw compressed bytes — `aii-consensus-bft` deserialises them
+/// into runtime keys when building [`crate::Genesis::to_bft_config`]'s
+/// equivalent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisValidator {
+    /// Compressed BLS12-381 G1 public key (48 bytes, hex-encoded in JSON).
+    pub bls_pubkey: BlsPubKey,
+    /// Compressed VRF public key (32 bytes, hex-encoded in JSON).
+    pub vrf_pubkey: VrfPubKey,
+    /// Initial stake (uint, no decimals).
+    pub stake: u64,
+}
 
 /// A single pre-allocation entry — pairs an address with its starting balance
 /// and (optional) code hash.
@@ -44,6 +60,17 @@ pub struct Genesis {
     /// Initial state allocation (each entry carries its own recipient address).
     #[serde(default)]
     pub alloc: Vec<GenesisAlloc>,
+    /// Initial BFT validator set. Empty allowed for legacy / dev-mode chains;
+    /// production deployments populate this so `aii-consensus-bft::BftConfig`
+    /// can be derived directly from the genesis file.
+    #[serde(default)]
+    pub validators: Vec<GenesisValidator>,
+    /// 32-byte seed used for leader selection at height 1 round 0. Subsequent
+    /// rounds derive their seed from the previous leader's VRF output. For
+    /// deterministic dev chains this can be all-zero; production chains should
+    /// fold in chain-genesis randomness (e.g. a hash of validator metadata).
+    #[serde(default)]
+    pub initial_seed: [u8; 32],
 }
 
 impl Genesis {
@@ -90,6 +117,8 @@ mod tests {
             timestamp: 1_700_000_000,
             extra_data: b"aii-genesis".to_vec(),
             alloc: Vec::new(),
+            validators: Vec::new(),
+            initial_seed: [0u8; 32],
         }
     }
 

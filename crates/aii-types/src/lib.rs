@@ -27,6 +27,7 @@ mod error;
 mod hash;
 mod integer;
 mod signed_tx;
+mod vrf;
 
 pub use address::Address;
 pub use algo::AlgoId;
@@ -35,3 +36,4 @@ pub use error::TypesError;
 pub use hash::H256;
 pub use integer::U256;
 pub use signed_tx::SignedTx;
+pub use vrf::VrfPubKey;

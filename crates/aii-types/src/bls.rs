@@ -3,6 +3,12 @@
 //! AII uses BLS on G1 (compressed, 48 bytes) for public keys and on G2
 //! (compressed, 96 bytes) for signatures, matching the Ethereum 2.0 spec
 //! conventions. Concrete verification lives in `aii-crypto` (later plan).
+//!
+//! Serde representation is **lowercase hex with `0x` prefix** for both
+//! types — matches the Ethereum / Beacon-Chain convention and keeps
+//! genesis JSON human-readable.
+
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Compressed BLS12-381 G1 public key (48 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +51,44 @@ impl BlsSignature {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 96] {
         &self.0
+    }
+}
+
+// ───────────── serde: lowercase hex with `0x` prefix ─────────────
+
+impl Serialize for BlsPubKey {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&format!("0x{}", hex::encode(self.0)))
+    }
+}
+
+impl<'de> Deserialize<'de> for BlsPubKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <&str>::deserialize(d)?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let raw = hex::decode(s).map_err(de::Error::custom)?;
+        let arr: [u8; 48] = raw.try_into().map_err(|v: Vec<u8>| {
+            de::Error::custom(format!("BlsPubKey: 48 bytes, got {}", v.len()))
+        })?;
+        Ok(Self(arr))
+    }
+}
+
+impl Serialize for BlsSignature {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&format!("0x{}", hex::encode(self.0)))
+    }
+}
+
+impl<'de> Deserialize<'de> for BlsSignature {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <&str>::deserialize(d)?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let raw = hex::decode(s).map_err(de::Error::custom)?;
+        let arr: [u8; 96] = raw.try_into().map_err(|v: Vec<u8>| {
+            de::Error::custom(format!("BlsSignature: 96 bytes, got {}", v.len()))
+        })?;
+        Ok(Self(arr))
     }
 }
 
