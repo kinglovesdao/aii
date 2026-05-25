@@ -244,13 +244,13 @@ impl BftEngine {
 
     /// `&self` harvest: if the coordinator is in `Committed`, commit
     /// the captured block, advance the head, roll the seed, and clear
-    /// the coordinator. Returns `Some(new_head_number)` on harvest,
-    /// `None` if there is nothing to commit yet.
+    /// the coordinator. Returns `Some(block)` on harvest with the
+    /// committed full block, `None` if there is nothing to commit yet.
     ///
     /// Useful for gossip / network drivers that hold the engine in an
     /// `Arc<BftEngine>` and cannot call the `&mut`-flavoured
     /// [`aii_consensus_iface::Engine::step`].
-    pub fn try_harvest_committed(&self) -> Option<u64> {
+    pub fn try_harvest_committed(&self) -> Option<Block> {
         let mut g = self.state.lock();
         let committed = g
             .coordinator
@@ -267,7 +267,7 @@ impl BftEngine {
         g.seed = proof.vrf_output;
         g.coordinator = None;
         g.proposal = None;
-        Some(block.header.number)
+        Some(block)
     }
 
     /// Build a proposal for the current round and feed it to our own

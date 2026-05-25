@@ -13,7 +13,8 @@
 
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
-    run_account_verify, run_chain_id, run_status, run_tier,
+    run_account_verify, run_chain_id, run_get_block_header, run_recent_blocks, run_status,
+    run_tier,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -192,6 +193,27 @@ impl Server {
                     "description": "Probe local hardware and return the recommended AII node Tier (T1–T7).",
                     "inputSchema": { "type": "object", "properties": {} },
                 },
+                {
+                    "name": "block_lookup",
+                    "description": "Fetch a single block header by number or 32-byte hash.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Decimal block number, 0x-prefixed block number, or 0x-prefixed 32-byte block hash." }
+                        },
+                        "required": ["query"]
+                    },
+                },
+                {
+                    "name": "recent_blocks",
+                    "description": "Return the N most-recently finalised block headers, newest first.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": { "type": "integer", "description": "Max headers (server-capped at 100). Defaults to 10.", "minimum": 1, "maximum": 100 }
+                        }
+                    },
+                },
             ],
         })
     }
@@ -247,6 +269,23 @@ impl Server {
             "tier_recommend" => {
                 let t = run_tier();
                 Ok(tool_text(format!("score {} → {:?}", t.score, t.tier)))
+            }
+            "block_lookup" => {
+                let query = string_arg(&args, "query")?;
+                let r = run_get_block_header(&self.rpc_url, &query)
+                    .await
+                    .map_err(|e| rpc_err(&e))?;
+                match r {
+                    Some(v) => Ok(tool_text(serde_json::to_string_pretty(&v).unwrap())),
+                    None => Ok(tool_text(format!("block not found: {query}"))),
+                }
+            }
+            "recent_blocks" => {
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10);
+                let headers = run_recent_blocks(&self.rpc_url, limit)
+                    .await
+                    .map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(serde_json::to_string_pretty(&headers).unwrap()))
             }
             other => Err(RpcErrorObject {
                 code: -32602,
@@ -314,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_eight_tools() {
+    async fn tools_list_includes_ten_tools() {
         let s = Server::new("http://127.0.0.1:0");
         let req = Request {
             jsonrpc: "2.0".into(),
@@ -325,8 +364,7 @@ mod tests {
         let resp = s.handle(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
-        // Spot-check the new ones.
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         for expected in [
             "chain_status",
@@ -337,6 +375,8 @@ mod tests {
             "mnemonic_new",
             "account_from_mnemonic",
             "tier_recommend",
+            "block_lookup",
+            "recent_blocks",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }

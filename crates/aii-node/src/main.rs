@@ -208,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         tokio::time::sleep(interval).await;
                         match engine_for_loop.advance_single() {
                             Ok(out) => {
+                                state_for_loop.commit_block(&out.block);
                                 state_for_loop.set_head(out.block.header.number);
                                 tracing::info!(
                                     number = out.block.header.number,
@@ -238,7 +239,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some(tokio::spawn(async move {
                     loop {
                         gossip.tick();
-                        if let Some(n) = engine_for_loop.try_harvest_committed() {
+                        if let Some(block) = engine_for_loop.try_harvest_committed() {
+                            let n = block.header.number;
+                            state_for_loop.commit_block(&block);
                             state_for_loop.set_head(n);
                             tracing::info!(number = n, "BFT block finalised (multi)");
                         }
@@ -285,7 +288,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     tokio::time::sleep(interval).await;
                     if engine.is_my_turn() {
                         match engine.produce_block() {
-                            Ok((hash, number, _block)) => {
+                            Ok((hash, number, block)) => {
+                                state_for_loop.commit_block(&block);
                                 state_for_loop.set_head(number);
                                 tracing::info!(number, ?hash, "PoA block produced");
                             }

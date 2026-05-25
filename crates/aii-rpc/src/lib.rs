@@ -35,6 +35,38 @@ pub struct AccountView {
     pub code_hash: String,
 }
 
+/// JSON-shaped block header (subset suitable for explorers).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeaderView {
+    /// `0x…` hex of the block hash.
+    pub hash: String,
+    /// `0x…` hex of the parent hash.
+    pub parent_hash: String,
+    /// `0x…` hex of the block number (Ethereum convention).
+    pub number: String,
+    /// `0x…` hex of the slot timestamp (unix seconds).
+    pub timestamp: String,
+    /// `0x…` hex address of the block proposer / coinbase.
+    pub beneficiary: String,
+    /// `0x…` hex of the gas limit.
+    pub gas_limit: String,
+    /// `0x…` hex of the gas used.
+    pub gas_used: String,
+    /// `0x…` hex of the EIP-1559 base fee per gas.
+    pub base_fee_per_gas: String,
+    /// `0x…` hex of the state root.
+    pub state_root: String,
+    /// `0x…` hex of the transactions root.
+    pub transactions_root: String,
+    /// `0x…` hex of the receipts root.
+    pub receipts_root: String,
+    /// `0x…` hex of the mix hash (BFT: VRF output; PoA: zero).
+    pub mix_hash: String,
+    /// UTF-8 best-effort decoding of `header.extra_data`. The raw bytes
+    /// stay available via their `0x…` hex in `extra_data_hex`.
+    pub extra_data_hex: String,
+}
+
 /// Read-only state the RPC server consumes.
 #[async_trait]
 pub trait RpcState: Send + Sync + 'static {
@@ -52,6 +84,24 @@ pub trait RpcState: Send + Sync + 'static {
 
     /// Return the account view for `addr`, or `None` if no record exists.
     async fn account(&self, addr: &Address) -> Option<AccountView>;
+
+    /// Header by block number, or `None` if the chain has not produced
+    /// `n` yet. Default returns `None`; node impls override.
+    async fn header_by_number(&self, _n: u64) -> Option<HeaderView> {
+        None
+    }
+
+    /// Header by block hash (`0x…` 32-byte hex), or `None` if unknown.
+    /// Default returns `None`; node impls override.
+    async fn header_by_hash(&self, _hash: &str) -> Option<HeaderView> {
+        None
+    }
+
+    /// The N most-recently-finalised headers, newest first. Default
+    /// returns empty; node impls override.
+    async fn recent_headers(&self, _limit: usize) -> Vec<HeaderView> {
+        Vec::new()
+    }
 }
 
 /// `aii_status` response body.
@@ -95,6 +145,17 @@ pub trait AiiRpc {
     /// Returns `null` if no account exists at that address.
     #[method(name = "getAccount")]
     async fn get_account(&self, address: String) -> RpcResult<Option<AccountView>>;
+
+    /// `aii_getBlockHeader(numberOrHash)` — accepts either a decimal /
+    /// `0x…` hex block number, or a 32-byte `0x…` hex block hash.
+    /// Returns `null` if the block is unknown.
+    #[method(name = "getBlockHeader")]
+    async fn get_block_header(&self, query: String) -> RpcResult<Option<HeaderView>>;
+
+    /// `aii_recentBlocks(limit)` — N most recent block headers, newest
+    /// first. `limit` is capped at 100.
+    #[method(name = "recentBlocks")]
+    async fn recent_blocks(&self, limit: u64) -> RpcResult<Vec<HeaderView>>;
 }
 
 struct EthRpcImpl<S: RpcState> {
@@ -144,6 +205,32 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
     async fn get_account(&self, address: String) -> RpcResult<Option<AccountView>> {
         let addr = parse_address(&address)?;
         Ok(self.state.account(&addr).await)
+    }
+
+    async fn get_block_header(&self, query: String) -> RpcResult<Option<HeaderView>> {
+        // Block hash is 0x + 64 hex chars; everything else parses as a number.
+        let trimmed = query.strip_prefix("0x").unwrap_or(&query);
+        if trimmed.len() == 64 {
+            return Ok(self.state.header_by_hash(&format!("0x{trimmed}")).await);
+        }
+        let n = if let Some(rest) = query.strip_prefix("0x") {
+            u64::from_str_radix(rest, 16)
+        } else {
+            query.parse::<u64>()
+        }
+        .map_err(|e| {
+            jsonrpsee::types::ErrorObjectOwned::owned(
+                -32602,
+                format!("getBlockHeader: '{query}' is neither a number nor a 32-byte hash: {e}"),
+                None::<()>,
+            )
+        })?;
+        Ok(self.state.header_by_number(n).await)
+    }
+
+    async fn recent_blocks(&self, limit: u64) -> RpcResult<Vec<HeaderView>> {
+        let capped = usize::try_from(limit.min(100)).unwrap_or(100);
+        Ok(self.state.recent_headers(capped).await)
     }
 }
 

@@ -5,6 +5,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.36] — 2026-05-25
+
+### Added — Block explorer API + MCP integration
+
+**The browser + CLI + Claude (MCP) can all read the chain now.**
+v0.0.34 made nodes talk to each other; v0.0.35 made sub-chains
+pluggable; v0.0.36 makes the data legible. Every finalised block is
+indexed and reachable via three surfaces: JSON-RPC, the `aii` CLI,
+and the MCP server.
+
+#### `aii-rpc`
+
+- New `HeaderView` JSON shape: hash, parent, number, timestamp,
+  beneficiary, gas limit/used, base fee, three roots, mix hash,
+  extra data (hex). All numbers `0x…` (Ethereum convention).
+- New `RpcState` methods with default `None`/empty impls so other
+  consumers keep building:
+  - `header_by_number(n)`
+  - `header_by_hash(hex)`
+  - `recent_headers(limit)`
+- New JSON-RPC methods on the `aii_` namespace:
+  - `aii_getBlockHeader(numberOrHash)` — accepts decimal or `0x…`
+    hex block number, or 32-byte `0x…` block hash. `null` on miss.
+  - `aii_recentBlocks(limit)` — newest first, server-capped at 100.
+
+#### `aii-node`
+
+- `NodeState` gains an in-memory `BlockStore` (header by hash +
+  number→hash index + insertion-order vector) and a
+  `commit_block(&Block)` method.
+- The BFT (single + multi-validator) and PoA producer loops in
+  `main.rs` now commit every finalised block. Multi-validator BFT
+  `try_harvest_committed()` now returns `Option<Block>` (was
+  `Option<u64>`) so the host can index the body too.
+- 7 RED→GREEN tests covering commit + lookup by number / hash,
+  unknown-block returns None, recent-headers newest-first + cap,
+  and full RPC round-trip for both new methods.
+
+#### `aii-cli`
+
+- Two new subcommands:
+  - `aii block <numberOrHash>` — pretty-print (or `--json`) a
+    single header.
+  - `aii recent --limit N` — print a number / timestamp / hash
+    table of the N newest blocks.
+- Library runners: `run_get_block_header` and `run_recent_blocks`.
+
+#### `aii-mcp`
+
+- Two new MCP tools (total 10):
+  - `block_lookup { query }` wraps `aii_getBlockHeader`.
+  - `recent_blocks { limit }` wraps `aii_recentBlocks`.
+- Existing `tools_list_includes_eight_tools` test renamed +
+  expanded to `…_ten_tools`.
+
+#### Tests + verification
+
+- Workspace: **647 / 647 tests pass** (was 640), clippy clean
+  under `-D warnings`.
+- Live: `aiid --consensus poa --slot-seconds 1` produced 3 blocks
+  in 3 seconds. All three surfaces read them back:
+  - `curl aii_getBlockHeader '["2"]'` → full HeaderView JSON.
+  - `curl aii_recentBlocks '[3]'` → newest-first 3-element array.
+  - `aii recent --limit 2` → two-row CLI table.
+  - `aii-mcp` stdio: `tools/list` reports 10 tools; `tools/call`
+    on `recent_blocks` and `block_lookup` returns live block data
+    wrapped in MCP `content[].text`.
+
+#### Scope discipline
+
+- **In scope**: in-memory header index, RPC endpoints, CLI
+  subcommands, MCP tools, wiring producers to `commit_block`.
+- **Not in this release**: persistent RocksDB block storage (the
+  `RocksDbBackend` is opened but not yet written to — restart
+  loses the index); tx bodies / receipts in `HeaderView`;
+  pagination beyond `recent_blocks`; standalone HTML/SPA
+  front-end (the data is now reachable by any explorer that
+  speaks JSON-RPC).
+
 ## [0.0.35] — 2026-05-25
 
 ### Added — Pluggable consensus (PoA alongside BFT-PoS)
