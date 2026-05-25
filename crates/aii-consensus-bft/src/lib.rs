@@ -19,11 +19,13 @@
 #![warn(missing_docs)]
 
 pub mod bft;
+pub mod coordinator;
 pub use bft::{
-    LeaderProof, PolcCertificate, PrecommitCertificate, PrecommitTallier, PrecommitVote,
+    LeaderProof, Phase, PolcCertificate, PrecommitCertificate, PrecommitTallier, PrecommitVote,
     PrevoteTallier, PrevoteVote, TallyState, Validator, ValidatorSet, MAX_VALIDATORS,
     PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
 };
+pub use coordinator::RoundCoordinator;
 
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
@@ -232,6 +234,16 @@ pub enum BftError {
     /// VRF proof failed to verify.
     #[error("invalid VRF proof")]
     InvalidVrfProof,
+
+    /// Operation attempted in a state that doesn't accept it (e.g.
+    /// submitting a PRE-VOTE while the coordinator is `AwaitingProposal`).
+    #[error("wrong phase: expected {expected:?}, was {actual:?}")]
+    WrongPhase {
+        /// Phase the coordinator would have accepted the input in.
+        expected: Phase,
+        /// Phase the coordinator was actually in.
+        actual: Phase,
+    },
 }
 
 #[cfg(test)]

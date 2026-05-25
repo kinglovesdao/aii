@@ -5,6 +5,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.26] — 2026-05-24
+
+### Added — BFT-PoS stage 3: round-change coordinator
+
+The stage-1/2 primitives now have an orchestrator. `RoundCoordinator`
+drives one height through the two-phase BFT lifecycle and advances
+rounds on timeout — the structural pre-req for surviving a stuck leader
+or a slow network. Still pure state machine: no networking, no clock,
+no I/O.
+
+#### aii-consensus-bft
+
+- New `coordinator` submodule with `RoundCoordinator`:
+  - `new(height, seed, vs)` starts at round 0, phase `AwaitingProposal`.
+  - `submit_proposal(block, &LeaderProof)` validates the proof against
+    the expected proposer for `(height, round, seed)` and transitions
+    to `Prevoting`.
+  - `submit_prevote(vote)` forwards to the inner `PrevoteTallier`; on
+    quorum captures the `PolcCertificate` and transitions to
+    `Precommitting`.
+  - `submit_precommit(vote)` forwards to the inner `PrecommitTallier`;
+    on quorum captures the `PrecommitCertificate` and transitions to
+    `Committed`.
+  - `fire_timeout()` advances to the next round (clearing proposal,
+    tallies, and POLC) unless already `Committed`. `Committed` makes
+    `fire_timeout` a no-op.
+  - Accessors: `phase()`, `round()`, `height()`, `leader_index()`,
+    `proposed_block()`, `polc()`, `certificate()`.
+- `bft::Phase` enum: `AwaitingProposal` / `Prevoting` / `Precommitting`
+  / `Committed`. Re-exported from the crate root.
+- New `BftError::WrongPhase { expected, actual }` for phase-violation
+  reports.
+- **Breaking change** to v0.0.23 leader API:
+  - `ValidatorSet::select_leader(height, seed)` →
+    `select_leader(height, round, seed)` so each round at the same
+    height picks a (probably) different proposer.
+  - `LeaderProof::input / produce / verify` all gain a `round: u32`
+    argument; the VRF input becomes `keccak256(height_be8 ‖ round_be4 ‖ seed)`.
+- 17 RED→GREEN tests on the coordinator covering: starts in
+  `AwaitingProposal`; leader index agreement with the validator set;
+  every phase rejects out-of-phase events; valid leader proof advances
+  to `Prevoting`; non-leader proof rejected; quorum-on-prevote
+  transitions to `Precommitting`; quorum-on-precommit transitions to
+  `Committed`; certificate verifies; timeouts in each pre-final phase
+  advance the round and clear state; timeout in `Committed` is a no-op;
+  round 1 only accepts proofs signed for round 1; inner-tally errors
+  (e.g. `WrongBlockHash`) propagate verbatim through the coordinator.
+- 2 extra bft.rs tests covering round-aware leader selection and the
+  new wrong-round leader-proof rejection.
+
+### Scope discipline (continued)
+
+Still NOT in this release: networking / gossip; timeout scheduling
+(the host fires `fire_timeout` from its own clock); POL preservation
+across rounds (locking a block from a previous round's POLC);
+equivocation detection / slashing; integration with `DevModeEngine`.
+These remain explicit non-goals and will land separately.
+
 ## [0.0.25] — 2026-05-24
 
 ### Added — BFT-PoS stage 2: two-phase voting + round numbers

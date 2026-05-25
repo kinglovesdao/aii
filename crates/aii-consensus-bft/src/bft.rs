@@ -139,16 +139,19 @@ impl ValidatorSet {
         &self.validators
     }
 
-    /// Stake-weighted deterministic leader for `(height, seed)`.
+    /// Stake-weighted deterministic leader for `(height, round, seed)`.
     ///
-    /// `pick = u64::from_be_bytes(keccak256(height_be8 ‖ seed)[0..8]) % total_stake`,
+    /// `pick = u64::from_be_bytes(keccak256(height_be8 ‖ round_be4 ‖ seed)[0..8]) % total_stake`,
     /// then the leader is the first validator whose running stake sum
-    /// exceeds `pick`. Distribution is uniform modulo `total_stake`.
+    /// exceeds `pick`. Including `round` makes each round at the same
+    /// height pick a (probably) different leader, so a stuck round can
+    /// recover with a different proposer.
     #[must_use]
-    pub fn select_leader(&self, height: u64, seed: &[u8; 32]) -> usize {
-        let mut buf = [0u8; 40];
+    pub fn select_leader(&self, height: u64, round: u32, seed: &[u8; 32]) -> usize {
+        let mut buf = [0u8; 44];
         buf[0..8].copy_from_slice(&height.to_be_bytes());
-        buf[8..40].copy_from_slice(seed);
+        buf[8..12].copy_from_slice(&round.to_be_bytes());
+        buf[12..44].copy_from_slice(seed);
         let hash = keccak256(&buf);
         let mut pick_bytes = [0u8; 8];
         pick_bytes.copy_from_slice(&hash.as_bytes()[0..8]);
@@ -175,18 +178,20 @@ pub struct LeaderProof {
 }
 
 impl LeaderProof {
-    /// VRF input for `(height, seed)`. Same on both signer and verifier.
+    /// VRF input for `(height, round, seed)`. Same on both signer and
+    /// verifier — `round` is included so each round's proof is unique.
     #[must_use]
-    pub fn input(height: u64, seed: &[u8; 32]) -> [u8; 32] {
-        let mut buf = [0u8; 40];
+    pub fn input(height: u64, round: u32, seed: &[u8; 32]) -> [u8; 32] {
+        let mut buf = [0u8; 44];
         buf[0..8].copy_from_slice(&height.to_be_bytes());
-        buf[8..40].copy_from_slice(seed);
+        buf[8..12].copy_from_slice(&round.to_be_bytes());
+        buf[12..44].copy_from_slice(seed);
         *keccak256(&buf).as_bytes()
     }
 
     /// Leader produces the proof + output for the next seed.
-    pub fn produce(sk: &vrf::SecretKey, height: u64, seed: &[u8; 32]) -> Self {
-        let input = Self::input(height, seed);
+    pub fn produce(sk: &vrf::SecretKey, height: u64, round: u32, seed: &[u8; 32]) -> Self {
+        let input = Self::input(height, round, seed);
         let (vrf_proof, vrf_output) = vrf::prove(sk, &input);
         Self {
             vrf_proof,
@@ -194,15 +199,16 @@ impl LeaderProof {
         }
     }
 
-    /// Verifier confirms this proof was made by `pk` at `(height, seed)`
-    /// and that `vrf_output` is the genuine VRF result.
+    /// Verifier confirms this proof was made by `pk` at `(height, round,
+    /// seed)` and that `vrf_output` is the genuine VRF result.
     pub fn verify(
         &self,
         pk: &vrf::PublicKey,
         height: u64,
+        round: u32,
         seed: &[u8; 32],
     ) -> Result<(), BftError> {
-        let input = Self::input(height, seed);
+        let input = Self::input(height, round, seed);
         let recovered =
             vrf::verify(pk, &input, &self.vrf_proof).map_err(|_| BftError::InvalidVrfProof)?;
         if recovered != self.vrf_output {
@@ -223,6 +229,22 @@ impl LeaderProof {
 pub const PREVOTE_DOMAIN: &[u8] = b"AII-PREVOTE";
 /// Domain-separation tag prefixed to every PRE-COMMIT digest.
 pub const PRECOMMIT_DOMAIN: &[u8] = b"AII-PRECOMMIT";
+
+/// Externally observable phase of a [`crate::coordinator::RoundCoordinator`].
+///
+/// Carried by [`crate::BftError::WrongPhase`] so callers can see both
+/// the phase the coordinator expected and the one it was actually in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Round has begun; no proposal received yet.
+    AwaitingProposal,
+    /// Proposal received; collecting PRE-VOTES.
+    Prevoting,
+    /// PRE-VOTE quorum reached (POLC formed); collecting PRE-COMMITS.
+    Precommitting,
+    /// PRE-COMMIT quorum reached; block is final for this height.
+    Committed,
+}
 
 /// A single PRE-VOTE vote from one validator (stage 2).
 ///
@@ -734,10 +756,29 @@ mod tests {
     fn select_leader_is_deterministic() {
         let (vs, _) = three_validators_equal_stake();
         let seed = [0xab; 32];
-        let l1 = vs.select_leader(42, &seed);
-        let l2 = vs.select_leader(42, &seed);
+        let l1 = vs.select_leader(42, 0, &seed);
+        let l2 = vs.select_leader(42, 0, &seed);
         assert_eq!(l1, l2);
         assert!(l1 < 3);
+    }
+
+    #[test]
+    fn select_leader_round_changes_pick() {
+        // For the same (height, seed), incrementing the round should
+        // eventually pick a different validator within 50 rounds — the
+        // distribution is uniform, so 3 validators × 50 rounds ⇒ at
+        // most ~10⁻¹⁵ probability all pick the same one.
+        let (vs, _) = three_validators_equal_stake();
+        let seed = [0xcd; 32];
+        let r0 = vs.select_leader(42, 0, &seed);
+        let mut differs = false;
+        for r in 1..50 {
+            if vs.select_leader(42, r, &seed) != r0 {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "round should change the leader pick");
     }
 
     #[test]
@@ -749,8 +790,8 @@ mod tests {
         // 100 different (height, seed) tuples should hit at least 2 of
         // the 3 validators, otherwise the picker is constant.
         for h in 0..50 {
-            seen.insert(vs.select_leader(h, &seed_a));
-            seen.insert(vs.select_leader(h, &seed_b));
+            seen.insert(vs.select_leader(h, 0, &seed_a));
+            seen.insert(vs.select_leader(h, 0, &seed_b));
         }
         assert!(
             seen.len() >= 2,
@@ -766,7 +807,7 @@ mod tests {
         let seed = [0xee; 32];
         let mut big_count = 0;
         for h in 0..1000 {
-            if vs.select_leader(h, &seed) == 1 {
+            if vs.select_leader(h, 0, &seed) == 1 {
                 big_count += 1;
             }
         }
@@ -782,8 +823,8 @@ mod tests {
         let sk = vrf_sk();
         let pk = sk.public_key();
         let seed = [0x33; 32];
-        let proof = LeaderProof::produce(&sk, 7, &seed);
-        proof.verify(&pk, 7, &seed).unwrap();
+        let proof = LeaderProof::produce(&sk, 7, 0, &seed);
+        proof.verify(&pk, 7, 0, &seed).unwrap();
     }
 
     #[test]
@@ -791,8 +832,18 @@ mod tests {
         let sk = vrf_sk();
         let pk = sk.public_key();
         let seed = [0x33; 32];
-        let proof = LeaderProof::produce(&sk, 7, &seed);
-        let err = proof.verify(&pk, 8, &seed).unwrap_err();
+        let proof = LeaderProof::produce(&sk, 7, 0, &seed);
+        let err = proof.verify(&pk, 8, 0, &seed).unwrap_err();
+        assert_eq!(err, BftError::InvalidVrfProof);
+    }
+
+    #[test]
+    fn leader_proof_verify_with_wrong_round_fails() {
+        let sk = vrf_sk();
+        let pk = sk.public_key();
+        let seed = [0x33; 32];
+        let proof = LeaderProof::produce(&sk, 7, 0, &seed);
+        let err = proof.verify(&pk, 7, 1, &seed).unwrap_err();
         assert_eq!(err, BftError::InvalidVrfProof);
     }
 
@@ -801,9 +852,9 @@ mod tests {
         let sk = vrf_sk();
         let pk = sk.public_key();
         let seed = [0x33; 32];
-        let mut proof = LeaderProof::produce(&sk, 7, &seed);
+        let mut proof = LeaderProof::produce(&sk, 7, 0, &seed);
         proof.vrf_output[0] ^= 0x01;
-        let err = proof.verify(&pk, 7, &seed).unwrap_err();
+        let err = proof.verify(&pk, 7, 0, &seed).unwrap_err();
         assert_eq!(err, BftError::InvalidVrfProof);
     }
 
