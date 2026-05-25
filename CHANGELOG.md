@@ -5,6 +5,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.33] — 2026-05-25
+
+### Added — `aiid --bft`: real BFT block production end-to-end
+
+The `aiid` binary now runs the real BFT-PoS engine from a genesis +
+keystore file pair. **This is the milestone for "the chain is
+runnable."** With v0.0.32 we had keygen + genesis on disk; with v0.0.33
+the node actually loads them, advances heights via BFT, and serves
+the new heads via RPC.
+
+#### aii-node
+
+- New `bft_bootstrap` submodule:
+  - `load_genesis(&Path)` / `load_keystore(&Path)` — parse JSON files.
+  - `discover_my_index(&Genesis, &ValidatorKeystore)` — match the
+    keystore's BLS pubkey against the genesis validator entries.
+  - `build_bft_config(&Genesis, &ValidatorKeystore, coinbase, my_index?)`
+    — assemble a runtime `BftConfig`, decompressing both secret keys.
+  - `boot_bft_engine(genesis_path, keystore_path, coinbase)` — one-shot
+    constructor returning the `BftEngine` ready to advance.
+  - New `BootstrapError` with `Io / Json / Hex / Keystore /
+    NotAValidator / Bft` variants.
+- 5 RED→GREEN tests covering: pubkey discovery, unknown-keystore
+  rejection, in-memory `BftConfig` build, end-to-end disk-to-engine
+  boot + first-block advance, malformed-JSON rejection.
+
+#### aiid (binary)
+
+- New flags: `--bft`, `--genesis FILE`, `--keystore FILE`,
+  `--coinbase 0xHEX`.
+- When `--bft` is set:
+  - Single-validator mode: per-`--slot-seconds` tick, call
+    `engine.advance_single()`, update `NodeState::head`, log
+    `BFT block finalised number=N hash=… round=R`.
+  - Multi-validator mode: wait for peer events (gossip transport
+    lands in v0.0.34+).
+- When `--bft` is absent: legacy `DevModeEngine` path preserved.
+
+### Verified on a live `aiid` process
+
+```bash
+aii validator keygen --out node.json
+aii --json validator pubkey --file node.json > pub.json
+aii genesis init --network testnet --validator-pubkey pub.json \
+    --stake 1000 --out genesis.json
+
+aiid --testnet --bft --genesis genesis.json --keystore node.json \
+     --slot-seconds 1 --coinbase 0xabababababababababababababababababababab
+
+# … 5 seconds later …
+curl -sX POST http://127.0.0.1:8545 \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+# → {"jsonrpc":"2.0","id":1,"result":"0x4"}
+```
+
+The logs show `BFT block finalised number=1 round=0`,
+`number=2 round=0`, … — real BFT certificates, one per block, every
+slot, persisted in `NodeState::head` and visible via `eth_blockNumber`.
+
+### What "可以商业化部署" means with this release
+
+A node operator can now:
+1. Generate validator keys (`aii validator keygen`).
+2. Assemble a genesis file (`aii genesis init`).
+3. Run a real BFT node (`aiid --bft …`).
+4. Query the chain head via JSON-RPC.
+
+Multi-validator deployments still need the gossip transport (v0.0.34)
+to share BFT messages across hosts. Until then, the multi-validator
+path can be driven via `BftEngine::submit_remote_*` from a custom
+transport (e.g. HTTP relay) — the API is stable.
+
+### Scope discipline
+
+Not in this release: P2P transport for `BftMessage`; encrypted
+validator keystore; on-chain slashing executor; state-root computation
+in the produced blocks; fork choice.
+
 ## [0.0.32] — 2026-05-25
 
 ### Added — node-operator CLI for validator + genesis tooling
