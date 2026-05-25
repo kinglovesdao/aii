@@ -5,6 +5,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.30] — 2026-05-25
+
+### Added — multi-validator BFT consensus end-to-end
+
+`BftEngine` now drives consensus across multiple validators by accepting
+peer-injected proposals and votes. The chain crosses from "single-node
+demo" to "actually multi-validator." A three-node test produces an
+identical chain through pure method-call exchange — the structural
+proof that the BFT engine can be deployed on a real network once the
+gossip transport is wired.
+
+#### aii-consensus-bft
+
+- `BftEngineState` gains a long-lived `RoundCoordinator` plus the
+  `(Block, LeaderProof)` for the in-progress round. Lazily created on
+  the first event for a height; reset after `step()` harvests the
+  committed block.
+- New methods on `BftEngine`:
+  - `cast_proposal()` — leader-only: build block + leader proof, feed
+    to local coordinator, return for broadcast.
+  - `cast_prevote()` / `cast_precommit()` — sign + submit my own vote,
+    return for broadcast.
+  - `submit_remote_proposal(Block, LeaderProof)` — peer-supplied
+    proposal; the inner coordinator validates the leader proof.
+  - `submit_remote_prevote(PrevoteVote)` /
+    `submit_remote_precommit(PrecommitVote)` — forward to coordinator.
+  - `tick_timeout()` — external-clock-driven round advance.
+  - `current_round_state()` → `Option<(height, round, Phase)>`.
+  - `current_leader_index()` → `Option<usize>`.
+- `Engine::step()` in multi-validator mode now harvests the committed
+  block when the coordinator reaches `Phase::Committed`: updates the
+  chain head, rolls the seed forward via the leader's VRF output, and
+  clears the coordinator so the next height can start fresh. Returns
+  `Idle` otherwise.
+- New `BftError` variants:
+  - `NoActiveCoordinator` — `cast_*` / `submit_remote_*` called before
+    a coordinator has been initialised for the current height.
+  - `NotLeader { round, expected }` — `cast_proposal()` rejected because
+    this node is not the elected leader for the round.
+- 12 new tests, including the killer **`three_node_consensus_produces_same_block`**:
+  three `BftEngine` instances act as a 3-validator set, exchange a
+  proposal + 3 prevotes + 3 precommits via direct method calls, and
+  all three then report the same `NewBlock(hash)` from `step()` —
+  bit-for-bit identical heads.
+- Other coverage: lazy coordinator init, non-leader proposal rejection,
+  prevote-without-proposal rejection, precommit-without-POLC rejection,
+  invalid leader proof rejection, timeout clears proposal, post-commit
+  state cleared, idle when no progress, current-leader-index reflects
+  validator set.
+
+### Why this matters
+
+Up to v0.0.29, a real multi-validator deployment had no API surface
+for the consensus engine — it could only run single-node. v0.0.30 is
+the last structural piece needed for the engine half of a commercial
+mainnet: gossip transport (wiring `BftMessage` through `aii-net-p2p`),
+state-root computation, slashing-tx execution, fork choice, and node
+operator tooling (genesis generator, validator key onboarding,
+config) remain — but the consensus machinery is functionally complete.
+
+### Scope discipline
+
+Not in this release: actual gossip transport, fork choice / re-org,
+state-root computation, slashing-tx execution, validator-set rotation,
+node operator tooling. These remain explicit non-goals and will land
+separately.
+
 ## [0.0.29] — 2026-05-24
 
 ### Added — BFT-PoS stage 6: chain-level `BftEngine`

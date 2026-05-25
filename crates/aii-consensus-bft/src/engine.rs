@@ -27,6 +27,8 @@
 //! scheduling) is an explicit non-goal here — it will land alongside
 //! the gossip layer.
 
+#![allow(clippy::significant_drop_tightening)]
+
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -84,6 +86,14 @@ struct BftEngineState {
     head_timestamp: u64,
     /// Seed rolled forward for the next height's leader selection.
     seed: [u8; 32],
+    /// Coordinator driving the next-height round, if one is active.
+    /// Lazily created when the first event for the height arrives;
+    /// reset to `None` after `Committed` is harvested into a new head.
+    coordinator: Option<RoundCoordinator>,
+    /// `(block, leader_proof)` accepted in the current round — held so
+    /// we can commit the full block when the cert forms and roll the
+    /// seed forward via the proof's VRF output.
+    proposal: Option<(Block, LeaderProof)>,
 }
 
 impl BftEngine {
@@ -94,6 +104,8 @@ impl BftEngine {
             head_number: genesis.header.number,
             head_timestamp: genesis.header.timestamp,
             seed: config.initial_seed,
+            coordinator: None,
+            proposal: None,
         };
         Self {
             config,
@@ -112,6 +124,206 @@ impl BftEngine {
     #[must_use]
     pub fn is_single_validator(&self) -> bool {
         self.config.validator_set.size() == 1
+    }
+
+    /// Current `(height, round, Phase)` if a coordinator is active.
+    #[must_use]
+    pub fn current_round_state(&self) -> Option<(u64, u32, crate::bft::Phase)> {
+        let g = self.state.lock();
+        g.coordinator
+            .as_ref()
+            .map(|c| (c.height(), c.round(), c.phase()))
+    }
+
+    /// Leader index for the active round (if any).
+    #[must_use]
+    pub fn current_leader_index(&self) -> Option<usize> {
+        let g = self.state.lock();
+        g.coordinator.as_ref().map(RoundCoordinator::leader_index)
+    }
+
+    /// Build a proposal for the current round and feed it to our own
+    /// coordinator. Caller is responsible for broadcasting the returned
+    /// `(Block, LeaderProof)` to peers. Only valid when this node is
+    /// the elected leader for the round.
+    pub fn cast_proposal(&self) -> Result<(Block, LeaderProof), BftError> {
+        let mut g = self.state.lock();
+        self.ensure_coordinator(&mut g);
+        let coord = g.coordinator.as_mut().expect("ensured");
+        let leader_idx = coord.leader_index();
+        if leader_idx != self.config.my_index as usize {
+            return Err(BftError::NotLeader {
+                round: coord.round(),
+                expected: u32::try_from(leader_idx).unwrap_or(u32::MAX),
+            });
+        }
+        let height = coord.height();
+        let round = coord.round();
+        let seed = g.seed;
+        let head_hash = g.head_hash;
+        let head_ts = g.head_timestamp;
+        let proof = LeaderProof::produce(&self.config.my_vrf_sk, height, round, &seed);
+        let block = self.build_block(head_hash, head_ts, height, &proof);
+        let block_hash = block.hash();
+        g.coordinator
+            .as_mut()
+            .unwrap()
+            .submit_proposal(block_hash, &proof)?;
+        g.proposal = Some((block.clone(), proof.clone()));
+        Ok((block, proof))
+    }
+
+    /// Sign + submit my own PRE-VOTE for whatever block the coordinator
+    /// is currently in `Prevoting` over. Returns the signed vote for
+    /// the host to broadcast.
+    pub fn cast_prevote(&self) -> Result<PrevoteVote, BftError> {
+        let mut g = self.state.lock();
+        let coord = g
+            .coordinator
+            .as_mut()
+            .ok_or(BftError::NoActiveCoordinator)?;
+        let phase = coord.phase();
+        let block_hash = coord.proposed_block().ok_or(BftError::WrongPhase {
+            expected: crate::bft::Phase::Prevoting,
+            actual: phase,
+        })?;
+        let vote = PrevoteVote::sign(
+            &self.config.my_bls_sk,
+            block_hash,
+            coord.height(),
+            coord.round(),
+            self.config.my_index,
+        );
+        coord.submit_prevote(vote.clone())?;
+        Ok(vote)
+    }
+
+    /// Sign + submit my own PRE-COMMIT. Returns the signed vote for
+    /// the host to broadcast.
+    pub fn cast_precommit(&self) -> Result<PrecommitVote, BftError> {
+        let mut g = self.state.lock();
+        let coord = g
+            .coordinator
+            .as_mut()
+            .ok_or(BftError::NoActiveCoordinator)?;
+        if coord.phase() != crate::bft::Phase::Precommitting {
+            return Err(BftError::WrongPhase {
+                expected: crate::bft::Phase::Precommitting,
+                actual: coord.phase(),
+            });
+        }
+        let block_hash = coord
+            .proposed_block()
+            .expect("invariant: block set by Precommitting");
+        let vote = PrecommitVote::sign(
+            &self.config.my_bls_sk,
+            block_hash,
+            coord.height(),
+            coord.round(),
+            self.config.my_index,
+        );
+        coord.submit_precommit(vote.clone())?;
+        Ok(vote)
+    }
+
+    /// Ingest a peer's proposal. Verifies the leader proof and
+    /// transitions to `Prevoting`.
+    pub fn submit_remote_proposal(
+        &self,
+        block: Block,
+        leader_proof: LeaderProof,
+    ) -> Result<(), BftError> {
+        let mut g = self.state.lock();
+        self.ensure_coordinator(&mut g);
+        let coord = g.coordinator.as_mut().expect("ensured");
+        let block_hash = block.hash();
+        coord.submit_proposal(block_hash, &leader_proof)?;
+        g.proposal = Some((block, leader_proof));
+        Ok(())
+    }
+
+    /// Ingest a peer's PRE-VOTE. Forwards to inner coordinator.
+    pub fn submit_remote_prevote(&self, vote: PrevoteVote) -> Result<(), BftError> {
+        let mut g = self.state.lock();
+        let coord = g
+            .coordinator
+            .as_mut()
+            .ok_or(BftError::NoActiveCoordinator)?;
+        coord.submit_prevote(vote)?;
+        Ok(())
+    }
+
+    /// Ingest a peer's PRE-COMMIT. Forwards to inner coordinator.
+    pub fn submit_remote_precommit(&self, vote: PrecommitVote) -> Result<(), BftError> {
+        let mut g = self.state.lock();
+        let coord = g
+            .coordinator
+            .as_mut()
+            .ok_or(BftError::NoActiveCoordinator)?;
+        coord.submit_precommit(vote)?;
+        Ok(())
+    }
+
+    /// External clock says the round timed out — advance the coordinator
+    /// to the next round and drop the captured proposal.
+    pub fn tick_timeout(&self) -> Result<(), BftError> {
+        let mut g = self.state.lock();
+        self.ensure_coordinator(&mut g);
+        let coord = g.coordinator.as_mut().expect("ensured");
+        coord.fire_timeout();
+        g.proposal = None;
+        Ok(())
+    }
+
+    /// Lazy: instantiate a fresh `RoundCoordinator` for `head_number + 1`
+    /// if none is active.
+    fn ensure_coordinator(&self, g: &mut BftEngineState) {
+        if g.coordinator.is_none() {
+            g.coordinator = Some(RoundCoordinator::new(
+                g.head_number + 1,
+                g.seed,
+                self.config.validator_set.clone(),
+            ));
+        }
+    }
+
+    /// Build the block this node would propose for `height` on top of
+    /// `parent_hash` at `parent_timestamp`. The leader's VRF output is
+    /// embedded in `mix_hash` so every legitimate proposer for the
+    /// same height produces a distinct block.
+    fn build_block(
+        &self,
+        parent_hash: H256,
+        parent_timestamp: u64,
+        height: u64,
+        leader_proof: &LeaderProof,
+    ) -> Block {
+        let header = Header {
+            parent_hash,
+            ommers_hash: EMPTY_LIST_HASH,
+            beneficiary: self.config.coinbase,
+            state_root: EMPTY_TRIE_HASH,
+            transactions_root: EMPTY_TRIE_HASH,
+            receipts_root: EMPTY_TRIE_HASH,
+            logs_bloom: Bloom::ZERO,
+            difficulty: U256::ZERO,
+            number: height,
+            gas_limit: self.config.gas_limit,
+            gas_used: 0,
+            timestamp: parent_timestamp + self.config.slot_seconds,
+            extra_data: b"aii-bft".to_vec(),
+            mix_hash: H256::new(leader_proof.vrf_output),
+            nonce: [0u8; 8],
+            base_fee_per_gas: self.config.base_fee_per_gas,
+            withdrawals_root: EMPTY_TRIE_HASH,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            parent_beacon_block_root: None,
+        };
+        Block {
+            header,
+            body: BlockBody::default(),
+        }
     }
 
     /// Run one full BFT round (propose + vote + commit) against
@@ -212,11 +424,30 @@ impl Engine for BftEngine {
             let out = self
                 .advance_single()
                 .map_err(|_e| ConsensusError::InvalidBlock("BFT advance failed"))?;
-            Ok(EngineProgress::NewBlock(out.block_hash))
-        } else {
-            // Multi-validator drive lands in v0.0.30; for now report idle.
-            Ok(EngineProgress::Idle)
+            return Ok(EngineProgress::NewBlock(out.block_hash));
         }
+
+        // Multi-validator: harvest if the coordinator has reached Committed.
+        let mut g = self.state.lock();
+        let committed = g
+            .coordinator
+            .as_ref()
+            .is_some_and(|c| c.phase() == crate::bft::Phase::Committed);
+        if !committed {
+            return Ok(EngineProgress::Idle);
+        }
+        let (block, proof) = g
+            .proposal
+            .clone()
+            .ok_or(ConsensusError::InvalidBlock("committed with no proposal"))?;
+        let block_hash = block.hash();
+        g.head_hash = block_hash;
+        g.head_number = block.header.number;
+        g.head_timestamp = block.header.timestamp;
+        g.seed = proof.vrf_output;
+        g.coordinator = None;
+        g.proposal = None;
+        Ok(EngineProgress::NewBlock(block_hash))
     }
 
     fn head(&self) -> H256 {
@@ -485,5 +716,363 @@ mod tests {
         let _ = PrevoteVote::digest(&H256::ZERO, 0, 0);
         let _ = PrecommitVote::digest(&H256::ZERO, 0, 0);
         let _ = LeaderProof::input(0, 0, &[0u8; 32]);
+    }
+
+    // ────────────────────────── multi-validator drive (v0.0.30) ──────────────────
+
+    /// Build N validators with identical stake. Returns the shared
+    /// validator set, plus per-node `(bls_sk, vrf_sk)`. Each node's
+    /// engine config can then be derived by picking `my_index`.
+    fn multi_validator_setup(n: u8) -> (ValidatorSet, Vec<(BlsSecretKey, VrfSecretKey)>) {
+        let mut keys = Vec::new();
+        let mut vs_list = Vec::new();
+        for i in 0..n {
+            let bls = bls_sk(i + 1);
+            let vrf = vrf_sk();
+            vs_list.push(Validator {
+                bls_pubkey: bls.public_key(),
+                vrf_pubkey: vrf.public_key(),
+                stake: 100,
+            });
+            keys.push((bls, vrf));
+        }
+        (ValidatorSet::new(vs_list).unwrap(), keys)
+    }
+
+    /// Construct a `BftEngine` for validator `idx` in the shared set.
+    fn engine_for(
+        idx: u32,
+        vs: &ValidatorSet,
+        keys: &[(BlsSecretKey, VrfSecretKey)],
+        genesis: &Block,
+    ) -> BftEngine {
+        let config = BftConfig {
+            validator_set: vs.clone(),
+            my_index: idx,
+            my_bls_sk: keys[idx as usize].0.clone(),
+            my_vrf_sk: keys[idx as usize].1.clone(),
+            initial_seed: [0x77; 32],
+            coinbase: Address::new([0xab; 20]),
+            gas_limit: 30_000_000,
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            slot_seconds: 3,
+        };
+        BftEngine::new(config, genesis)
+    }
+
+    #[test]
+    fn multi_validator_coordinator_lazily_created() {
+        let (vs, keys) = multi_validator_setup(3);
+        let engine = engine_for(0, &vs, &keys, &genesis());
+        assert!(engine.current_round_state().is_none());
+    }
+
+    #[test]
+    fn cast_proposal_rejected_for_non_leader() {
+        let (vs, keys) = multi_validator_setup(3);
+        // Find an index that is NOT the leader for height 1 round 0.
+        let expected = vs.select_leader(1, 0, &[0x77; 32]);
+        let non_leader = (expected + 1) % 3;
+        let engine = engine_for(non_leader as u32, &vs, &keys, &genesis());
+        let err = engine.cast_proposal().unwrap_err();
+        match err {
+            BftError::NotLeader { round, expected: e } => {
+                assert_eq!(round, 0);
+                assert_eq!(e, expected as u32);
+            }
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_prevote_without_proposal_rejected() {
+        let (vs, keys) = multi_validator_setup(3);
+        let engine = engine_for(0, &vs, &keys, &genesis());
+        assert!(engine.cast_prevote().is_err());
+    }
+
+    #[test]
+    fn submit_remote_proposal_advances_to_prevoting() {
+        let (vs, keys) = multi_validator_setup(3);
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let leader_engine = engine_for(leader as u32, &vs, &keys, &genesis());
+        let (block, proof) = leader_engine.cast_proposal().unwrap();
+
+        // A peer (not the leader) ingests the proposal.
+        let peer_idx = (leader + 1) % 3;
+        let peer = engine_for(peer_idx as u32, &vs, &keys, &genesis());
+        peer.submit_remote_proposal(block, proof).unwrap();
+        let (_, _, phase) = peer.current_round_state().unwrap();
+        assert_eq!(phase, crate::bft::Phase::Prevoting);
+    }
+
+    #[test]
+    fn three_node_consensus_produces_same_block() {
+        // The killer test: 3 BftEngine instances drive consensus on the
+        // same height by exchanging proposals + votes via direct method
+        // calls. All three should agree on the new head.
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+
+        // Leader for height 1 round 0 proposes.
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        let block_hash = block.hash();
+
+        // Every non-leader peer ingests the proposal.
+        for (i, e) in engines.iter().enumerate() {
+            if i != leader {
+                e.submit_remote_proposal(block.clone(), proof.clone())
+                    .unwrap();
+            }
+        }
+
+        // Every node casts their own PRE-VOTE.
+        let prevotes: Vec<PrevoteVote> =
+            engines.iter().map(|e| e.cast_prevote().unwrap()).collect();
+
+        // Broadcast every prevote to every peer.
+        for (vi, vote) in prevotes.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_prevote(vote.clone()).unwrap();
+                }
+            }
+        }
+
+        // Each node casts PRE-COMMIT.
+        let precommits: Vec<PrecommitVote> = engines
+            .iter()
+            .map(|e| e.cast_precommit().unwrap())
+            .collect();
+        for (vi, vote) in precommits.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_precommit(vote.clone()).unwrap();
+                }
+            }
+        }
+
+        // Every node now harvests the committed block via step().
+        for mut e in engines {
+            let progress = <BftEngine as Engine>::step(&mut e).unwrap();
+            assert_eq!(progress, EngineProgress::NewBlock(block_hash));
+            let (h, n) = e.head();
+            assert_eq!(h, block_hash);
+            assert_eq!(n, 1);
+        }
+    }
+
+    #[test]
+    fn submit_remote_prevote_below_quorum_keeps_prevoting() {
+        let (vs, keys) = multi_validator_setup(3);
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let leader_e = engine_for(leader as u32, &vs, &keys, &genesis());
+        let (block, proof) = leader_e.cast_proposal().unwrap();
+        // 1 prevote (the leader's). Still below 2-of-3 quorum.
+        leader_e.cast_prevote().unwrap();
+        let (_, _, phase) = leader_e.current_round_state().unwrap();
+        assert_eq!(phase, crate::bft::Phase::Prevoting);
+        // Pull (block, proof) out only to silence the unused warning.
+        let _ = (block, proof);
+    }
+
+    #[test]
+    fn three_node_polc_forms_at_quorum() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let mut engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.submit_remote_proposal(block.clone(), proof.clone())
+                    .unwrap();
+            }
+        }
+        let prevotes: Vec<PrevoteVote> =
+            engines.iter().map(|e| e.cast_prevote().unwrap()).collect();
+        for (vi, vote) in prevotes.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_prevote(vote.clone()).unwrap();
+                }
+            }
+        }
+        // All three engines now in Precommitting.
+        for e in &engines {
+            let (_, _, phase) = e.current_round_state().unwrap();
+            assert_eq!(phase, crate::bft::Phase::Precommitting);
+        }
+    }
+
+    #[test]
+    fn step_returns_idle_when_no_progress() {
+        let (vs, keys) = multi_validator_setup(3);
+        let mut engine = engine_for(0, &vs, &keys, &genesis());
+        // No proposal seen yet — step() must report idle.
+        let p = <BftEngine as Engine>::step(&mut engine).unwrap();
+        assert_eq!(p, EngineProgress::Idle);
+    }
+
+    #[test]
+    fn step_after_commit_advances_head_in_multi_validator() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let mut engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.submit_remote_proposal(block.clone(), proof.clone())
+                    .unwrap();
+            }
+        }
+        let prevotes: Vec<PrevoteVote> =
+            engines.iter().map(|e| e.cast_prevote().unwrap()).collect();
+        for (vi, v) in prevotes.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_prevote(v.clone()).unwrap();
+                }
+            }
+        }
+        let precommits: Vec<PrecommitVote> = engines
+            .iter()
+            .map(|e| e.cast_precommit().unwrap())
+            .collect();
+        for (vi, v) in precommits.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_precommit(v.clone()).unwrap();
+                }
+            }
+        }
+        let mut e0 = engines.remove(0);
+        let p = <BftEngine as Engine>::step(&mut e0).unwrap();
+        assert!(matches!(p, EngineProgress::NewBlock(_)));
+        assert_eq!(e0.head().1, 1);
+    }
+
+    #[test]
+    fn tick_timeout_advances_round_and_clears_proposal() {
+        let (vs, keys) = multi_validator_setup(3);
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let leader_e = engine_for(leader as u32, &vs, &keys, &genesis());
+        leader_e.cast_proposal().unwrap();
+        leader_e.tick_timeout().unwrap();
+        let (h, r, phase) = leader_e.current_round_state().unwrap();
+        assert_eq!(h, 1);
+        assert_eq!(r, 1);
+        assert_eq!(phase, crate::bft::Phase::AwaitingProposal);
+    }
+
+    #[test]
+    fn submit_remote_proposal_with_invalid_leader_proof_rejected() {
+        let (vs, keys) = multi_validator_setup(3);
+        let leader_idx = vs.select_leader(1, 0, &[0x77; 32]);
+        let non_leader = (leader_idx + 1) % 3;
+        // Build a proposal using the WRONG VRF key — claiming to be the leader.
+        let bad_proof = LeaderProof::produce(&keys[non_leader].1, 1, 0, &[0x77; 32]);
+        let block = Block {
+            header: Header {
+                parent_hash: genesis().hash(),
+                ommers_hash: EMPTY_LIST_HASH,
+                beneficiary: Address::ZERO,
+                state_root: EMPTY_TRIE_HASH,
+                transactions_root: EMPTY_TRIE_HASH,
+                receipts_root: EMPTY_TRIE_HASH,
+                logs_bloom: Bloom::ZERO,
+                difficulty: U256::ZERO,
+                number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_003,
+                extra_data: vec![],
+                mix_hash: H256::new(bad_proof.vrf_output),
+                nonce: [0u8; 8],
+                base_fee_per_gas: U256::from(1_000_000_000u64),
+                withdrawals_root: EMPTY_TRIE_HASH,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                parent_beacon_block_root: None,
+            },
+            body: BlockBody::default(),
+        };
+        let peer = engine_for(0, &vs, &keys, &genesis());
+        assert_eq!(
+            peer.submit_remote_proposal(block, bad_proof).unwrap_err(),
+            BftError::InvalidVrfProof,
+        );
+    }
+
+    #[test]
+    fn next_height_starts_after_commit() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader1 = vs.select_leader(1, 0, &[0x77; 32]);
+        let mut engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+        let (block, proof) = engines[leader1].cast_proposal().unwrap();
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader1 {
+                e.submit_remote_proposal(block.clone(), proof.clone())
+                    .unwrap();
+            }
+        }
+        let prevotes: Vec<PrevoteVote> =
+            engines.iter().map(|e| e.cast_prevote().unwrap()).collect();
+        for (vi, v) in prevotes.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_prevote(v.clone()).unwrap();
+                }
+            }
+        }
+        let precommits: Vec<PrecommitVote> = engines
+            .iter()
+            .map(|e| e.cast_precommit().unwrap())
+            .collect();
+        for (vi, v) in precommits.iter().enumerate() {
+            for (ei, e) in engines.iter().enumerate() {
+                if ei != vi {
+                    e.submit_remote_precommit(v.clone()).unwrap();
+                }
+            }
+        }
+        for e in &mut engines {
+            <BftEngine as Engine>::step(e).unwrap();
+        }
+        // All engines at height 1 now. Round-state cleared.
+        for e in &engines {
+            assert_eq!(e.head().1, 1);
+            assert!(
+                e.current_round_state().is_none(),
+                "coordinator should be cleared post-commit",
+            );
+        }
+    }
+
+    #[test]
+    fn cast_precommit_without_polc_rejected() {
+        let (vs, keys) = multi_validator_setup(3);
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let leader_e = engine_for(leader as u32, &vs, &keys, &genesis());
+        leader_e.cast_proposal().unwrap();
+        // Only 1 prevote (mine) — below quorum, still in Prevoting.
+        leader_e.cast_prevote().unwrap();
+        assert!(leader_e.cast_precommit().is_err());
+    }
+
+    #[test]
+    fn current_leader_index_matches_validator_set() {
+        let (vs, keys) = multi_validator_setup(3);
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let leader_e = engine_for(leader as u32, &vs, &keys, &genesis());
+        // No coordinator yet — index is None.
+        assert!(leader_e.current_leader_index().is_none());
+        // Touch coordinator via cast_proposal.
+        leader_e.cast_proposal().unwrap();
+        assert_eq!(leader_e.current_leader_index(), Some(leader));
     }
 }

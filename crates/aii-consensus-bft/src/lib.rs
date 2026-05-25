@@ -257,6 +257,20 @@ pub enum BftError {
     /// configured set is larger.
     #[error("operation requires single-validator config; set has {0} validators")]
     NotSingleValidator(usize),
+
+    /// No coordinator has been initialised for the current height yet
+    /// (no proposal received, no `cast_*` called).
+    #[error("no active coordinator at this height")]
+    NoActiveCoordinator,
+
+    /// This node is not the leader for the current round.
+    #[error("not the leader for round {round} (expected validator index {expected})")]
+    NotLeader {
+        /// Round at which leadership was checked.
+        round: u32,
+        /// Validator index that *is* the leader.
+        expected: u32,
+    },
 }
 
 #[cfg(test)]
