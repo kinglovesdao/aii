@@ -20,8 +20,9 @@
 
 pub mod bft;
 pub use bft::{
-    LeaderProof, PrecommitCertificate, PrecommitTallier, PrecommitVote, TallyState, Validator,
-    ValidatorSet, MAX_VALIDATORS,
+    LeaderProof, PolcCertificate, PrecommitCertificate, PrecommitTallier, PrecommitVote,
+    PrevoteTallier, PrevoteVote, TallyState, Validator, ValidatorSet, MAX_VALIDATORS,
+    PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
 };
 
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
@@ -206,6 +207,10 @@ pub enum BftError {
     /// Vote's `height` does not match the tallier's height.
     #[error("vote targets a different height than this tallier")]
     WrongHeight,
+
+    /// Vote's `round` does not match the tallier's round.
+    #[error("vote targets a different round than this tallier")]
+    WrongRound,
 
     /// Vote's `validator_index` is outside the set.
     #[error("validator index {index} out of bounds for set of size {size}")]

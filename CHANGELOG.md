@@ -5,6 +5,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.25] — 2026-05-24
+
+### Added — BFT-PoS stage 2: two-phase voting + round numbers
+
+The stage-1 finality state machine grows the missing PRE-VOTE phase and
+an explicit `round: u32` on every vote/tally/certificate. Two-phase
+voting is the structural prerequisite for safe round changes — a
+validator that has issued a PRE-COMMIT in round R cannot equivocate at
+round R+1 against the same `(block, height, round)` because every digest
+now binds round into the BLS-signed bytes.
+
+#### aii-consensus-bft
+
+- New `PrevoteVote` / `PrevoteTallier` / `PolcCertificate` types,
+  mirror-images of the precommit side. `try_form_polc()` emits the
+  Proof-of-Lock-Change when ⅔+1 stake worth of PRE-VOTES land.
+- Both phases use domain-tagged digests:
+  - `prevote_digest = keccak256(PREVOTE_DOMAIN ‖ block ‖ height_be8 ‖ round_be4)`
+  - `precommit_digest = keccak256(PRECOMMIT_DOMAIN ‖ block ‖ height_be8 ‖ round_be4)`
+  Cross-phase replay is now mechanically impossible, not just policy.
+- **Breaking changes** to v0.0.23 API:
+  - `PrecommitVote` / `PrecommitTallier` / `PrecommitCertificate` gain
+    a `round: u32` field.
+  - `PrecommitVote::digest(hash, height)` → `digest(hash, height, round)`.
+  - `PrecommitVote::sign(sk, hash, height, idx)` →
+    `sign(sk, hash, height, round, idx)`.
+  - `PrecommitTallier::new(hash, height, vs)` → `new(hash, height, round, vs)`.
+- New `BftError::WrongRound` variant; tally validation order is now
+  block-hash → height → round → index bounds → duplicate → BLS.
+- New `PREVOTE_DOMAIN` / `PRECOMMIT_DOMAIN` public consts so external
+  crates that verify certificates can derive digests themselves.
+- 17 RED→GREEN tests added on top of stage 1's 26 (PrecommitTallier
+  rejects wrong-round; cross-phase digest separation; round-replay
+  rejection; mirror of all precommit tests for prevote phase; POLC
+  verification round-trip + tampered-hash rejection).
+- Doc comment at the top of `bft.rs` rewritten to describe the
+  two-phase lifecycle as the primary path.
+
+### Scope discipline (continued)
+
+Still **not** in this release: networking / gossip, round-change
+coordinator with timeout policy, POL preservation across rounds,
+equivocation slashing, integration into `DevModeEngine`. These remain
+explicit non-goals and will land separately.
+
 ## [0.0.24] — 2026-05-24
 
 ### Added — sub-chain ↔ state integration bridge
