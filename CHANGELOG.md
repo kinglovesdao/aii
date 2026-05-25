@@ -5,6 +5,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.28] — 2026-05-24
+
+### Added — BFT-PoS stage 5: POL preservation + equivocation detector
+
+Two correctness gates land on top of the stage-3 coordinator:
+
+1. **POL preservation**: a [`PolcCertificate`] formed in round R is now
+   captured into a `LockedState` that survives every subsequent
+   `fire_timeout`. Validator clients consult `coord.locked()` to
+   decide whether to PRE-VOTE for the new round's proposal or keep
+   their lock.
+2. **Equivocation detector**: a slashing-evidence builder that catches
+   any validator who signs two different blocks for the same `(height,
+   round, phase)`.
+
+#### aii-consensus-bft
+
+- New `LockedState { block_hash, round, polc }` in
+  `coordinator` module; new `RoundCoordinator::locked()` accessor.
+- `fire_timeout` clears the proposal / tallies / current-round
+  `polc()`, but leaves `locked()` untouched — the lock is the durable
+  protocol state across rounds.
+- POLC formation at a strictly newer round supersedes the prior lock;
+  an equal-round POLC is also accepted (idempotent restart).
+- New `slashing` submodule with:
+  - `EquivocationDetector` — tracks `(validator_index, height, round)`
+    → first signed vote per phase; second conflicting block at the
+    same key emits evidence.
+  - `EquivocationEvidence::Prevote { conflicting: [PrevoteVote; 2] }`
+    / `Precommit { conflicting: [PrecommitVote; 2] }`. Accessors
+    `validator_index()`, `height()`, `round()`.
+  - `EquivocationEvidence::verify(&vs)` — independently re-checks
+    coordinate agreement, that the two block hashes differ, and that
+    both BLS signatures verify under the same validator's pubkey.
+- New `SlashingError`: `SameBlock`, `Mismatch { field }`,
+  `UnknownValidator(u32)`, `InvalidSignature`.
+- 17 new slashing tests + 5 new coordinator POL tests:
+  - PRE-VOTE / PRE-COMMIT streams tracked independently per phase
+    (cross-phase contradictions are caught by digest domain separation
+    rather than the detector).
+  - Different validators / heights / rounds correctly partition the
+    map (no false positives).
+  - Evidence verify catches same-block, mismatched validator index /
+    round, out-of-bounds index, and BLS signature forgery.
+  - Coordinator starts with no lock; POLC sets it; timeout preserves
+    it across 5 timeouts; a fresh POLC at a higher round supersedes.
+
+### Scope discipline
+
+Still NOT in this release: actually executing the slashing transaction
+(state debit + validator freeze), enforcing the "vote your lock"
+policy at the protocol level, gossip-side gating on lock state. These
+remain explicit non-goals.
+
 ## [0.0.27] — 2026-05-24
 
 ### Added — BFT-PoS stage 4: wire-format codec
