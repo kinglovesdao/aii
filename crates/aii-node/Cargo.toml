@@ -25,6 +25,8 @@ aii-metrics = { workspace = true }
 aii-block = { workspace = true }
 aii-state = { workspace = true }
 aii-consensus-bft = { workspace = true }
+aii-crypto = { workspace = true }
+aii-cli = { workspace = true }
 hex = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

@@ -3,7 +3,7 @@
 use aii_block::{Block, BlockBody, Bloom, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_config::ChainSpec;
 use aii_consensus_bft::{DevModeEngine, EngineConfig};
-use aii_node::NodeState;
+use aii_node::{bft_bootstrap, NodeState};
 use aii_storage::RocksDbBackend;
 use aii_types::{Address, H256, U256};
 use clap::Parser;
@@ -41,6 +41,42 @@ struct Cli {
     /// Block-production interval in seconds (when `--produce-blocks` is on).
     #[arg(long, default_value = "3")]
     slot_seconds: u64,
+
+    /// Run with the real BFT-PoS engine instead of the dev-mode producer.
+    /// Requires `--genesis` and `--keystore`. In single-validator mode
+    /// the node produces a fresh block every `--slot-seconds`; in
+    /// multi-validator mode the node waits for peer events (network
+    /// transport lands in v0.0.34+).
+    #[arg(long)]
+    bft: bool,
+
+    /// Path to a genesis JSON file (produced by `aii genesis init`).
+    /// Required when `--bft` is set.
+    #[arg(long)]
+    genesis: Option<PathBuf>,
+
+    /// Path to a validator keystore JSON (produced by `aii validator keygen`).
+    /// Required when `--bft` is set.
+    #[arg(long)]
+    keystore: Option<PathBuf>,
+
+    /// Block-producing coinbase address (hex, with or without `0x`).
+    /// Defaults to all-zero.
+    #[arg(long)]
+    coinbase: Option<String>,
+}
+
+fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
+    let s = s.trim_start_matches("0x");
+    let raw = hex::decode(s).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("coinbase: bad hex: {e}").into()
+    })?;
+    let arr: [u8; 20] =
+        raw.try_into()
+            .map_err(|v: Vec<u8>| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("coinbase: expected 20 bytes, got {}", v.len()).into()
+            })?;
+    Ok(Address::new(arr))
 }
 
 fn genesis_block(spec: &ChainSpec) -> Block {
@@ -72,6 +108,7 @@ fn genesis_block(spec: &ChainSpec) -> Block {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -101,34 +138,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let node_state = NodeState::new(spec.clone());
 
-    // Wire up the dev-mode BFT producer if requested.
-    let producer_handle = if cli.produce_blocks {
-        let genesis = genesis_block(&spec);
-        let engine_cfg = EngineConfig {
-            slot_seconds: cli.slot_seconds,
-            ..EngineConfig::default()
-        };
-        let engine = DevModeEngine::new(engine_cfg, &genesis);
-        let state_for_loop = node_state.clone();
-        let interval = Duration::from_secs(cli.slot_seconds);
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                match engine.produce_block() {
-                    Ok((hash, number, _block)) => {
-                        state_for_loop.set_head(number);
-                        tracing::info!(number, ?hash, "block produced");
-                    }
-                    Err(e) => {
-                        tracing::error!(?e, "block production failed");
-                        break;
+    // Production path: real BFT engine driven by genesis + keystore.
+    let producer_handle =
+        if cli.bft {
+            let genesis_path = cli.genesis.as_ref().ok_or_else(
+                || -> Box<dyn std::error::Error + Send + Sync> {
+                    "--bft requires --genesis FILE".into()
+                },
+            )?;
+            let keystore_path = cli.keystore.as_ref().ok_or_else(
+                || -> Box<dyn std::error::Error + Send + Sync> {
+                    "--bft requires --keystore FILE".into()
+                },
+            )?;
+            let coinbase = cli
+                .coinbase
+                .as_deref()
+                .map(parse_address)
+                .transpose()?
+                .unwrap_or(Address::ZERO);
+            let (engine, genesis) =
+                bft_bootstrap::boot_bft_engine(genesis_path, keystore_path, coinbase)?;
+            let is_single = engine.is_single_validator();
+            tracing::info!(
+                single_validator = is_single,
+                validators = genesis.validators.len(),
+                coinbase = ?coinbase,
+                "BftEngine ready"
+            );
+            let state_for_loop = node_state.clone();
+            let interval = Duration::from_secs(cli.slot_seconds);
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if is_single {
+                        match engine.advance_single() {
+                            Ok(out) => {
+                                state_for_loop.set_head(out.block.header.number);
+                                tracing::info!(
+                                    number = out.block.header.number,
+                                    hash = ?out.block_hash,
+                                    round = out.certificate.round,
+                                    "BFT block finalised"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(?e, "BFT advance failed");
+                                break;
+                            }
+                        }
+                    } else {
+                        // Multi-validator drive: peer events arrive via the
+                        // network layer (v0.0.34+). For now, just log that
+                        // we're waiting.
+                        tracing::debug!("multi-validator mode — waiting for peer events");
                     }
                 }
-            }
-        }))
-    } else {
-        None
-    };
+            }))
+        } else if cli.produce_blocks {
+            // Legacy dev-mode producer.
+            let genesis = genesis_block(&spec);
+            let engine_cfg = EngineConfig {
+                slot_seconds: cli.slot_seconds,
+                ..EngineConfig::default()
+            };
+            let engine = DevModeEngine::new(engine_cfg, &genesis);
+            let state_for_loop = node_state.clone();
+            let interval = Duration::from_secs(cli.slot_seconds);
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    match engine.produce_block() {
+                        Ok((hash, number, _block)) => {
+                            state_for_loop.set_head(number);
+                            tracing::info!(number, ?hash, "block produced");
+                        }
+                        Err(e) => {
+                            tracing::error!(?e, "block production failed");
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
     let (bound, handle) = aii_rpc::serve(cli.rpc, node_state).await?;
     tracing::info!(addr = %bound, "rpc server listening");

@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bft_bootstrap;
+
 use aii_config::ChainSpec;
 use aii_rpc::{AccountView, RpcState};
 use aii_state::StateDb;
