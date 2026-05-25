@@ -5,6 +5,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.32] — 2026-05-25
+
+### Added — node-operator CLI for validator + genesis tooling
+
+The `aii` binary gains the commands a real validator operator needs to
+bootstrap a multi-node testnet/mainnet:
+
+- `aii validator keygen [--out FILE]` — generate a fresh BLS + VRF
+  keypair, write a JSON keystore with hex-encoded secret + public
+  material. **Testnet only** for now; encrypted keystore is a v0.0.33+
+  follow-up.
+- `aii validator pubkey --file FILE` — load a keystore, validate
+  internal consistency (pubkey-from-secret on both BLS and VRF), and
+  emit the pubkeys-only projection that gets shared with the genesis
+  assembler.
+- `aii genesis init --network testnet --validator-pubkey FILE …
+  --stake N [--initial-seed 0xHEX] [--out FILE]` — combine N
+  validator-pubkey files into a Genesis JSON ready for shipping.
+- `aii genesis validate --file FILE` — round-trip parse, chain-spec
+  invariants, every pubkey decompresses, total stake non-zero.
+
+#### aii-cli
+
+- New `ValidatorKeystore`, `ValidatorPubkeys`, `ValidatorEntry` types
+  (serde, hex-encoded `0x`-prefixed fields).
+- New runners: `run_validator_keygen`, `run_validator_pubkey`,
+  `run_genesis_init`, `run_genesis_validate`, `run_random_seed_hex`.
+- 12 new unit tests including an end-to-end test that runs the full
+  operator workflow: 3 fresh keygens → 3 pubkey extractions → 1
+  genesis init → 3 independent `BftConfig::from_genesis` loads each
+  with the matching node's secret keys.
+
+### Verified end-to-end
+
+```bash
+aii validator keygen --out validator-a.json
+aii --json validator pubkey --file validator-a.json > pubkey-a.json
+# … operators share pubkey JSONs …
+aii genesis init --network testnet \
+    --validator-pubkey pubkey-a.json \
+    --validator-pubkey pubkey-b.json \
+    --validator-pubkey pubkey-c.json \
+    --stake 1000 --out genesis.json
+aii --json genesis validate --file genesis.json
+# → {"chain_id":9999,"ok":true,"validators":3}
+```
+
+### Why this matters
+
+Before this release, building a multi-node testnet required
+hand-writing genesis JSON and matching node-side BLS/VRF keys by hand.
+v0.0.32 is the minimum operator-facing UX for spinning up a commercial
+chain. The remaining piece — wiring `BftEngine` into the `aiid` node
+binary on startup — lands in v0.0.33.
+
+### Scope discipline
+
+Not in this release: encrypted validator keystore (`scrypt` + AES like
+the EOA wallet); `aiid --bft --genesis FILE` integration; P2P transport
+for `BftMessage`; on-chain slashing executor.
+
 ## [0.0.31] — 2026-05-25
 
 ### Added — genesis-driven BFT bootstrap

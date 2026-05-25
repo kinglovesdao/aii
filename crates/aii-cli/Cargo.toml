@@ -21,6 +21,9 @@ aii-types = { workspace = true }
 aii-wallet = { workspace = true }
 aii-rpc = { workspace = true }
 aii-onboarding = { workspace = true }
+aii-config = { workspace = true }
+aii-crypto = { workspace = true }
+aii-consensus-bft = { workspace = true }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +37,5 @@ rand = { workspace = true }
 async-trait = "0.1"
 
 [dev-dependencies]
-aii-config = { workspace = true }
 aii-node = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "net", "time"] }
