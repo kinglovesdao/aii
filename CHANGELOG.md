@@ -5,6 +5,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.29] — 2026-05-24
+
+### Added — BFT-PoS stage 6: chain-level `BftEngine`
+
+The pure state machines built up through stages 1–5 (`ValidatorSet`,
+`LeaderProof`, `PrevoteVote`/`PrecommitVote`, `RoundCoordinator`,
+`PolcCertificate` / `PrecommitCertificate`, equivocation detector)
+finally meet the rest of the chain. `BftEngine` implements
+`aii_consensus_iface::Engine`, so the existing `aiid` node binary can
+swap `DevModeEngine` for a real two-phase BFT engine without API churn.
+
+#### aii-consensus-bft
+
+- New `engine` submodule with:
+  - `BftConfig { validator_set, my_index, my_bls_sk, my_vrf_sk,
+    initial_seed, coinbase, gas_limit, base_fee_per_gas,
+    slot_seconds }` — everything a node needs to participate in BFT.
+  - `BftEngine` — wraps a chain-head `(hash, number, timestamp, seed)`
+    plus the static config; the round coordinator is created on demand
+    per height.
+  - `BftEngine::advance_single()` — single-validator round trip:
+    produce leader proof for `(height+1, 0, seed)`, build a block on
+    top of the current head with `mix_hash = vrf_output`, drive a
+    fresh `RoundCoordinator` through propose → prevote → precommit →
+    committed, harvest the certificate, and advance the seed to the
+    leader's VRF output. Returns `AdvanceOutput { block, block_hash,
+    certificate }`.
+  - `BftEngine::is_single_validator()` for tooling that needs to know
+    which mode the engine is in.
+  - `Engine::step()` — in single-validator mode, auto-advances one
+    height (`EngineProgress::NewBlock`); in multi-validator mode,
+    reports `Idle` and waits for an external network drive (lands
+    alongside gossip in v0.0.30+).
+- New `BftError::NotSingleValidator(usize)` — `advance_single` requires
+  a 1-of-1 set, fails clean otherwise.
+- 16 RED→GREEN tests:
+  - construction, init, coinbase, head accessors;
+  - `is_single_validator` predicate;
+  - single-validator advance increments height + timestamp + parent-hash
+    chain;
+  - finality certificate verifies under the configured validator set;
+  - advance correctly rejected in multi-validator mode;
+  - `step()` returns `NewBlock` in single-validator mode and `Idle` in
+    multi-validator mode;
+  - seed evolves across calls (consecutive blocks differ);
+  - 10-height chain test: every parent hash matches; every certificate
+    verifies; final head matches the last produced block.
+
+### Scope discipline
+
+Still NOT in this release: peer-side ingest API for multi-validator
+mode (gossip-driven proposal/prevote/precommit injection — v0.0.30+);
+chain re-org / fork-choice (only single-leader paths exist today);
+state-root computation (every block is empty-state); slashing tx
+execution (the detector emits evidence but no on-chain action). These
+remain explicit non-goals.
+
 ## [0.0.28] — 2026-05-24
 
 ### Added — BFT-PoS stage 5: POL preservation + equivocation detector

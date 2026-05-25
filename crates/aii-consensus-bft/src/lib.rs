@@ -20,6 +20,7 @@
 
 pub mod bft;
 pub mod coordinator;
+pub mod engine;
 pub mod slashing;
 pub mod wire;
 pub use bft::{
@@ -28,6 +29,7 @@ pub use bft::{
     PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
 };
 pub use coordinator::RoundCoordinator;
+pub use engine::{AdvanceOutput, BftConfig, BftEngine};
 pub use slashing::{EquivocationDetector, EquivocationEvidence, SlashingError};
 pub use wire::{
     BftMessage, CodecError, PROPOSAL_LEN, TAG_PRECOMMIT, TAG_PREVOTE, TAG_PROPOSAL, VOTE_LEN,
@@ -250,6 +252,11 @@ pub enum BftError {
         /// Phase the coordinator was actually in.
         actual: Phase,
     },
+
+    /// Operation requires `validator_set.size() == 1` but the
+    /// configured set is larger.
+    #[error("operation requires single-validator config; set has {0} validators")]
+    NotSingleValidator(usize),
 }
 
 #[cfg(test)]
