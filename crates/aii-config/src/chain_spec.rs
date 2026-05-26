@@ -39,6 +39,29 @@ pub struct ChainSpec {
     /// active validator set at epoch boundaries.
     #[serde(default = "default_min_validator_stake")]
     pub min_validator_stake_wei: u128,
+    /// Length of one DPoS epoch in blocks. The active validator set
+    /// is re-elected at every block where
+    /// `block.number % epoch_length_blocks == 0`.
+    #[serde(default = "default_epoch_length")]
+    pub epoch_length_blocks: u64,
+    /// Maximum size of the active validator set. The top-N stakers
+    /// (by `amount_wei`, descending; ties broken by address asc)
+    /// who clear `min_validator_stake_wei` form the elected set.
+    #[serde(default = "default_validators_per_epoch")]
+    pub validators_per_epoch: u32,
+}
+
+const fn default_epoch_length() -> u64 {
+    // 4 800 blocks ≈ 4 hours at 3 s/block. Short enough to react to
+    // stake changes within a working day; long enough that the
+    // election cost doesn't dominate the slot.
+    4_800
+}
+
+const fn default_validators_per_epoch() -> u32 {
+    // 21 — same as EOS / TRON; small enough for sub-second BFT round
+    // trip, large enough that a coalition takedown needs ~14 nodes.
+    21
 }
 
 const fn default_unbonding_period() -> u64 {
@@ -108,6 +131,8 @@ pub const AII_MAINNET: ChainSpec = ChainSpec {
     block_reward_halving_interval: 42_048_000,           // ~4y at 3s/block
     unbonding_period_blocks: 100_800,
     min_validator_stake_wei: 100_000_000_000_000_000_000,
+    epoch_length_blocks: 4_800,
+    validators_per_epoch: 21,
 };
 
 /// Reference AII testnet spec.
@@ -121,6 +146,8 @@ pub const AII_TESTNET: ChainSpec = ChainSpec {
     block_reward_halving_interval: 42_048_000,
     unbonding_period_blocks: 100_800,
     min_validator_stake_wei: 100_000_000_000_000_000_000,
+    epoch_length_blocks: 4_800,
+    validators_per_epoch: 21,
 };
 
 impl ChainSpec {

@@ -10,9 +10,11 @@
 
 pub mod bft_bootstrap;
 pub mod bft_p2p;
+pub mod dpos;
 pub mod staking;
 pub mod sync;
 
+pub use dpos::{elect_active_set, latest_validator_set, ValidatorEntry};
 pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
 
@@ -21,8 +23,8 @@ use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, HeaderView, LogView, ReceiptView, RpcState, SlashView, StakeView,
-    SubchainAnchorView, SubmitTxError, TxView,
+    AccountView, ActiveValidatorsView, HeaderView, LogView, ReceiptView, RpcState, SlashView,
+    StakeView, SubchainAnchorView, SubmitTxError, TxView, ValidatorEntryView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -268,6 +270,44 @@ impl NodeState {
         self.persist_block(block, hash);
         self.execute_block_txs(block);
         self.scan_microchain_anchors(block, hash);
+        self.maybe_elect_validator_set(block.header.number);
+    }
+
+    /// If `block_number` is a multiple of the chain's
+    /// `epoch_length_blocks`, run a fresh DPoS election against the
+    /// persistent stake table and persist the result under the new
+    /// epoch index. No-op at every non-boundary height.
+    ///
+    /// `block_number == 0` (genesis) is intentionally skipped so the
+    /// genesis validator set isn't overwritten by an empty election.
+    fn maybe_elect_validator_set(&self, block_number: u64) {
+        let epoch_len = self.spec.epoch_length_blocks;
+        if block_number == 0 || epoch_len == 0 || block_number % epoch_len != 0 {
+            return;
+        }
+        let epoch = block_number / epoch_len;
+        let table = self.stake_table();
+        let elected = match elect_active_set(
+            &table,
+            U256::from(self.spec.min_validator_stake_wei),
+            self.spec.validators_per_epoch,
+        ) {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::warn!(error = %e, "elect_active_set failed — skipping epoch");
+                return;
+            }
+        };
+        if let Err(e) = dpos::persist_validator_set(&self.backend, epoch, &elected) {
+            tracing::error!(error = %e, "persist_validator_set failed");
+            return;
+        }
+        tracing::info!(
+            epoch,
+            block = block_number,
+            elected = elected.len(),
+            "DPoS validator set re-elected",
+        );
     }
 
     /// Walk every tx in `block` looking for sub-chain flush-anchor
@@ -578,6 +618,22 @@ impl NodeState {
     /// the offending validator's staked balance — that requires the
     /// DPoS stake table from C.6 / E.3. For now the record itself is
     /// the slashing primitive.
+    /// Optional slash-debit hook. When invoked together with
+    /// [`Self::record_slashing`], this debits the offending
+    /// validator's bond by `slash_amount_wei` (saturating at zero).
+    /// Returns silently if the validator has no stake record (e.g.
+    /// during a testnet where staking isn't wired yet).
+    pub fn debit_slash_stake(&self, offender: &Address, slash_amount_wei: U256) {
+        let table = self.stake_table();
+        if let Ok(Some(_)) = table.get(offender) {
+            if let Err(e) = table.slash(offender, slash_amount_wei) {
+                tracing::error!(error = %e, "slash debit failed");
+            }
+        }
+    }
+
+    /// Append an equivocation record to the slashing index. Idempotent
+    /// on the same `(validator, height, phase)` triple.
     pub fn record_slashing(&self, evidence: &aii_consensus_bft::EquivocationEvidence) {
         use aii_consensus_bft::EquivocationEvidence;
         let (phase_byte, phase_str, hashes) = match evidence {
@@ -705,6 +761,13 @@ impl NodeState {
             .read()
             .ok()
             .and_then(|s| s.by_number.get(&n).copied())
+    }
+
+    /// Test-only sync accessor for the latest persisted validator set.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn async_active_validator_set_test_helper(&self) -> Option<(u64, Vec<ValidatorEntry>)> {
+        latest_validator_set(&self.backend).ok().flatten()
     }
 
     /// Borrow the world-state for embedders who want to read/write accounts
@@ -957,6 +1020,20 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn active_validator_set(&self) -> Option<ActiveValidatorsView> {
+        let (epoch, entries) = latest_validator_set(&self.backend).ok().flatten()?;
+        Some(ActiveValidatorsView {
+            epoch: format!("0x{epoch:x}"),
+            validators: entries
+                .iter()
+                .map(|e| ValidatorEntryView {
+                    address: format!("0x{}", hex::encode(e.address.as_bytes())),
+                    stake_wei: format!("0x{:x}", e.stake_wei),
+                })
+                .collect(),
+        })
     }
 
     async fn stake_at(&self, address: &Address) -> Option<StakeView> {
@@ -1341,6 +1418,59 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn slash_debit_reduces_bonded_stake() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let validator = Address::new([0xa1; 20]);
+        state
+            .stake_table()
+            .bond(&validator, U256::from(1_000u64))
+            .unwrap();
+        state.debit_slash_stake(&validator, U256::from(250u64));
+        let rec = state.stake_table().get(&validator).unwrap().unwrap();
+        assert_eq!(rec.amount_wei, U256::from(750u64));
+    }
+
+    #[test]
+    fn epoch_boundary_block_runs_dpos_election() {
+        let mut spec = ChainSpec::mainnet();
+        // Tiny epoch so the test doesn't need to commit 4 800 blocks.
+        spec.epoch_length_blocks = 3;
+        // Low min stake so test bonds clear it.
+        spec.min_validator_stake_wei = 100;
+        spec.validators_per_epoch = 5;
+        let backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let state = NodeState::new(spec, backend);
+
+        // Stake two addresses, different amounts.
+        let big = Address::new([0xb1; 20]);
+        let small = Address::new([0xb2; 20]);
+        state
+            .stake_table()
+            .bond(&big, U256::from(1_000u64))
+            .unwrap();
+        state
+            .stake_table()
+            .bond(&small, U256::from(200u64))
+            .unwrap();
+
+        // Commit 3 blocks → block 3 triggers an election (height % 3 == 0).
+        let mut parent = H256::ZERO;
+        for n in 1..=3 {
+            let b = fake_block(n, parent);
+            parent = b.hash();
+            state.commit_block(&b);
+        }
+        let latest = state.async_active_validator_set_test_helper();
+        assert!(latest.is_some(), "epoch boundary must record election");
+        let (epoch, entries) = latest.unwrap();
+        assert_eq!(epoch, 1, "block 3 / epoch length 3 → epoch 1");
+        assert_eq!(entries.len(), 2);
+        // Sort order: big stake first.
+        assert_eq!(entries[0].address, big);
+        assert_eq!(entries[1].address, small);
     }
 
     #[test]

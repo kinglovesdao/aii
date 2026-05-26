@@ -194,6 +194,12 @@ pub trait RpcState: Send + Sync + 'static {
     async fn all_stakers(&self) -> Vec<StakeView> {
         Vec::new()
     }
+
+    /// Most recently elected DPoS validator set, with the epoch it
+    /// was elected at. Default returns `None`.
+    async fn active_validator_set(&self) -> Option<ActiveValidatorsView> {
+        None
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -362,6 +368,31 @@ pub trait AiiRpc {
     /// order. Empty array on a fresh chain.
     #[method(name = "listStakers")]
     async fn list_stakers(&self) -> RpcResult<Vec<StakeView>>;
+
+    /// `aii_getActiveValidators` — the most recently elected DPoS
+    /// validator set. Returns `{ epoch, validators: [...] }` with
+    /// every entry hex-encoded. Returns `null` on a chain that has
+    /// not yet crossed its first epoch boundary.
+    #[method(name = "getActiveValidators")]
+    async fn get_active_validators(&self) -> RpcResult<Option<ActiveValidatorsView>>;
+}
+
+/// JSON-RPC view of the elected validator set at one epoch boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveValidatorsView {
+    /// Epoch index this election was recorded at (`0x…` hex).
+    pub epoch: String,
+    /// Elected entries, in protocol sort order (stake desc, addr asc).
+    pub validators: Vec<ValidatorEntryView>,
+}
+
+/// JSON-RPC view of one DPoS validator entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidatorEntryView {
+    /// Validator address (`0x…` hex).
+    pub address: String,
+    /// Bonded stake at election time (`0x…` hex Wei).
+    pub stake_wei: String,
 }
 
 /// JSON-RPC view of a single staking record.
@@ -580,6 +611,10 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn list_stakers(&self) -> RpcResult<Vec<StakeView>> {
         Ok(self.state.all_stakers().await)
+    }
+
+    async fn get_active_validators(&self) -> RpcResult<Option<ActiveValidatorsView>> {
+        Ok(self.state.active_validator_set().await)
     }
 }
 

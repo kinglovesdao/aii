@@ -5,6 +5,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.49] — 2026-05-26
+
+### Added — DPoS validator-set election + slashing debit hook (C.6 + C.7 close-out)
+
+The staking primitive from v0.0.48 is now wired into a live election
+cycle. Every epoch boundary (default 4 800 blocks ≈ 4 h at 3 s/block)
+the node reads its persistent stake table, sorts by `amount_wei` desc
+with address-asc tiebreak, filters records below
+`min_validator_stake_wei`, and persists the top-N as the active
+validator set under `Meta:validator_set:<epoch_be8>`. A new
+`debit_slash_stake` hook on `NodeState` lets the slashing executor
+debit a misbehaving validator's bond — pairing the v0.0.46 evidence
+log with real economic consequence.
+
+#### `aii-config::ChainSpec`
+
+- Two new fields (with `#[serde(default = …)]`):
+  - `epoch_length_blocks: u64` (default 4 800).
+  - `validators_per_epoch: u32` (default 21).
+
+#### `aii-node`
+
+- New module `aii_node::dpos` exporting:
+  - `ValidatorEntry { address, stake_wei }`.
+  - `elect_active_set(table, min_stake, validators_per_epoch)` —
+    deterministic election from a `StakeTable`.
+  - `persist_validator_set / read_validator_set` — fixed-layout
+    encoding on `ColumnFamily::Meta`.
+  - `latest_validator_set` — finds the highest-epoch record by
+    prefix scan.
+  - `LatestEpochSet` type alias for the `(epoch, entries)` payload.
+- `NodeState::commit_block` calls `maybe_elect_validator_set` after
+  every commit; at `block_number % epoch_length_blocks == 0` the
+  election runs and the result lands on disk. Genesis (block 0) is
+  intentionally skipped.
+- `NodeState::debit_slash_stake(offender, amount)` slashes the
+  offender's `StakeTable` record by `amount` (saturating).
+  No-op if the offender has no stake record yet — keeps testnet
+  ergonomics intact.
+- 7 unit tests in `dpos::tests`: empty election; min-stake filter;
+  N-cap; sort-order determinism (stake desc + addr asc); unbonding
+  records excluded; persist/read round-trip; highest-epoch
+  selection.
+- 2 new lib-level tests:
+  `slash_debit_reduces_bonded_stake` and
+  `epoch_boundary_block_runs_dpos_election` (synthesises two
+  stakers, commits 3 blocks against `epoch_length_blocks = 3`,
+  asserts both validators were elected with `big > small` order).
+
+#### `aii-rpc`
+
+- New JSON-RPC method
+  `aii_getActiveValidators() -> Option<ActiveValidatorsView>`.
+- New response types `ActiveValidatorsView { epoch, validators }`
+  and `ValidatorEntryView { address, stake_wei }` (all hex).
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **Consensus engines still use genesis validators.** The election
+  table is recorded but the BFT engine doesn't yet rotate at epoch
+  boundaries — that's the "engine apply-then-hash" refactor that
+  also fixes header state_root.
+- **No reward distribution.** Block subsidy (B.4) goes to the
+  block's beneficiary; it does not yet split pro-rata among the
+  active set. Stake-weighted distribution lands together with the
+  governance contract (E.2).
+- **No automatic slash on equivocation.** The hook
+  `debit_slash_stake` is in place; the BFT gossip loop doesn't yet
+  call it on detected double-signs. Wiring is a one-line change but
+  pairs better with C.4 (encrypted gossip) so we can authenticate
+  the evidence channel first.
+
 ## [0.0.48] — 2026-05-26
 
 ### Added — Staking primitive (roadmap E.3)
