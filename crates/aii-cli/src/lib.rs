@@ -312,6 +312,12 @@ pub async fn run_subchain(
 pub struct SubchainPersistentState {
     /// Sub-chain id (kept here so the JSON file is self-describing).
     pub sub_chain_id: u64,
+    /// Consensus engine the sub-chain runs. `"poa"` (single
+    /// authority) is fully implemented; `"bft"` requires a multi-
+    /// operator validator set and is currently rejected at startup
+    /// pending the engine wire-up.
+    #[serde(default = "default_consensus_label")]
+    pub consensus: String,
     /// Operator secp256k1 secret key, hex (32 bytes).
     pub operator_sk_hex: String,
     /// Last sub-chain block number produced before shutdown.
@@ -325,6 +331,52 @@ pub struct SubchainPersistentState {
     pub flush_count: u64,
 }
 
+fn default_consensus_label() -> String {
+    "poa".to_string()
+}
+
+/// Currently-implemented sub-chain consensus engines.
+///
+/// `Poa` is the only fully-implemented variant; `Bft` is parsed +
+/// persisted but rejected at startup until the engine wire-up lands
+/// in a follow-up release. Keeping the enum here means today's
+/// `state.json` already records the operator's chosen consensus so a
+/// future binary can pick it up without a fresh keygen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubchainConsensus {
+    /// Proof-of-Authority with a single operator. Round-robin authority
+    /// list `[operator]` — every block produced by the operator.
+    Poa,
+    /// VRF-PoS BFT. The operator becomes validator 0 of a single-
+    /// validator set; future releases extend to multi-operator.
+    Bft,
+}
+
+impl SubchainConsensus {
+    /// Parse the on-disk label.
+    ///
+    /// # Errors
+    /// Returns `Err` for any unrecognised label.
+    pub fn parse(s: &str) -> Result<Self, CliError> {
+        match s {
+            "poa" => Ok(Self::Poa),
+            "bft" => Ok(Self::Bft),
+            other => Err(CliError::Client(format!(
+                "unknown sub-chain consensus '{other}' (expected: poa, bft)"
+            ))),
+        }
+    }
+
+    /// Canonical lowercase label used in the on-disk JSON.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Poa => "poa",
+            Self::Bft => "bft",
+        }
+    }
+}
+
 impl SubchainPersistentState {
     /// Build the canonical filename inside `data_dir`.
     fn path(data_dir: &std::path::Path) -> std::path::PathBuf {
@@ -334,9 +386,18 @@ impl SubchainPersistentState {
     /// Bootstrap state for a brand-new sub-chain — generates a fresh
     /// operator key and writes the initial state file.
     ///
+    /// `consensus` records the operator's chosen engine; today only
+    /// `Poa` is fully implemented but the label persists so a future
+    /// binary can honour the original choice without forcing a fresh
+    /// keygen.
+    ///
     /// # Errors
     /// Returns I/O / JSON errors.
-    pub fn create_fresh(sub_chain_id: u64, data_dir: &std::path::Path) -> Result<Self, CliError> {
+    pub fn create_fresh(
+        sub_chain_id: u64,
+        consensus: SubchainConsensus,
+        data_dir: &std::path::Path,
+    ) -> Result<Self, CliError> {
         use aii_crypto::secp::SecretKey;
         use rand::RngCore;
         std::fs::create_dir_all(data_dir)
@@ -353,6 +414,7 @@ impl SubchainPersistentState {
         };
         let st = Self {
             sub_chain_id,
+            consensus: consensus.as_label().to_string(),
             operator_sk_hex: format!("0x{}", hex::encode(sk.to_bytes())),
             head_number: 0,
             head_hash: String::new(),
@@ -361,6 +423,14 @@ impl SubchainPersistentState {
         };
         st.save(data_dir)?;
         Ok(st)
+    }
+
+    /// Decode the on-disk `consensus` label into a typed enum.
+    ///
+    /// # Errors
+    /// Returns `Err` if the label is unknown.
+    pub fn consensus_kind(&self) -> Result<SubchainConsensus, CliError> {
+        SubchainConsensus::parse(&self.consensus)
     }
 
     /// Load the persistent state from `data_dir/state.json`, or
@@ -1014,7 +1084,8 @@ mod tests {
     #[test]
     fn subchain_persistent_state_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let st1 = SubchainPersistentState::create_fresh(42, dir.path()).unwrap();
+        let st1 =
+            SubchainPersistentState::create_fresh(42, SubchainConsensus::Poa, dir.path()).unwrap();
         // Mutate + save.
         let mut st2 = st1.clone();
         st2.head_number = 7;
@@ -1040,6 +1111,29 @@ mod tests {
     fn subchain_persistent_state_load_missing_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(SubchainPersistentState::load(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn subchain_consensus_round_trip_via_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let st =
+            SubchainPersistentState::create_fresh(7, SubchainConsensus::Bft, dir.path()).unwrap();
+        assert_eq!(st.consensus, "bft");
+        let back = SubchainPersistentState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.consensus_kind().unwrap(), SubchainConsensus::Bft);
+    }
+
+    #[test]
+    fn subchain_consensus_rejects_unknown_label() {
+        assert!(SubchainConsensus::parse("foo").is_err());
+        assert_eq!(
+            SubchainConsensus::parse("poa").unwrap(),
+            SubchainConsensus::Poa
+        );
+        assert_eq!(
+            SubchainConsensus::parse("bft").unwrap(),
+            SubchainConsensus::Bft
+        );
     }
 
     #[tokio::test]

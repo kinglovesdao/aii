@@ -5,6 +5,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.53] — 2026-05-26
+
+### Added — Sub-chain consensus selector + persisted label (D.3 primitive)
+
+The persistent state file from v0.0.52 now records *which* consensus
+engine the sub-chain was bootstrapped against. PoA stays fully
+implemented; the new `SubchainConsensus::Bft` variant is parsed +
+persisted today so a future binary can pick the same operator key up
+and run the multi-validator BFT engine against it without forcing a
+fresh keygen.
+
+#### `aii-cli`
+
+- New `SubchainConsensus { Poa, Bft }` enum with `parse(label)` /
+  `as_label()`.
+- `SubchainPersistentState` gains a `consensus: String` field, set
+  via the new `consensus: SubchainConsensus` arg on `create_fresh`.
+  `#[serde(default = …)]` so existing `state.json` files (created
+  before this release) decode unchanged with `consensus = "poa"`.
+- `SubchainPersistentState::consensus_kind()` decodes the on-disk
+  label into the typed enum.
+- 2 new tests cover the round-trip and the unknown-label rejection.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **`Bft` startup still rejected.** The `state.json` already records
+  `consensus = "bft"` correctly, but `run_subchain` itself doesn't
+  yet branch on the kind — it always boots a `PoaEngine`. The
+  follow-up reads the label, dispatches to `BftEngine::advance_single`
+  for a single-validator sub-chain, and adds the multi-validator
+  variant once the gossip protocol is extended to sub-chain epochs.
+- **No DPoS sub-chains.** Validator-set rotation (C.6) applies to
+  the main chain only; sub-chain validator changes wait on the same
+  engine refactor that lands header `state_root`.
+
 ## [0.0.52] — 2026-05-26
 
 ### Added — Sub-chain persistent operator state (roadmap D.1)
