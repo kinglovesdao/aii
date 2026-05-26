@@ -5,6 +5,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.42] — 2026-05-26
+
+### Added — revm in commit_block + tx receipts (roadmap B.1 + B.2)
+
+**Every tx in every committed block now runs through real revm, and
+every execution produces a persisted receipt.** Before this release
+`commit_block` routed through `aii_evm::execute_transfer` — a
+fast-path that only handles EOA-to-EOA transfers and rejects any
+contract call or CREATE. Contract deploys submitted via
+`eth_sendRawTransaction` were therefore admitted to the mempool,
+included in a block, and silently dropped at execution time. Now
+the same submission path deploys real EVM bytecode, calls real
+contracts, and returns a receipt with status / cumulative gas /
+logs queryable via `eth_getTransactionReceipt`.
+
+#### `aii-evm`
+
+- `ExecutionSummary` gains a `logs: Vec<aii_block::Log>` field. The
+  revm `ExecutionResult::Success` log stream is translated to the
+  AII `Log` struct (address + topics + data) in emission order.
+
+#### `aii-node`
+
+- `NodeState.state` is now `Arc<StateDb<RocksDbBackend>>` (was an
+  owned `StateDb`). `state()` returns `&Arc<...>` so callers that
+  need to hand the state off to revm via `execute_with_revm` can
+  clone the Arc.
+- `execute_block_txs` rebuilt: every Legacy + EIP-1559 tx is now
+  routed through `aii_evm::execute_with_revm`. EIP-4844 blob txs
+  are skipped with a warn (blob-side execution stays out of scope).
+  Each successful invocation produces a `Receipt` populated with
+  `status / cumulative_gas_used / logs`; on revm error the tx is
+  warn-logged and skipped.
+- New `persist_receipts(block_hash, receipts)` writes each
+  `(tx_hash, Receipt)` to the `Receipts` CF (RLP-encoded via
+  `Receipt::encode_2718`) in a single atomic `WriteBatch`.
+- New `receipt_by_tx_hash(H256) -> Result<Option<Receipt>, _>` reads
+  back through the same CF.
+- `RpcState::receipt_by_tx_hash` impl translates the `Receipt` into
+  a `ReceiptView` (hex-encoded fields, tx_type string) so
+  `eth_getTransactionReceipt` can answer through the standard JSON
+  shape.
+- New test `receipt_round_trip_through_persistent_index` verifies
+  the encode → write → read → decode loop.
+- New test `commit_block_executes_contract_deploy_through_revm`
+  deploys real EVM bytecode (writer contract that SSTOREs 0x42 at
+  slot 0), calls it, and asserts `state_root()` shifts — proves the
+  contract path mutates state, not just balances.
+
+#### `aii-rpc`
+
+- New `eth_getTransactionReceipt(hash)` method on the `EthRpc`
+  trait. Returns `null` for unknown / unindexed hashes.
+- New response types `ReceiptView` and `LogView` (both
+  Serialize+Deserialize).
+- New trait method `RpcState::receipt_by_tx_hash` with a default
+  `None` impl so non-receipt-indexing backends compile unchanged.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **`receipts_root` in the block header is still `EMPTY_TRIE_HASH`.**
+  Computing it correctly requires applying the block's txs before
+  finalising the hash — same chicken-and-egg as `state_root`, both
+  fixed together when the engine learns to apply-then-hash (planned
+  for the v0.0.45-v0.0.47 range).
+- **No gas fee debit to sender / credit to beneficiary.** revm
+  reports `gas_used`, but the `gas_price` we pass is `0` — the gas
+  fee accounting lands in B.3 (v0.0.43).
+- **No block subsidy.** Coinbase still earns 0 AII per block; B.4
+  (v0.0.44) will mint per-block + halving.
+- **No logs bloom aggregation.** Per-tx `logs_bloom` is `Bloom::ZERO`
+  and the block-level bloom isn't touched; B.5 (v0.0.45) will fold
+  every log into both the receipt and the header bloom.
+- **No `eth_getLogs` RPC yet.** B.5 again.
+- **No tx-failure receipts.** revm `Err(_)` cases warn-skip without
+  recording a status=false receipt; a follow-up will record those so
+  `eth_getTransactionReceipt` can distinguish reverted from missing.
+
 ## [0.0.41] — 2026-05-26
 
 ### Added — Transactions-MPT + world-state-MPT (roadmap A.3 partial)

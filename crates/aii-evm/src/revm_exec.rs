@@ -2,6 +2,7 @@
 //! back into `aii-state::StateDb`.
 
 use crate::{revm_db::RevmDb, ExecError};
+use aii_block::Log;
 use aii_state::{Account, StateDb};
 use aii_storage::KvBackend;
 use aii_types::{Address as AiiAddress, H256 as AiiH256};
@@ -21,6 +22,8 @@ pub struct ExecutionSummary {
     pub output: Vec<u8>,
     /// Contract address for a successful CREATE; `None` otherwise.
     pub deployed_contract: Option<AiiAddress>,
+    /// EVM event logs emitted during execution, in emission order.
+    pub logs: Vec<Log>,
 }
 
 /// Execute a single transaction via `revm` and commit state changes
@@ -101,6 +104,21 @@ pub fn execute_with_revm<B: KvBackend>(
 
     let success = matches!(result, ExecutionResult::Success { .. });
     let gas_used = result.gas_used();
+    let logs: Vec<Log> = match &result {
+        ExecutionResult::Success { logs, .. } => logs
+            .iter()
+            .map(|l| Log {
+                address: AiiAddress::new(l.address.into_array()),
+                topics: l
+                    .topics()
+                    .iter()
+                    .map(|t| AiiH256::new(*t.as_slice().first_chunk::<32>().unwrap()))
+                    .collect(),
+                data: l.data.data.to_vec(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     let (output, deployed) = match result {
         ExecutionResult::Success { output, .. } => match output {
             Output::Call(bytes) => (bytes.to_vec(), None),
@@ -117,6 +135,7 @@ pub fn execute_with_revm<B: KvBackend>(
         gas_used,
         output,
         deployed_contract: deployed,
+        logs,
     })
 }
 

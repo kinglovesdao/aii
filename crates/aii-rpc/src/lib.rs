@@ -154,6 +154,42 @@ pub trait RpcState: Send + Sync + 'static {
     async fn submit_raw_tx(&self, _raw_hex: &str) -> Result<String, SubmitTxError> {
         Err(SubmitTxError::Unsupported)
     }
+
+    /// Look up a transaction's receipt by tx hash. Default returns
+    /// `None`; node impls that index receipts should override.
+    async fn receipt_by_tx_hash(&self, _hash: &str) -> Option<ReceiptView> {
+        None
+    }
+}
+
+/// JSON-RPC-facing view of an [`aii_block::Receipt`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiptView {
+    /// Transaction hash this receipt belongs to (`0x…` hex).
+    pub transaction_hash: String,
+    /// Block number that included the tx (`0x…` hex).
+    pub block_number: String,
+    /// `0x01` if the tx succeeded, `0x00` otherwise.
+    pub status: String,
+    /// Cumulative gas used by this tx + all preceding txs in the block.
+    pub cumulative_gas_used: String,
+    /// 256-byte logs bloom as `0x…` hex.
+    pub logs_bloom: String,
+    /// Tx type string — `"legacy" | "eip1559" | "eip4844"`.
+    pub tx_type: String,
+    /// Emitted logs.
+    pub logs: Vec<LogView>,
+}
+
+/// JSON-RPC-facing view of an [`aii_block::Log`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogView {
+    /// Address that emitted the log (`0x…` hex).
+    pub address: String,
+    /// Indexed topics (`0x…` hex), at most 4.
+    pub topics: Vec<String>,
+    /// Non-indexed event data (`0x…` hex).
+    pub data: String,
 }
 
 /// Errors from `RpcState::submit_raw_tx`.
@@ -212,6 +248,12 @@ pub trait EthRpc {
     /// 32-byte transaction hash as `0x…` hex.
     #[method(name = "sendRawTransaction")]
     async fn send_raw_transaction(&self, raw_hex: String) -> RpcResult<String>;
+
+    /// `eth_getTransactionReceipt(hash)` — receipt for a finalised tx.
+    /// Returns `null` if the tx is unknown, has no receipt on file, or
+    /// was rejected pre-execution.
+    #[method(name = "getTransactionReceipt")]
+    async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<ReceiptView>>;
 }
 
 #[rpc(server, namespace = "aii")]
@@ -298,6 +340,10 @@ impl<S: RpcState> EthRpcServer for EthRpcImpl<S> {
                 None::<()>,
             )),
         }
+    }
+
+    async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<ReceiptView>> {
+        Ok(self.state.receipt_by_tx_hash(&hash).await)
     }
 }
 

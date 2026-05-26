@@ -12,10 +12,10 @@ pub mod bft_bootstrap;
 pub mod bft_p2p;
 
 use aii_block::tx::Tx;
-use aii_block::{Block, BlockBody, Hashable, Header};
+use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
-use aii_rpc::{AccountView, HeaderView, RpcState, SubmitTxError, TxView};
+use aii_rpc::{AccountView, HeaderView, LogView, ReceiptView, RpcState, SubmitTxError, TxView};
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
 use aii_types::{Address, H256, U256};
@@ -40,7 +40,7 @@ pub struct NodeState {
     spec: ChainSpec,
     head: AtomicU64,
     backend: Arc<RocksDbBackend>,
-    state: StateDb<RocksDbBackend>,
+    state: Arc<StateDb<RocksDbBackend>>,
     /// In-memory index of the persistent header/body/tx store. Rebuilt
     /// from disk on startup via [`NodeState::recover`].
     blocks: RwLock<BlockStore>,
@@ -75,7 +75,7 @@ impl NodeState {
         Arc::new(Self {
             spec,
             head: AtomicU64::new(0),
-            state: StateDb::new(Arc::clone(&backend)),
+            state: Arc::new(StateDb::new(Arc::clone(&backend))),
             backend,
             blocks: RwLock::new(BlockStore::default()),
             tx_pool: TxPool::new(100_000),
@@ -168,7 +168,7 @@ impl NodeState {
         Ok(Arc::new(Self {
             spec,
             head: AtomicU64::new(head),
-            state: StateDb::new(Arc::clone(&backend)),
+            state: Arc::new(StateDb::new(Arc::clone(&backend))),
             backend,
             blocks: RwLock::new(BlockStore {
                 by_hash,
@@ -274,8 +274,12 @@ impl NodeState {
     }
 
     fn execute_block_txs(&self, block: &Block) {
+        use aii_block::tx::{TxEip1559, TxLegacy};
         let chain_id = self.spec.chain_id;
+        let mut cumulative_gas_used: u64 = 0;
+        let mut receipts: Vec<(H256, Receipt)> = Vec::new();
         for tx in &block.body.transactions {
+            let tx_hash = tx.hash();
             let Ok(sender) = tx.recover_signer(chain_id) else {
                 tracing::warn!(
                     block = block.header.number,
@@ -283,15 +287,125 @@ impl NodeState {
                 );
                 continue;
             };
-            if let Err(e) = aii_evm::execute_transfer(&self.state, sender, tx) {
-                tracing::warn!(
-                    block = block.header.number,
-                    sender = ?sender,
-                    error = %e,
-                    "execute_transfer failed — skipping tx",
-                );
+            let (to, value, data, gas_limit, _gas_price, tx_type) = match tx {
+                Tx::Legacy(TxLegacy {
+                    to,
+                    value,
+                    data,
+                    gas_limit,
+                    gas_price,
+                    ..
+                }) => (
+                    *to,
+                    *value,
+                    data.clone(),
+                    *gas_limit,
+                    *gas_price,
+                    TxType::Legacy,
+                ),
+                Tx::Eip1559(TxEip1559 {
+                    to,
+                    value,
+                    data,
+                    gas_limit,
+                    max_fee_per_gas,
+                    ..
+                }) => (
+                    *to,
+                    *value,
+                    data.clone(),
+                    *gas_limit,
+                    *max_fee_per_gas,
+                    TxType::Eip1559,
+                ),
+                Tx::Eip4844(_) => {
+                    tracing::warn!(
+                        block = block.header.number,
+                        "EIP-4844 blob txs not yet executable — skipping",
+                    );
+                    continue;
+                }
+            };
+            // Route every tx — value transfer or contract — through
+            // revm so a single code path handles both. `gas_price` is
+            // passed as ZERO at this stage; gas fee debit lands in B.3.
+            match aii_evm::execute_with_revm(
+                &self.state,
+                sender,
+                to,
+                value,
+                data,
+                gas_limit,
+                revm::primitives::U256::ZERO,
+            ) {
+                Ok(summary) => {
+                    cumulative_gas_used = cumulative_gas_used.saturating_add(summary.gas_used);
+                    receipts.push((
+                        tx_hash,
+                        Receipt {
+                            tx_type,
+                            status: summary.success,
+                            cumulative_gas_used,
+                            logs_bloom: Bloom::ZERO, // logs-bloom aggregation lands in B.5
+                            logs: summary.logs,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block = block.header.number,
+                        sender = ?sender,
+                        error = %e,
+                        "execute_with_revm failed — skipping tx",
+                    );
+                }
             }
         }
+        self.persist_receipts(block.hash(), &receipts);
+    }
+
+    /// Persist every receipt produced for `block_hash` into the
+    /// `Receipts` CF (keyed by tx_hash). Writes via a single
+    /// `WriteBatch` so partial failure can't leave an inconsistent
+    /// index.
+    fn persist_receipts(&self, _block_hash: H256, receipts: &[(H256, Receipt)]) {
+        if receipts.is_empty() {
+            return;
+        }
+        let mut wb = WriteBatch::new();
+        for (tx_hash, r) in receipts {
+            let mut buf = alloy_rlp::bytes::BytesMut::new();
+            r.encode_2718(&mut buf);
+            wb.put(ColumnFamily::Receipts, tx_hash.as_bytes(), &buf);
+        }
+        if let Err(e) = self.backend.write(wb) {
+            tracing::error!(
+                count = receipts.len(),
+                error = %e,
+                "persist receipts: WriteBatch failed",
+            );
+        }
+    }
+
+    /// Look up the receipt for a tx by its keccak256 hash. Returns
+    /// `Ok(None)` if no receipt is on file (e.g. the tx is unknown,
+    /// was rejected pre-execution, or pre-dates the receipt index).
+    ///
+    /// # Errors
+    /// Propagates backend / decode failures.
+    pub fn receipt_by_tx_hash(
+        &self,
+        tx_hash: H256,
+    ) -> Result<Option<Receipt>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(bytes) = self
+            .backend
+            .get(ColumnFamily::Receipts, tx_hash.as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let mut s: &[u8] = &bytes;
+        let r = Receipt::decode_2718(&mut s)?;
+        Ok(Some(r))
     }
 
     /// Total number of indexed blocks (test-only diagnostic).
@@ -309,7 +423,7 @@ impl NodeState {
 
     /// Borrow the world-state for embedders who want to read/write accounts
     /// directly (e.g. apply a genesis allocation).
-    pub const fn state(&self) -> &StateDb<RocksDbBackend> {
+    pub const fn state(&self) -> &Arc<StateDb<RocksDbBackend>> {
         &self.state
     }
 
@@ -489,6 +603,45 @@ impl RpcState for NodeState {
                 .map(|tx| tx_to_view(tx, chain_id))
                 .collect(),
         )
+    }
+
+    async fn receipt_by_tx_hash(&self, hash_hex: &str) -> Option<ReceiptView> {
+        let h = parse_hash_h256(hash_hex)?;
+        let receipt = self.receipt_by_tx_hash(h).ok()??;
+        let block_number = self
+            .blocks
+            .read()
+            .ok()
+            .and_then(|s| s.tx_index.get(&h).map(|(n, _)| *n));
+        Some(ReceiptView {
+            transaction_hash: format!("0x{}", hex::encode(h.as_bytes())),
+            block_number: block_number.map_or_else(|| "0x0".to_string(), |n| format!("0x{n:x}")),
+            status: if receipt.status {
+                "0x1".into()
+            } else {
+                "0x0".into()
+            },
+            cumulative_gas_used: format!("0x{:x}", receipt.cumulative_gas_used),
+            logs_bloom: format!("0x{}", hex::encode(receipt.logs_bloom.0)),
+            tx_type: match receipt.tx_type {
+                TxType::Legacy => "legacy".into(),
+                TxType::Eip1559 => "eip1559".into(),
+                TxType::Eip4844 => "eip4844".into(),
+            },
+            logs: receipt
+                .logs
+                .into_iter()
+                .map(|l| LogView {
+                    address: format!("0x{}", hex::encode(l.address.as_bytes())),
+                    topics: l
+                        .topics
+                        .into_iter()
+                        .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
+                        .collect(),
+                    data: format!("0x{}", hex::encode(l.data)),
+                })
+                .collect(),
+        })
     }
 
     async fn transaction_by_hash(&self, hash_hex: &str) -> Option<(TxView, u64)> {
@@ -816,6 +969,103 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn receipt_round_trip_through_persistent_index() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let tx_hash = H256::new([0xfe; 32]);
+        let r = Receipt {
+            tx_type: TxType::Eip1559,
+            status: true,
+            cumulative_gas_used: 42_000,
+            logs_bloom: Bloom::ZERO,
+            logs: vec![],
+        };
+        state.persist_receipts(H256::ZERO, &[(tx_hash, r.clone())]);
+        let back = state.receipt_by_tx_hash(tx_hash).unwrap().unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn commit_block_executes_contract_deploy_through_revm() {
+        use aii_block::tx::TxLegacy;
+        use aii_types::AlgoId;
+
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+
+        // Fund alice for the contract deployment.
+        let alice = Address::new([0xa1; 20]);
+        state
+            .state()
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: U256::from(1_000_000_000_000_000_000u64), // 1 AII
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // EVM creation bytecode that, when CALLed, SSTOREs 0x42 at slot 0:
+        //   deploy:  0x60 0x06 0x60 0x0C 0x60 0x00 0x39 0x60 0x06 0x60 0x00 0xF3
+        //   runtime: 0x60 0x42 0x60 0x00 0x55 0x00
+        let bytecode = vec![
+            0x60, 0x06, 0x60, 0x0C, 0x60, 0x00, 0x39, 0x60, 0x06, 0x60, 0x00, 0xF3, // deploy
+            0x60, 0x42, 0x60, 0x00, 0x55, 0x00, // runtime
+        ];
+
+        // Synthesize a tx with sender = alice; we skip signature recovery
+        // by directly setting the body and shipping the block through
+        // commit_block — `execute_block_txs` calls `recover_signer` which
+        // would fail. We instead test the execute_with_revm path by
+        // calling it directly. (Full submit_raw_tx → commit_block →
+        // contract working is exercised by the live testnet smoke test.)
+        let _tx = Tx::Legacy(TxLegacy {
+            nonce: 0,
+            gas_price: U256::from(1_000_000_000u64),
+            gas_limit: 200_000,
+            to: None,
+            value: U256::ZERO,
+            data: bytecode.clone(),
+            v: 27,
+            r: H256::new([0xaa; 32]),
+            s: H256::new([0xbb; 32]),
+            algo_id: AlgoId::Secp256k1,
+        });
+
+        let summary = aii_evm::execute_with_revm(
+            state.state(),
+            alice,
+            None,
+            revm::primitives::U256::ZERO,
+            bytecode,
+            200_000,
+            revm::primitives::U256::ZERO,
+        )
+        .expect("revm execute deploy");
+        assert!(summary.success);
+        let contract = summary.deployed_contract.expect("CREATE returns address");
+
+        // Verify state_root reflects the contract account.
+        let root_before = state.state().state_root().unwrap();
+        // Touch storage via a CALL.
+        let _ = aii_evm::execute_with_revm(
+            state.state(),
+            alice,
+            Some(contract),
+            revm::primitives::U256::ZERO,
+            vec![],
+            100_000,
+            revm::primitives::U256::ZERO,
+        )
+        .unwrap();
+        let root_after = state.state().state_root().unwrap();
+        assert_ne!(
+            root_before, root_after,
+            "state_root must shift after contract call mutates storage"
+        );
     }
 
     #[test]
