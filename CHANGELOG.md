@@ -5,6 +5,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.48] — 2026-05-26
+
+### Added — Staking primitive (roadmap E.3)
+
+The on-chain staking table is the missing economic foundation for the
+DPoS rotation (C.6) and the on-chain slashing executor (C.7). v0.0.48
+ships the persistent primitive — bond, unbond timer, withdraw, slash,
+total bonded, plus full RPC visibility — without yet wiring it into
+the consensus engine's validator selection. That deliberate split
+makes the next two releases (DPoS + slash-executor) one-line wire-ups
+against an already-tested table rather than a bundled architectural
+shift.
+
+#### `aii-config::ChainSpec`
+
+- Two new fields with `#[serde(default = …)]` (existing genesis JSON
+  decodes unchanged):
+  - `unbonding_period_blocks: u64` (default 100 800 ≈ ~3.5 d at 3 s/block).
+  - `min_validator_stake_wei: u128` (default 100 AII).
+
+#### `aii-node`
+
+- New module `aii_node::staking` exporting:
+  - `StakeRecord { staker, amount_wei, unbond_at }` — fixed 40-byte
+    persistent layout (32-byte U256 ‖ 8-byte unbond height) under
+    `ColumnFamily::Meta` key prefix `b"stake:"`.
+  - `StakeTable` — thin wrapper around `Arc<RocksDbBackend>` exposing
+    `bond / begin_unbond / withdraw / slash / get / list_all /
+    total_bonded`. `bond` accumulates, `begin_unbond` records the
+    unbond height, `withdraw` deletes the record only after the
+    unbond timer elapses, `slash` saturates at zero, `total_bonded`
+    sums every actively bonded record.
+- `NodeState::stake_table()` — cheap accessor returning a fresh
+  `StakeTable` view; the underlying backend Arc is cloned, the table
+  itself is stateless.
+- 8 unit tests covering: round-trip; bond accumulation; unbond timer;
+  premature withdraw rejected; mature withdraw deletes record;
+  saturating slash; full list; total-bonded skipping unbonding records.
+
+#### `aii-rpc`
+
+- Three new JSON-RPC methods:
+  - `aii_getStake(address)` → `StakeView` or `null`.
+  - `aii_totalStake()` → `0x…` hex Wei.
+  - `aii_listStakers()` → `Vec<StakeView>`.
+- New response type `StakeView { address, amount_wei, unbond_at,
+  is_bonded }` — every field hex-encoded.
+- Three new default-`None`/`Empty` trait methods on `RpcState`
+  (`stake_at`, `total_bonded_stake`, `all_stakers`); `NodeState`
+  overrides each by walking the new `StakeTable`.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No automatic balance debit on bond.** `StakeTable::bond` simply
+  records the intent; coupling it to the account's free balance
+  needs a precompile-style tx type (delivered together with the
+  governance call surface, E.2).
+- **DPoS rotation (C.6) doesn't consult the table yet.** Validator
+  set still comes from genesis. The election loop hooks onto
+  `total_bonded` + per-record `amount_wei` in the next release.
+- **Slashing executor (C.7) doesn't call `slash` yet.** The slashing
+  record from v0.0.46 stays observability-only until DPoS lands.
+- **No delegation.** Each record has a single principal `staker`;
+  delegated-stake aggregation (E.3 stretch) is future work.
+
 ## [0.0.47] — 2026-05-26
 
 ### Added — Microchain anchor decoder + RPC (roadmap D.2)

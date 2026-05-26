@@ -27,6 +27,28 @@ pub struct ChainSpec {
     /// Halving period in blocks. Set to `u64::MAX` to disable halving.
     #[serde(default = "default_halving_interval")]
     pub block_reward_halving_interval: u64,
+    /// Number of blocks a staker must wait between `begin_unbond` and
+    /// when their stake actually becomes spendable again. Prevents
+    /// "stake → equivocate → exit before slash" attacks. Default 100,800
+    /// blocks ≈ ~3.5 days at 3 s/block.
+    #[serde(default = "default_unbonding_period")]
+    pub unbonding_period_blocks: u64,
+    /// Minimum stake (Wei) a validator must keep bonded to be eligible
+    /// for the DPoS rotation (C.6). Below this threshold, the staker
+    /// is still tracked in the registry but is filtered out of the
+    /// active validator set at epoch boundaries.
+    #[serde(default = "default_min_validator_stake")]
+    pub min_validator_stake_wei: u128,
+}
+
+const fn default_unbonding_period() -> u64 {
+    100_800
+}
+
+const fn default_min_validator_stake() -> u128 {
+    // 100 AII — low enough for a testnet, gauntlet for a real
+    // mainnet bootstrap.
+    100_000_000_000_000_000_000
 }
 
 const fn default_block_reward() -> u128 {
@@ -84,6 +106,8 @@ pub const AII_MAINNET: ChainSpec = ChainSpec {
     min_base_fee_per_gas: 1_000_000_000,
     block_reward_initial_wei: 2_000_000_000_000_000_000, // 2 AII / block
     block_reward_halving_interval: 42_048_000,           // ~4y at 3s/block
+    unbonding_period_blocks: 100_800,
+    min_validator_stake_wei: 100_000_000_000_000_000_000,
 };
 
 /// Reference AII testnet spec.
@@ -95,6 +119,8 @@ pub const AII_TESTNET: ChainSpec = ChainSpec {
     min_base_fee_per_gas: 100_000_000,
     block_reward_initial_wei: 2_000_000_000_000_000_000,
     block_reward_halving_interval: 42_048_000,
+    unbonding_period_blocks: 100_800,
+    min_validator_stake_wei: 100_000_000_000_000_000_000,
 };
 
 impl ChainSpec {

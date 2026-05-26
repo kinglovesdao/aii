@@ -10,8 +10,10 @@
 
 pub mod bft_bootstrap;
 pub mod bft_p2p;
+pub mod staking;
 pub mod sync;
 
+pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
 
 use aii_block::tx::Tx;
@@ -19,8 +21,8 @@ use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, HeaderView, LogView, ReceiptView, RpcState, SlashView, SubchainAnchorView,
-    SubmitTxError, TxView,
+    AccountView, HeaderView, LogView, ReceiptView, RpcState, SlashView, StakeView,
+    SubchainAnchorView, SubmitTxError, TxView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -717,6 +719,13 @@ impl NodeState {
     pub fn backend(&self) -> Arc<RocksDbBackend> {
         Arc::clone(&self.backend)
     }
+
+    /// Construct a fresh `StakeTable` view bound to this node's
+    /// backend. Cheap — the inner `RocksDbBackend` Arc is shared.
+    #[must_use]
+    pub fn stake_table(&self) -> StakeTable {
+        StakeTable::new(Arc::clone(&self.backend))
+    }
 }
 
 /// `"n:" ‖ number_be8` — key form used in the `Meta` CF for the
@@ -727,6 +736,15 @@ fn number_key(n: u64) -> Vec<u8> {
     k.extend_from_slice(b"n:");
     k.extend_from_slice(&n.to_be_bytes());
     k
+}
+
+fn stake_record_to_view(r: &StakeRecord) -> StakeView {
+    StakeView {
+        address: format!("0x{}", hex::encode(r.staker.as_bytes())),
+        amount_wei: format!("0x{:x}", r.amount_wei),
+        unbond_at: format!("0x{:x}", r.unbond_at),
+        is_bonded: r.is_bonded(),
+    }
 }
 
 fn header_to_view(hash: H256, h: &Header) -> HeaderView {
@@ -939,6 +957,25 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn stake_at(&self, address: &Address) -> Option<StakeView> {
+        let table = self.stake_table();
+        let rec = table.get(address).ok().flatten()?;
+        Some(stake_record_to_view(&rec))
+    }
+
+    async fn total_bonded_stake(&self) -> U256 {
+        self.stake_table().total_bonded().unwrap_or(U256::ZERO)
+    }
+
+    async fn all_stakers(&self) -> Vec<StakeView> {
+        self.stake_table()
+            .list_all()
+            .unwrap_or_default()
+            .iter()
+            .map(stake_record_to_view)
+            .collect()
     }
 
     async fn subchain_anchor(&self, id: u32) -> Option<SubchainAnchorView> {

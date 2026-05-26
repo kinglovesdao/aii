@@ -178,6 +178,22 @@ pub trait RpcState: Send + Sync + 'static {
     async fn subchain_anchor(&self, _id: u32) -> Option<SubchainAnchorView> {
         None
     }
+
+    /// Read one staker's bond + unbond status. Default returns `None`.
+    async fn stake_at(&self, _address: &Address) -> Option<StakeView> {
+        None
+    }
+
+    /// Sum of every currently-bonded stake on the chain in Wei.
+    /// Default returns `U256::ZERO`.
+    async fn total_bonded_stake(&self) -> U256 {
+        U256::ZERO
+    }
+
+    /// List every staking record. Default returns an empty vector.
+    async fn all_stakers(&self) -> Vec<StakeView> {
+        Vec::new()
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -329,6 +345,37 @@ pub trait AiiRpc {
     /// if no anchor has been flushed yet.
     #[method(name = "getSubchainAnchor")]
     async fn get_subchain_anchor(&self, id: u32) -> RpcResult<Option<SubchainAnchorView>>;
+
+    /// `aii_getStake(address)` — staking record for `address` or `null`
+    /// if no bond has ever been recorded. Used by validator dashboards
+    /// + governance UIs.
+    #[method(name = "getStake")]
+    async fn get_stake(&self, address: String) -> RpcResult<Option<StakeView>>;
+
+    /// `aii_totalStake` — sum of every currently-bonded stake on the
+    /// chain. Returned as `0x…` hex (Wei). Denominator for any
+    /// stake-weighted query.
+    #[method(name = "totalStake")]
+    async fn total_stake(&self) -> RpcResult<String>;
+
+    /// `aii_listStakers` — every staker on record, in unspecified
+    /// order. Empty array on a fresh chain.
+    #[method(name = "listStakers")]
+    async fn list_stakers(&self) -> RpcResult<Vec<StakeView>>;
+}
+
+/// JSON-RPC view of a single staking record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StakeView {
+    /// Staker address (`0x…` hex).
+    pub address: String,
+    /// Bonded amount in Wei (`0x…` hex).
+    pub amount_wei: String,
+    /// Block at which the bond becomes withdrawable (`0x…` hex). `0x0`
+    /// means "still actively bonded — no unbond requested yet".
+    pub unbond_at: String,
+    /// `true` while the stake counts toward the elected validator set.
+    pub is_bonded: bool,
 }
 
 /// JSON-RPC view of a sub-chain flush anchor.
@@ -519,6 +566,20 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn get_subchain_anchor(&self, id: u32) -> RpcResult<Option<SubchainAnchorView>> {
         Ok(self.state.subchain_anchor(id).await)
+    }
+
+    async fn get_stake(&self, address: String) -> RpcResult<Option<StakeView>> {
+        let addr = parse_address(&address)?;
+        Ok(self.state.stake_at(&addr).await)
+    }
+
+    async fn total_stake(&self) -> RpcResult<String> {
+        let t = self.state.total_bonded_stake().await;
+        Ok(format!("0x{t:x}"))
+    }
+
+    async fn list_stakers(&self) -> RpcResult<Vec<StakeView>> {
+        Ok(self.state.all_stakers().await)
     }
 }
 
