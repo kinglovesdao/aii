@@ -868,7 +868,7 @@ mod tests {
     use aii_node::NodeState;
 
     async fn spawn_node() -> (String, jsonrpsee::server::ServerHandle) {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state)
             .await
             .unwrap();

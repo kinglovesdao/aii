@@ -5,6 +5,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.40] — 2026-05-26
+
+### Added — Persistent chain state (roadmap A.1 + A.2 bundled)
+
+**A restart now restores the entire chain.** Before this release, every
+node ran on `MemoryBackend` and a restart wiped all account balances,
+every block header, every tx index, and the head counter; the
+`RocksDbBackend` opened against `--data-dir` was allocated but never
+written to. Now `NodeState` is RocksDB-backed end-to-end, and on
+restart `aiid` calls a new `NodeState::recover()` that replays the
+indexed chain off disk before opening RPC.
+
+This unblocks every subsequent roadmap milestone — without persistence
+a "real public chain" couldn't survive an operator deploying a new
+binary.
+
+#### `aii-node`
+
+- `NodeState` now owns `Arc<RocksDbBackend>` and routes `StateDb` to
+  that backend. The struct field type is `StateDb<RocksDbBackend>`
+  (was `StateDb<MemoryBackend>`); the `state()` accessor's return type
+  changes accordingly. Tests that previously called `NodeState::new(spec)`
+  switch to `NodeState::new_for_tests(spec)`, which opens a tempdir-backed
+  RocksDB internally via `RocksDbBackend::open_in_temp`.
+- `NodeState::new(spec, backend)` is the production constructor — the
+  binary path threads the long-lived `Arc<RocksDbBackend>` opened
+  against `--data-dir` straight in.
+- New `NodeState::recover(spec, backend) -> Result<Arc<Self>, _>` — on
+  startup, iterates `ColumnFamily::Headers` to rebuild `(hash → Header)`
+  + `(number → hash)`, iterates `ColumnFamily::Bodies` to rebuild
+  `body_by_hash` + the tx-hash index, and reads `Meta:head_block_number`
+  to restore the head counter. The insertion-order `order` vector is
+  reconstructed by sorting headers by `header.number` ascending, so
+  `aii_recentBlocks` observes the same ordering across restarts.
+- `commit_block` writes Header + Body + per-tx `TxLookup` + a
+  `Meta:n:<be8>` reverse index in a single atomic `WriteBatch` — all
+  ops land together or not at all.
+- `set_head(n)` now also persists `Meta:head_block_number` and
+  `Meta:head_block_hash`. Synchronous accessor `head_block_number_sync`
+  added so startup logging doesn't have to spin up a tokio runtime.
+- New helper `number_key(n: u64) -> Vec<u8>` builds `"n:" ‖ be8` keys
+  for the `Meta` CF — prefix-distinct from the head markers, scan-safe.
+
+#### `aiid` binary
+
+- Replaces the `let _backend = ...` no-op with a real, named
+  `Arc<RocksDbBackend>` threaded into NodeState. On startup, probes
+  `Meta:head_block_number`: if present, calls `NodeState::recover`
+  and logs `recovered_head=N blocks=K`; if absent, calls
+  `NodeState::new(spec, backend)` for a fresh chain.
+
+#### Testing
+
+- New `persistence_round_trip_recovers_state_blocks_and_head` test:
+  opens a `tempdir`-backed RocksDB, writes 5 blocks + an Alice account
+  with a non-trivial `(nonce=7, balance=987654321)`, bumps head to 5,
+  drops every Arc. Reopens the same path, calls `recover`, and asserts
+  the Alice account survived intact, head_counter == 5, all 5 blocks
+  are indexed by both hash and number, and every block's body is
+  present in the cache.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No cold-join block sync yet.** A fresh node still needs the same
+  pre-existing data dir as its peers; nothing yet downloads missing
+  blocks from a remote peer.
+- **No state pruning.** Every block body, header, and tx entry is
+  retained forever. A "snapshot + reset" tool is on the roadmap.
+- **No MPT state trie yet.** `state_root` in the header is still
+  `EMPTY_TRIE_HASH`; persistent flat KV is what survives restart.
+  Trie integration is roadmap A.3.
+- **No fork choice / re-org logic.** Persisted blocks are append-only;
+  if a re-org ever arrives, the current `commit_block` rejects the
+  conflicting hash via the `by_hash.contains_key` short-circuit.
+
 ## [0.0.39] — 2026-05-26
 
 ### Added — Multi-validator BFT body gossip + real tx execution

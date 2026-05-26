@@ -17,26 +17,32 @@ use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{AccountView, HeaderView, RpcState, SubmitTxError, TxView};
 use aii_state::StateDb;
-use aii_storage::MemoryBackend;
+use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
 use aii_types::{Address, H256, U256};
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, Encodable};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Meta-CF key holding the canonical chain head as a big-endian u64.
+const META_KEY_HEAD: &[u8] = b"head_block_number";
+/// Meta-CF key holding the canonical chain head hash (raw 32 bytes).
+const META_KEY_HEAD_HASH: &[u8] = b"head_block_hash";
+
 /// In-process node state.
 ///
-/// Owns a `ChainSpec`, a head-block counter, and an in-memory `StateDb` so
-/// that the RPC layer can answer `eth_getBalance` / `aii_getAccount`
-/// against real state. The persistent RocksDB backend connected by the
-/// `aiid` binary stays separate (it stores blocks; v0.0.11 will route
-/// `StateDb` to it too).
+/// Owns a `ChainSpec`, a head-block counter, a persistent `StateDb`, and a
+/// persistent header/body/tx index — all backed by RocksDB so that a
+/// restart restores the chain head, every block, every tx lookup, and
+/// every account state.
 pub struct NodeState {
     spec: ChainSpec,
     head: AtomicU64,
-    state: StateDb<MemoryBackend>,
-    /// In-memory header store. Persistent RocksDB lands in v0.0.36+.
+    backend: Arc<RocksDbBackend>,
+    state: StateDb<RocksDbBackend>,
+    /// In-memory index of the persistent header/body/tx store. Rebuilt
+    /// from disk on startup via [`NodeState::recover`].
     blocks: RwLock<BlockStore>,
     /// Mempool for incoming signed transactions (v0.0.37).
     tx_pool: TxPool,
@@ -62,16 +68,117 @@ struct BlockStore {
 }
 
 impl NodeState {
-    /// Construct with a starting head of 0 (genesis) and a fresh in-memory
-    /// state database.
-    pub fn new(spec: ChainSpec) -> Arc<Self> {
+    /// Construct a fresh node on top of `backend`. Starting head is 0
+    /// (genesis); no blocks indexed. Use [`NodeState::recover`] when
+    /// reopening an existing data directory.
+    pub fn new(spec: ChainSpec, backend: Arc<RocksDbBackend>) -> Arc<Self> {
         Arc::new(Self {
             spec,
             head: AtomicU64::new(0),
-            state: StateDb::new(Arc::new(MemoryBackend::new())),
+            state: StateDb::new(Arc::clone(&backend)),
+            backend,
             blocks: RwLock::new(BlockStore::default()),
             tx_pool: TxPool::new(100_000),
         })
+    }
+
+    /// Open a temporary RocksDB backend (test-only) and return a fresh
+    /// `NodeState` bound to it. The tempdir is leaked — the OS reaps it
+    /// once the process exits.
+    ///
+    /// # Panics
+    /// Panics if RocksDB cannot open a tempdir (filesystem error).
+    #[must_use]
+    pub fn new_for_tests(spec: ChainSpec) -> Arc<Self> {
+        let backend = Arc::new(
+            RocksDbBackend::open_in_temp().expect("RocksDbBackend::open_in_temp for tests"),
+        );
+        Self::new(spec, backend)
+    }
+
+    /// Reopen a previously-persisted node from `backend`. Reads:
+    /// * `Meta:head_block_number` → restored head counter,
+    /// * every `Headers` entry → `(hash → Header)` + `(number → hash)`,
+    /// * every `Bodies` entry → `body_by_hash` + tx-hash index,
+    /// * `order` is rebuilt by sorting headers by `header.number` so that
+    ///   `recent_headers` returns newest-first across restarts.
+    ///
+    /// State accounts are already on disk and need no replay.
+    ///
+    /// # Errors
+    /// Returns a storage-level error if reading any column family fails
+    /// or if a persisted header/body fails to RLP-decode.
+    pub fn recover(
+        spec: ChainSpec,
+        backend: Arc<RocksDbBackend>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut by_hash: HashMap<H256, Header> = HashMap::new();
+        let mut by_number: HashMap<u64, H256> = HashMap::new();
+        let mut body_by_hash: HashMap<H256, BlockBody> = HashMap::new();
+        let mut tx_index: HashMap<H256, (u64, usize)> = HashMap::new();
+
+        for kv in backend.iter(ColumnFamily::Headers) {
+            let (k, v) = kv?;
+            if k.len() != 32 {
+                continue;
+            }
+            let mut h_arr = [0u8; 32];
+            h_arr.copy_from_slice(&k);
+            let hash = H256::new(h_arr);
+            let mut s: &[u8] = &v;
+            let header = Header::decode(&mut s)?;
+            by_number.insert(header.number, hash);
+            by_hash.insert(hash, header);
+        }
+
+        for kv in backend.iter(ColumnFamily::Bodies) {
+            let (k, v) = kv?;
+            if k.len() != 32 {
+                continue;
+            }
+            let mut h_arr = [0u8; 32];
+            h_arr.copy_from_slice(&k);
+            let hash = H256::new(h_arr);
+            let mut s: &[u8] = &v;
+            let body = BlockBody::decode(&mut s)?;
+            if let Some(header) = by_hash.get(&hash) {
+                for (idx, tx) in body.transactions.iter().enumerate() {
+                    tx_index.insert(tx.hash(), (header.number, idx));
+                }
+            }
+            body_by_hash.insert(hash, body);
+        }
+
+        // Rebuild `order` (insertion-order vec for recent_headers) by
+        // sorting headers by number ascending — same observable order as
+        // the live commit path produces.
+        let mut sorted: Vec<(u64, H256)> = by_number.iter().map(|(n, h)| (*n, *h)).collect();
+        sorted.sort_unstable_by_key(|(n, _)| *n);
+        let order: Vec<H256> = sorted.into_iter().map(|(_, h)| h).collect();
+
+        let head = backend
+            .get(ColumnFamily::Meta, META_KEY_HEAD)?
+            .filter(|b| b.len() == 8)
+            .map_or(0, |b| {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&b);
+                u64::from_be_bytes(arr)
+            });
+
+        Ok(Arc::new(Self {
+            spec,
+            head: AtomicU64::new(head),
+            state: StateDb::new(Arc::clone(&backend)),
+            backend,
+            blocks: RwLock::new(BlockStore {
+                by_hash,
+                by_number,
+                order,
+                body_by_hash,
+                tx_index,
+            }),
+            tx_pool: TxPool::new(100_000),
+        }))
     }
 
     /// Borrow the mempool (for the producer drain loop).
@@ -81,8 +188,22 @@ impl NodeState {
     }
 
     /// Update the head block number — called when a new block is finalised.
+    /// Persists the new head to the `Meta` CF so a restart restores it.
     pub fn set_head(&self, n: u64) {
         self.head.store(n, Ordering::Relaxed);
+        let _ = self
+            .backend
+            .put(ColumnFamily::Meta, META_KEY_HEAD, &n.to_be_bytes());
+        if let Some(hash) = self
+            .blocks
+            .read()
+            .ok()
+            .and_then(|s| s.by_number.get(&n).copied())
+        {
+            let _ = self
+                .backend
+                .put(ColumnFamily::Meta, META_KEY_HEAD_HASH, hash.as_bytes());
+        }
     }
 
     /// Index a finalised block so RPC clients can look it up via
@@ -116,7 +237,40 @@ impl NodeState {
             }
             s.body_by_hash.insert(hash, block.body.clone());
         }
+        self.persist_block(block, hash);
         self.execute_block_txs(block);
+    }
+
+    /// Persist header + body + tx-index entries for `block` to RocksDB in a
+    /// single atomic `WriteBatch`. The block-hash agreement check in
+    /// `commit_block` runs first, so this path only fires for novel blocks.
+    fn persist_block(&self, block: &Block, hash: H256) {
+        let mut header_buf = alloy_rlp::bytes::BytesMut::new();
+        block.header.encode(&mut header_buf);
+        let mut body_buf = alloy_rlp::bytes::BytesMut::new();
+        block.body.encode(&mut body_buf);
+
+        let mut wb = WriteBatch::new();
+        wb.put(ColumnFamily::Headers, hash.as_bytes(), &header_buf);
+        wb.put(ColumnFamily::Bodies, hash.as_bytes(), &body_buf);
+        // `number → hash` reverse map so number-based lookups can be
+        // answered from disk if the in-memory cache evicts (future work).
+        let nk = number_key(block.header.number);
+        wb.put(ColumnFamily::Meta, &nk, hash.as_bytes());
+        // `tx_hash → (block_hash ‖ index_be8)` for `aii_getTransaction`.
+        for (idx, tx) in block.body.transactions.iter().enumerate() {
+            let mut v = Vec::with_capacity(32 + 8);
+            v.extend_from_slice(hash.as_bytes());
+            v.extend_from_slice(&(idx as u64).to_be_bytes());
+            wb.put(ColumnFamily::TxLookup, tx.hash().as_bytes(), &v);
+        }
+        if let Err(e) = self.backend.write(wb) {
+            tracing::error!(
+                number = block.header.number,
+                error = %e,
+                "persist block: WriteBatch failed",
+            );
+        }
     }
 
     fn execute_block_txs(&self, block: &Block) {
@@ -146,11 +300,35 @@ impl NodeState {
         self.blocks.read().map_or(0, |s| s.order.len())
     }
 
+    /// Synchronous read of the head block number — used by startup
+    /// logging where the async trait method would force a runtime.
+    #[must_use]
+    pub fn head_block_number_sync(&self) -> u64 {
+        self.head.load(Ordering::Relaxed)
+    }
+
     /// Borrow the world-state for embedders who want to read/write accounts
     /// directly (e.g. apply a genesis allocation).
-    pub const fn state(&self) -> &StateDb<MemoryBackend> {
+    pub const fn state(&self) -> &StateDb<RocksDbBackend> {
         &self.state
     }
+
+    /// Borrow the underlying backend (used by sub-systems that index
+    /// data in column families outside the `state` keyset).
+    #[must_use]
+    pub fn backend(&self) -> Arc<RocksDbBackend> {
+        Arc::clone(&self.backend)
+    }
+}
+
+/// `"n:" ‖ number_be8` — key form used in the `Meta` CF for the
+/// `number → block_hash` reverse map. Kept tiny and prefix-distinct from
+/// the head markers so the keyspace stays scannable.
+fn number_key(n: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(10);
+    k.extend_from_slice(b"n:");
+    k.extend_from_slice(&n.to_be_bytes());
+    k
 }
 
 fn header_to_view(hash: H256, h: &Header) -> HeaderView {
@@ -394,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_chain_id_query() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
             .await
             .unwrap();
@@ -407,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_advances_on_set_head() {
-        let state = NodeState::new(ChainSpec::testnet());
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
         let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
             .await
             .unwrap();
@@ -432,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn aii_status_reports_correct_network() {
-        let state = NodeState::new(ChainSpec::testnet());
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
         let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
             .await
             .unwrap();
@@ -446,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_balance_via_state_db() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         // Pre-populate Alice's account with 1 AII.
         let alice = Address::new([0xa1; 20]);
         let alice_acc = Account {
@@ -486,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_gas_price_uses_chain_spec_floor() {
-        let state = NodeState::new(ChainSpec::mainnet()); // min_base_fee = 1e9
+        let state = NodeState::new_for_tests(ChainSpec::mainnet()); // min_base_fee = 1e9
         let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
             .await
             .unwrap();
@@ -527,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_block_lookup_by_number_returns_header() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let block = fake_block(1, H256::ZERO);
         state.commit_block(&block);
         assert_eq!(state.block_count(), 1);
@@ -541,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_block_lookup_by_hash_returns_header() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let block = fake_block(42, H256::ZERO);
         let block_hash = block.hash();
         state.commit_block(&block);
@@ -552,7 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_unknown_block_returns_none() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         assert!(state.header_by_number(99).await.is_none());
         assert!(state
             .header_by_hash("0x0000000000000000000000000000000000000000000000000000000000000000")
@@ -562,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn recent_headers_returns_newest_first_and_caps_at_limit() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let mut parent = H256::ZERO;
         for n in 1..=5 {
             let b = fake_block(n, parent);
@@ -579,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn aii_get_block_header_rpc_by_number() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let b = fake_block(7, H256::ZERO);
         state.commit_block(&b);
         let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
@@ -598,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn aii_get_block_header_rpc_by_hash() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let b = fake_block(7, H256::ZERO);
         let h = b.hash();
         state.commit_block(&b);
@@ -618,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn aii_recent_blocks_rpc_caps_and_orders() {
-        let state = NodeState::new(ChainSpec::mainnet());
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let mut parent = H256::ZERO;
         for n in 1..=10 {
             let b = fake_block(n, parent);
@@ -638,5 +816,69 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn persistence_round_trip_recovers_state_blocks_and_head() {
+        use aii_storage::RocksDbBackend;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Phase A: open a fresh data dir, write state + commit blocks,
+        // bump head, then drop everything (simulating shutdown).
+        let alice = Address::new([0xa1; 20]);
+        let alice_acc = Account {
+            nonce: 7,
+            balance: U256::from(987_654_321u64),
+            ..Account::EMPTY
+        };
+        let mut block_hashes: Vec<H256> = Vec::new();
+        {
+            let backend = Arc::new(RocksDbBackend::open(&path).unwrap());
+            let state = NodeState::new(ChainSpec::mainnet(), backend);
+            state.state().set_account(&alice, &alice_acc).unwrap();
+            let mut parent = H256::ZERO;
+            for n in 1..=5 {
+                let b = fake_block(n, parent);
+                parent = b.hash();
+                block_hashes.push(parent);
+                state.commit_block(&b);
+            }
+            state.set_head(5);
+            // state, backend Arcs dropped at end of scope.
+        }
+
+        // Phase B: reopen, recover, verify everything came back.
+        let backend = Arc::new(RocksDbBackend::open(&path).unwrap());
+        let state = NodeState::recover(ChainSpec::mainnet(), backend).unwrap();
+
+        // Account survived.
+        let after = state.state().account(&alice).unwrap().unwrap();
+        assert_eq!(after, alice_acc, "account state must survive restart");
+
+        // Head counter restored.
+        assert_eq!(state.head_block_number_sync(), 5, "head counter restored");
+
+        // All 5 blocks recovered, each indexed by hash + number.
+        assert_eq!(state.block_count(), 5);
+        for (i, h) in block_hashes.iter().enumerate() {
+            let n = (i + 1) as u64;
+            let by_n = state.blocks.read().unwrap().by_number.get(&n).copied();
+            assert_eq!(
+                by_n,
+                Some(*h),
+                "number → hash map must restore for block {n}"
+            );
+            assert!(
+                state.blocks.read().unwrap().by_hash.contains_key(h),
+                "hash → header map must restore for block {n}"
+            );
+            assert!(
+                state.blocks.read().unwrap().body_by_hash.contains_key(h),
+                "body must restore for block {n}"
+            );
+        }
     }
 }

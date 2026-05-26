@@ -7,7 +7,7 @@ use aii_consensus_iface::ConsensusKind;
 use aii_consensus_poa::{PoaConfig, PoaEngine};
 use aii_node::bft_p2p::TcpBftTransport;
 use aii_node::{bft_bootstrap, NodeState};
-use aii_storage::RocksDbBackend;
+use aii_storage::{KvBackend, RocksDbBackend};
 use aii_types::{Address, H256, U256};
 use clap::Parser;
 use std::net::SocketAddr;
@@ -200,9 +200,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     std::fs::create_dir_all(&cli.data_dir)?;
-    let _backend: Arc<RocksDbBackend> = Arc::new(RocksDbBackend::open(&cli.data_dir)?);
+    let backend: Arc<RocksDbBackend> = Arc::new(RocksDbBackend::open(&cli.data_dir)?);
 
-    let node_state = NodeState::new(spec.clone());
+    // If the data dir already has a head marker, replay the indexed
+    // chain off disk; otherwise stand up a fresh in-memory cache on
+    // top of the (possibly empty) backend.
+    let has_existing = backend
+        .get(aii_storage::ColumnFamily::Meta, b"head_block_number")?
+        .is_some();
+    let node_state = if has_existing {
+        let s = NodeState::recover(spec.clone(), Arc::clone(&backend))?;
+        tracing::info!(
+            recovered_head = s.head_block_number_sync(),
+            blocks = s.block_count(),
+            "recovered persisted chain from data_dir",
+        );
+        s
+    } else {
+        NodeState::new(spec.clone(), Arc::clone(&backend))
+    };
 
     // Production path: real BFT engine driven by genesis + keystore.
     let producer_handle = if cli.bft {
