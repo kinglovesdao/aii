@@ -15,8 +15,10 @@
 #![warn(missing_docs)]
 
 pub mod discovery;
+pub mod kademlia;
 pub mod noise;
 
+pub use kademlia::{xor_distance, KademliaTable, PeerEntry, BUCKETS, K};
 pub use noise::{handshake_initiator, handshake_responder, EncryptedSession, NoiseError};
 
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};

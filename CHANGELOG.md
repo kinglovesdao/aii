@@ -5,6 +5,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.56] — 2026-05-26
+
+### Added — Kademlia routing-table primitive (C.3 partial)
+
+Devp2p Discovery v4 has been live since v0.0.17 (`Ping` / `Pong` over
+signed UDP), but the routing layer that turns "I just heard from
+peer X" into "where do I send `FindNode` next?" was missing.
+v0.0.56 ships the Kademlia primitive: 256 k-buckets keyed by leading-
+zero count of the XOR distance, K=16 entries per bucket, LRS
+eviction, and `find_closest(target, n)` over the full table.
+
+Plugging the table onto an actual `FindNode` / `Neighbours` UDP loop
+is the next chore — this release is the data-structure primitive so
+that wiring is a pure swap-in.
+
+#### `aii-net-p2p`
+
+- New module `aii_net_p2p::kademlia` exporting:
+  - `PeerEntry { node_id, payload }` — opaque payload lets callers
+    stash the full `Endpoint` without coupling the table to one
+    transport.
+  - `KademliaTable::new(local_id) / len / is_empty / bucket_index /
+    insert / find_closest`.
+  - Free function `xor_distance(a, b) -> [u8; 32]`.
+  - Constants `K = 16`, `BUCKETS = 256`.
+- 8 unit tests cover empty / insert / self-ignored / bucket-index
+  math / refresh order / closest sort / N-cap / LRS eviction.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No `FindNode` / `Neighbours` packet types yet.** Devp2p packet
+  types 0x03 / 0x04 are unparsed. Once they're added to the
+  `discovery` module, the only further plumbing is calling
+  `KademliaTable::insert` on every received `Pong` / `Neighbours`
+  entry and `find_closest` for outgoing `FindNode` targets.
+- **No libp2p stack.** This is still the devp2p / Discovery v4 line.
+  A future release may swap to libp2p + Kademlia DHT proper — the
+  table layout (256 buckets, K=16) maps 1:1 so the swap is local
+  to one crate.
+- **Identity binding stays via secp256k1.** Static x25519 (Noise)
+  keys are session-only — node identity is the keccak256 of the
+  secp256k1 public key, same as devp2p mainline.
+
 ## [0.0.55] — 2026-05-26
 
 ### Added — Noise XX encrypted transport primitive (C.4)
