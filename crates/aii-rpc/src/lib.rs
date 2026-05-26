@@ -166,6 +166,12 @@ pub trait RpcState: Send + Sync + 'static {
     async fn raw_block(&self, _query: &str) -> Option<String> {
         None
     }
+
+    /// List every persisted slashing record. Default returns an empty
+    /// vector; node impls that index slashings override.
+    async fn slashings(&self) -> Vec<SlashView> {
+        Vec::new()
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -305,6 +311,25 @@ pub trait AiiRpc {
     /// shipped through their typed views. Returns `null` if unknown.
     #[method(name = "getRawBlock")]
     async fn get_raw_block(&self, query: String) -> RpcResult<Option<String>>;
+
+    /// `aii_listSlashings` — every persisted slashing record on this
+    /// node. Operational tooling uses this to spot equivocating
+    /// validators across history. Empty array = no slashings yet.
+    #[method(name = "listSlashings")]
+    async fn list_slashings(&self) -> RpcResult<Vec<SlashView>>;
+}
+
+/// JSON-RPC view of a slashing record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlashView {
+    /// Validator index that signed both conflicting votes.
+    pub validator_index: u32,
+    /// Block height of the equivocation (`0x…` hex).
+    pub height: String,
+    /// BFT phase: `"prevote"` or `"precommit"`.
+    pub phase: String,
+    /// Two conflicting block hashes (`0x…` hex), in canonical sort order.
+    pub block_hashes: [String; 2],
 }
 
 /// Response shape for `aii_getTransaction`.
@@ -463,6 +488,10 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn get_raw_block(&self, query: String) -> RpcResult<Option<String>> {
         Ok(self.state.raw_block(&query).await)
+    }
+
+    async fn list_slashings(&self) -> RpcResult<Vec<SlashView>> {
+        Ok(self.state.slashings().await)
     }
 }
 

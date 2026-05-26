@@ -5,6 +5,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.46] — 2026-05-26
+
+### Added — Slashing record persistence + RPC (roadmap C.7 partial)
+
+The BFT equivocation detector has produced `EquivocationEvidence`
+since v0.0.27, but nothing on the node side stored or exposed it —
+catching a misbehaving validator left no auditable trail. v0.0.46
+closes that observability gap: `NodeState::record_slashing(evidence)`
+persists each equivocation as a stable `Meta`-CF entry, queryable
+through the new `aii_listSlashings` JSON-RPC method. The stake-debit
+side of slashing waits for DPoS (C.6 / E.3) to land first.
+
+#### `aii-node`
+
+- New `SlashRecord { validator_index, height, phase, block_hashes }`
+  public struct.
+- New `NodeState::record_slashing(&EquivocationEvidence)` — folds
+  prevote/precommit equivocation into a stable CF-key layout
+  `b"slash:" ‖ vidx_be4 ‖ height_be8 ‖ phase_byte` so the same
+  `(validator, height, phase)` overwrites idempotently. Value is
+  `phase_str_len ‖ phase_str ‖ block_hash0 ‖ block_hash1`.
+- New `NodeState::list_slashings()` prefix-scans the `Meta` CF and
+  decodes every record. O(slashings); typical chain has zero.
+- `RpcState::slashings` default impl returns `Vec::new()`; NodeState
+  overrides to hex-encode every `SlashRecord` into a `SlashView`.
+- New test `slashing_record_persists_and_lists` synthesises two
+  conflicting BLS-signed prevotes under the same validator key
+  (different block hashes → real equivocation), records via
+  `record_slashing`, asserts the persisted record round-trips with
+  every field intact.
+
+#### `aii-rpc`
+
+- New JSON-RPC method `aii_listSlashings(): Vec<SlashView>`.
+- New response type `SlashView { validator_index, height, phase,
+  block_hashes }` — all `0x…` hex-encoded so explorer integrations
+  are trivial.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **Slashing isn't auto-triggered yet.** `record_slashing` is a
+  public manual API on NodeState; the BFT gossip loop doesn't
+  currently call it on every equivocation. Wiring the auto-record
+  is a one-line follow-up but pairs cleanly with the actual
+  stake-debit logic — both land together when DPoS arrives.
+- **No stake debit on slash.** Future-DPoS work will reach into the
+  staking table and slash the offending validator's bond; today's
+  record is observability only.
+- **No on-chain slashing tx broadcast.** The evidence stays local to
+  the node that detected it. Cross-node propagation needs a P2P
+  message type added to the BFT transport.
+
 ## [0.0.45] — 2026-05-26
 
 ### Added — PoA seals + encrypted byte-payload keystore (roadmap C.5 + C.8)

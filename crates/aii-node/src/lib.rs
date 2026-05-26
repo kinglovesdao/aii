@@ -18,7 +18,9 @@ use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
-use aii_rpc::{AccountView, HeaderView, LogView, ReceiptView, RpcState, SubmitTxError, TxView};
+use aii_rpc::{
+    AccountView, HeaderView, LogView, ReceiptView, RpcState, SlashView, SubmitTxError, TxView,
+};
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
 use aii_types::{Address, H256, U256};
@@ -32,6 +34,26 @@ use std::sync::{Arc, RwLock};
 const META_KEY_HEAD: &[u8] = b"head_block_number";
 /// Meta-CF key holding the canonical chain head hash (raw 32 bytes).
 const META_KEY_HEAD_HASH: &[u8] = b"head_block_hash";
+/// Meta-CF key prefix for persisted slashing records.
+/// Layout: `b"slash:" ‖ validator_index_be4 ‖ height_be8 ‖ phase_byte`.
+/// `phase_byte` is `0` for prevote, `1` for precommit. Yields one entry
+/// per slashed `(validator, height, phase)` triple, listable by prefix.
+const META_KEY_SLASH_PREFIX: &[u8] = b"slash:";
+
+/// Persistent slashing record. Built by `NodeState::record_slashing` from
+/// an `aii_consensus_bft::EquivocationEvidence`; queryable via the new
+/// `aii_listSlashings` RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashRecord {
+    /// Validator index that signed both conflicting votes.
+    pub validator_index: u32,
+    /// Height where the equivocation occurred.
+    pub height: u64,
+    /// BFT phase: `"prevote"` or `"precommit"`.
+    pub phase: &'static str,
+    /// Both conflicting block hashes — the smoking gun.
+    pub block_hashes: [H256; 2],
+}
 
 /// In-process node state.
 ///
@@ -445,6 +467,98 @@ impl NodeState {
         }
     }
 
+    /// Persist a slashing record produced by the BFT equivocation
+    /// detector. The record is stored under
+    /// `Meta:slash:<vidx>:<height>:<phase>`; duplicate records for
+    /// the same `(validator, height, phase)` triple overwrite (idempotent).
+    ///
+    /// Future releases will, in addition to recording the slash, debit
+    /// the offending validator's staked balance — that requires the
+    /// DPoS stake table from C.6 / E.3. For now the record itself is
+    /// the slashing primitive.
+    pub fn record_slashing(&self, evidence: &aii_consensus_bft::EquivocationEvidence) {
+        use aii_consensus_bft::EquivocationEvidence;
+        let (phase_byte, phase_str, hashes) = match evidence {
+            EquivocationEvidence::Prevote { conflicting } => (
+                0u8,
+                "prevote",
+                [conflicting[0].block_hash, conflicting[1].block_hash],
+            ),
+            EquivocationEvidence::Precommit { conflicting } => (
+                1u8,
+                "precommit",
+                [conflicting[0].block_hash, conflicting[1].block_hash],
+            ),
+        };
+        let mut key = Vec::with_capacity(META_KEY_SLASH_PREFIX.len() + 4 + 8 + 1);
+        key.extend_from_slice(META_KEY_SLASH_PREFIX);
+        key.extend_from_slice(&evidence.validator_index().to_be_bytes());
+        key.extend_from_slice(&evidence.height().to_be_bytes());
+        key.push(phase_byte);
+
+        // Value: `phase_str_len_be1 ‖ phase_str ‖ hash0[32] ‖ hash1[32]`.
+        let mut val = Vec::with_capacity(1 + phase_str.len() + 64);
+        val.push(phase_str.len() as u8);
+        val.extend_from_slice(phase_str.as_bytes());
+        val.extend_from_slice(hashes[0].as_bytes());
+        val.extend_from_slice(hashes[1].as_bytes());
+        if let Err(e) = self.backend.put(ColumnFamily::Meta, &key, &val) {
+            tracing::error!(error = %e, "record_slashing: write failed");
+        }
+    }
+
+    /// Return every persisted slashing record across the whole chain.
+    /// Used by `aii_listSlashings` RPC and ops tooling.
+    ///
+    /// # Errors
+    /// Propagates backend errors during the prefix scan.
+    pub fn list_slashings(
+        &self,
+    ) -> Result<Vec<SlashRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for kv in self
+            .backend
+            .iter_prefix(ColumnFamily::Meta, META_KEY_SLASH_PREFIX)
+        {
+            let (k, v) = kv?;
+            let suffix = &k[META_KEY_SLASH_PREFIX.len()..];
+            if suffix.len() != 4 + 8 + 1 {
+                continue;
+            }
+            let mut vidx_arr = [0u8; 4];
+            vidx_arr.copy_from_slice(&suffix[..4]);
+            let validator_index = u32::from_be_bytes(vidx_arr);
+            let mut h_arr = [0u8; 8];
+            h_arr.copy_from_slice(&suffix[4..12]);
+            let height = u64::from_be_bytes(h_arr);
+            let phase_byte = suffix[12];
+            let phase = if phase_byte == 0 {
+                "prevote"
+            } else {
+                "precommit"
+            };
+            if v.len() < 1 + 64 {
+                continue;
+            }
+            let plen = v[0] as usize;
+            if v.len() < 1 + plen + 64 {
+                continue;
+            }
+            let hash_bytes = &v[1 + plen..];
+            let mut h0 = [0u8; 32];
+            let mut h1 = [0u8; 32];
+            h0.copy_from_slice(&hash_bytes[..32]);
+            h1.copy_from_slice(&hash_bytes[32..64]);
+            out.push(SlashRecord {
+                validator_index,
+                height,
+                phase,
+                block_hashes: [H256::new(h0), H256::new(h1)],
+            });
+        }
+        Ok(out)
+    }
+
     /// Look up the receipt for a tx by its keccak256 hash. Returns
     /// `Ok(None)` if no receipt is on file (e.g. the tx is unknown,
     /// was rejected pre-execution, or pre-dates the receipt index).
@@ -725,6 +839,23 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn slashings(&self) -> Vec<SlashView> {
+        self.list_slashings()
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| SlashView {
+                validator_index: r.validator_index,
+                height: format!("0x{:x}", r.height),
+                phase: r.phase.to_string(),
+                block_hashes: [
+                    format!("0x{}", hex::encode(r.block_hashes[0].as_bytes())),
+                    format!("0x{}", hex::encode(r.block_hashes[1].as_bytes())),
+                ],
+            })
+            .collect()
     }
 
     async fn raw_block(&self, query: &str) -> Option<String> {
@@ -1061,6 +1192,30 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn slashing_record_persists_and_lists() {
+        use aii_consensus_bft::EquivocationEvidence;
+        use aii_consensus_bft::PrevoteVote;
+        use aii_crypto::bls::SecretKey;
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        // Build two conflicting PRE-VOTES at the same (height, round).
+        // Both signed by the same validator; different block_hash → equivocation.
+        let sk = SecretKey::from_ikm(&[0xab; 32], b"aii-validator-test").expect("bls keygen");
+        let vote_a = PrevoteVote::sign(&sk, H256::new([0x11; 32]), 42, 0, 7);
+        let vote_b = PrevoteVote::sign(&sk, H256::new([0x22; 32]), 42, 0, 7);
+        let evidence = EquivocationEvidence::Prevote {
+            conflicting: [vote_a, vote_b],
+        };
+        state.record_slashing(&evidence);
+        let listed = state.list_slashings().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].validator_index, 7);
+        assert_eq!(listed[0].height, 42);
+        assert_eq!(listed[0].phase, "prevote");
+        assert_eq!(listed[0].block_hashes[0], H256::new([0x11; 32]));
+        assert_eq!(listed[0].block_hashes[1], H256::new([0x22; 32]));
     }
 
     #[test]
