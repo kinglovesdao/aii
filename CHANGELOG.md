@@ -5,6 +5,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.45] — 2026-05-26
+
+### Added — PoA seals + encrypted byte-payload keystore (roadmap C.5 + C.8)
+
+**Two operational hardenings for the v0.0.45 release window.**
+Before this release, a PoA node only checked that the proposer
+*address* matched the slot rota — peers had no cryptographic
+evidence that the elected authority actually produced the block; a
+malicious operator could forge blocks "as if" from another authority
+since address attribution was implicit. And validator BLS+VRF secrets
+sat on disk as plaintext JSON, ready to leak through any backup-tarball
+or shell-history mishap.
+
+#### `aii-consensus-poa`
+
+- `PoaConfig` gains `signer_sk: Option<aii_crypto::secp::SecretKey>`.
+  When set, every produced block can be signed via the new
+  `produce_block_signed() -> (hash, number, block, Option<PoaSeal>)`
+  method. `PoaSeal` is a re-export of `aii_crypto::secp::Signature`
+  (65-byte `r ‖ s ‖ v` Ethereum-style).
+- New free function
+  `verify_poa_seal(block_hash, sig, authorities, height) -> Result<bool>`
+  recovers the signer address from the seal and compares it to
+  `authorities[height % len]`. Any other authority — or any
+  un-elected signer — fails the check.
+- Seal is shipped out-of-band (alongside the block body via a future
+  P2P sidecar), not embedded in `extra_data`. This keeps the canonical
+  Ethereum-compatible header layout intact, so block hashes don't drift.
+- New `PoaError::SealSignFailed` for the corrupt-key edge case.
+- New tests:
+  `produce_block_signed_returns_recoverable_seal`,
+  `verify_poa_seal_rejects_wrong_authority` (an impostor block fails
+  verification against the legit authority list).
+
+#### `aii-wallet`
+
+- New `EncryptedBytes` API: same scrypt + AES-128-CTR + Keccak-MAC
+  recipe as the Web3-v3 wallet keystore, but for *arbitrary-length*
+  payloads. Designed to wrap a `ValidatorKeystore`'s full JSON blob
+  (BLS secret + VRF secret = 96 bytes plus pubkey hex), which the
+  wallet-only `EncryptedKeystore` rejects (it's hard-coded to a
+  32-byte ciphertext).
+- `Crypto / KdfParams / CipherParams` are now `pub` so callers can
+  inspect raw fields (e.g. for migration tooling); normal usage is
+  `EncryptedBytes::encrypt(payload, password, params, label).to_json()`
+  and never touches them directly.
+- New tests: `encrypted_bytes_roundtrips_arbitrary_payload`,
+  `encrypted_bytes_wrong_password_fails_mac`,
+  `encrypted_bytes_json_round_trip`.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **PoA seal isn't wired into the binary or BlockStore yet.** The
+  primitive is in place; `aiid` still constructs `PoaConfig` with
+  `signer_sk: None` and doesn't ship seals over the wire. A future
+  release adds the sidecar protocol + the verifier hook in
+  `commit_block`.
+- **The CLI doesn't yet offer `aii validator keygen --encrypted`.**
+  The `EncryptedBytes` primitive is publicly importable, so an
+  external tool can already encrypt a generated keystore — the CLI
+  flag is a v0.0.46+ chore.
+- **No on-disk migration of existing plaintext keystores.** Operators
+  running v0.0.40-v0.0.44 testnets still have plaintext JSON; an
+  `aii validator encrypt-keystore --in plain.json --out enc.json`
+  command lands later.
+
 ## [0.0.44] — 2026-05-26
 
 ### Added — Cold-join block sync (roadmap C.1)

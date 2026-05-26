@@ -214,6 +214,7 @@ pub async fn run_subchain(
         slot_seconds,
         gas_limit: 30_000_000,
         base_fee_per_gas: U256::from(1_000_000_000u64),
+        signer_sk: None,
     };
     let engine =
         PoaEngine::new(cfg, &genesis).map_err(|e| CliError::Client(format!("poa engine: {e}")))?;

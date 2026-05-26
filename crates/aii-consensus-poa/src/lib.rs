@@ -35,10 +35,13 @@ pub enum PoaError {
     /// Block number would overflow `u64`.
     #[error("block number overflow")]
     Overflow,
+    /// secp256k1 signing failed (corrupt key, etc.).
+    #[error("PoA seal sign failed")]
+    SealSignFailed,
 }
 
 /// Configuration for a [`PoaEngine`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PoaConfig {
     /// Ordered authority list. Position determines round-robin slot.
     pub authorities: Vec<Address>,
@@ -51,6 +54,45 @@ pub struct PoaConfig {
     pub gas_limit: u64,
     /// EIP-1559 base fee.
     pub base_fee_per_gas: U256,
+    /// Optional secp256k1 signer. When `Some`, every produced block
+    /// is signed via [`produce_block`](PoaEngine::produce_block_signed)
+    /// and the signature can be verified by any peer using
+    /// [`verify_poa_seal`]. When `None`, blocks are produced without a
+    /// seal — used by tests and by non-authority observers that only
+    /// run the engine to compute next-slot predictions.
+    pub signer_sk: Option<aii_crypto::secp::SecretKey>,
+}
+
+/// A 65-byte recoverable secp256k1 PoA seal signature over `block.hash()`.
+///
+/// Sealed blocks ship the signature out-of-band (alongside the block
+/// body) rather than embedding it in `extra_data`; this keeps the
+/// canonical Ethereum-compatible block layout intact. Verifiers pass
+/// the sig + the block hash into [`verify_poa_seal`].
+pub type PoaSeal = aii_crypto::secp::Signature;
+
+/// Verify a PoA seal signature against the expected authority for `height`.
+///
+/// Returns `Ok(true)` iff:
+/// 1. `sig` was produced over `block_hash`,
+/// 2. the recovered signer's Ethereum address equals
+///    `authorities[height % authorities.len()]`.
+///
+/// # Errors
+/// Propagates [`aii_crypto::CryptoError`] from the underlying
+/// signature recovery (malformed sig bytes, etc.).
+pub fn verify_poa_seal(
+    block_hash: &H256,
+    sig: &PoaSeal,
+    authorities: &[Address],
+    height: u64,
+) -> Result<bool, aii_crypto::CryptoError> {
+    if authorities.is_empty() {
+        return Ok(false);
+    }
+    let recovered = aii_crypto::secp::recover(sig, block_hash)?;
+    let expected = authorities[(height as usize) % authorities.len()];
+    Ok(recovered.address() == expected)
 }
 
 /// PoA consensus engine.
@@ -166,6 +208,26 @@ impl PoaEngine {
         g.head_timestamp = new_timestamp;
         Ok((hash, new_number, block))
     }
+
+    /// Produce the next block and additionally sign its hash with the
+    /// configured PoA signer key. Returns the signature alongside the
+    /// usual `(hash, number, block)` tuple. Returns `None` for the
+    /// sig when no signer is configured.
+    ///
+    /// # Errors
+    /// Returns [`PoaError::Overflow`] if the height counter would wrap,
+    /// or [`PoaError::SealSignFailed`] if signing fails (only possible
+    /// with a corrupt key).
+    pub fn produce_block_signed(&self) -> Result<(H256, u64, Block, Option<PoaSeal>), PoaError> {
+        let (hash, number, block) = self.produce_block()?;
+        let sig = match &self.config.signer_sk {
+            Some(sk) => {
+                Some(aii_crypto::secp::sign(sk, &hash).map_err(|_| PoaError::SealSignFailed)?)
+            }
+            None => None,
+        };
+        Ok((hash, number, block, sig))
+    }
 }
 
 impl Engine for PoaEngine {
@@ -243,6 +305,7 @@ mod tests {
             slot_seconds: 2,
             gas_limit: 30_000_000,
             base_fee_per_gas: U256::from(1_000_000_000u64),
+            signer_sk: None,
         }
     }
 
@@ -323,5 +386,47 @@ mod tests {
         let a = Address::new([0xa1; 20]);
         let e = PoaEngine::new(cfg(vec![a], a), &genesis()).unwrap();
         assert_eq!(Engine::coinbase(&e), Some(a));
+    }
+
+    #[test]
+    fn produce_block_signed_returns_recoverable_seal() {
+        use rand::RngCore;
+        let mut sk_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut sk_bytes);
+        let sk = aii_crypto::secp::SecretKey::from_bytes(&sk_bytes).unwrap();
+        let pk = sk.public_key();
+        let signer_addr = pk.address();
+        let mut c = cfg(vec![signer_addr], signer_addr);
+        c.signer_sk = Some(sk);
+        let e = PoaEngine::new(c, &genesis()).unwrap();
+        let (hash, height, _block, sig) = e.produce_block_signed().unwrap();
+        let sig = sig.expect("signer_sk set, sig must be present");
+        // Verify roundtrip.
+        let ok = verify_poa_seal(&hash, &sig, &[signer_addr], height).unwrap();
+        assert!(ok, "PoA seal must verify against the producer's authority");
+    }
+
+    #[test]
+    fn verify_poa_seal_rejects_wrong_authority() {
+        use rand::RngCore;
+        let mut a_bytes = [0u8; 32];
+        let mut b_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut a_bytes);
+        rand::thread_rng().fill_bytes(&mut b_bytes);
+        let sk_a = aii_crypto::secp::SecretKey::from_bytes(&a_bytes).unwrap();
+        let sk_b = aii_crypto::secp::SecretKey::from_bytes(&b_bytes).unwrap();
+        let addr_a = sk_a.public_key().address();
+        let addr_b = sk_b.public_key().address();
+        // Authority set = [a], producer = b (impostor).
+        let mut c = cfg(vec![addr_a], addr_b);
+        c.signer_sk = Some(sk_b);
+        let e = PoaEngine::new(c, &genesis()).unwrap();
+        // Force the slot — engine.is_my_turn() is false but produce_block ignores it.
+        let (hash, height, _block, sig) = e.produce_block_signed().unwrap();
+        let ok = verify_poa_seal(&hash, &sig.unwrap(), &[addr_a], height).unwrap();
+        assert!(
+            !ok,
+            "PoA seal signed by an impostor must not verify against the legit authority"
+        );
     }
 }

@@ -82,28 +82,36 @@ impl Default for ScryptParams {
     }
 }
 
+/// Scrypt-KDF parameters serialised inside [`Crypto`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct KdfParams {
-    dklen: u32,
-    salt: String,
-    n: u32,
-    r: u32,
-    p: u32,
+#[allow(missing_docs)]
+pub struct KdfParams {
+    pub dklen: u32,
+    pub salt: String,
+    pub n: u32,
+    pub r: u32,
+    pub p: u32,
 }
 
+/// AES-CTR cipher parameters serialised inside [`Crypto`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CipherParams {
-    iv: String,
+#[allow(missing_docs)]
+pub struct CipherParams {
+    pub iv: String,
 }
 
+/// Encrypted ciphertext block. Public because callers of
+/// [`EncryptedBytes`] may need to inspect ciphertext / mac fields,
+/// but normal usage is `encrypt(...).to_json()` and never touches it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Crypto {
-    ciphertext: String,
-    cipherparams: CipherParams,
-    cipher: String,
-    kdf: String,
-    kdfparams: KdfParams,
-    mac: String,
+#[allow(missing_docs)]
+pub struct Crypto {
+    pub ciphertext: String,
+    pub cipherparams: CipherParams,
+    pub cipher: String,
+    pub kdf: String,
+    pub kdfparams: KdfParams,
+    pub mac: String,
 }
 
 /// Encrypted keystore record. Round-trips through JSON via serde.
@@ -241,6 +249,132 @@ impl EncryptedKeystore {
     }
 
     /// Parse from JSON.
+    pub fn from_json(s: &str) -> Result<Self, KeystoreError> {
+        serde_json::from_str(s).map_err(KeystoreError::Json)
+    }
+}
+
+/// Web3-Secret-Storage-style encrypted container for arbitrary-length
+/// secret payloads — used for validator keystores (which contain BLS
+/// + VRF secrets that exceed the 32-byte wallet shape).
+///
+/// Same scrypt+AES-128-CTR recipe as [`EncryptedKeystore`]; only the
+/// `ciphertext` length is variable and the optional `address` field
+/// is replaced by a free-form `label` to disambiguate keystores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedBytes {
+    /// Schema version. Always 1.
+    pub version: u32,
+    /// UUIDv4 for cross-referencing in operational tooling.
+    pub id: Uuid,
+    /// Human-readable label (e.g. `"aii-validator"`).
+    pub label: String,
+    /// Crypto block (matches the wallet keystore's Crypto shape).
+    pub crypto: Crypto,
+}
+
+impl EncryptedBytes {
+    /// Encrypt `payload` under `password`. Returns a self-contained
+    /// JSON-serialisable record.
+    ///
+    /// # Errors
+    /// Returns [`KeystoreError::Scrypt`] if the scrypt KDF rejects the
+    /// supplied parameters (non-power-of-two n, etc.).
+    pub fn encrypt(
+        payload: &[u8],
+        password: &str,
+        params: ScryptParams,
+        label: &str,
+    ) -> Result<Self, KeystoreError> {
+        let mut salt = [0u8; 32];
+        let mut iv = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut salt);
+        rand::thread_rng().fill_bytes(&mut iv);
+
+        let derived = derive_key(password, &salt, params)?;
+        let mut ciphertext = payload.to_vec();
+        let mut cipher = Aes128Ctr::new((&derived[..16]).into(), (&iv).into());
+        cipher.apply_keystream(&mut ciphertext);
+
+        // Same MAC recipe as the wallet keystore.
+        let mac_input = [&derived[16..32], &ciphertext[..]].concat();
+        let mac = keccak256(&mac_input);
+
+        Ok(Self {
+            version: 1,
+            id: Uuid::new_v4(),
+            label: label.to_string(),
+            crypto: Crypto {
+                ciphertext: hex::encode(&ciphertext),
+                cipherparams: CipherParams {
+                    iv: hex::encode(iv),
+                },
+                cipher: "aes-128-ctr".to_string(),
+                kdf: "scrypt".to_string(),
+                kdfparams: KdfParams {
+                    dklen: 32,
+                    salt: hex::encode(salt),
+                    n: params.n,
+                    r: params.r,
+                    p: params.p,
+                },
+                mac: hex::encode(mac.as_bytes()),
+            },
+        })
+    }
+
+    /// Decrypt the payload. Verifies the MAC before deciphering so a
+    /// wrong password fails fast with [`KeystoreError::BadMac`].
+    ///
+    /// # Errors
+    /// `BadMac` on wrong password; `UnsupportedCipher` / `UnsupportedKdf`
+    /// if the JSON was produced by a future schema this build doesn't
+    /// understand; `Hex` on malformed hex fields.
+    pub fn decrypt(&self, password: &str) -> Result<Vec<u8>, KeystoreError> {
+        if self.version != 1 {
+            return Err(KeystoreError::UnsupportedVersion(self.version));
+        }
+        if self.crypto.cipher != "aes-128-ctr" {
+            return Err(KeystoreError::UnsupportedCipher(self.crypto.cipher.clone()));
+        }
+        if self.crypto.kdf != "scrypt" {
+            return Err(KeystoreError::UnsupportedKdf(self.crypto.kdf.clone()));
+        }
+        let salt = hex::decode(&self.crypto.kdfparams.salt).map_err(KeystoreError::Hex)?;
+        let iv = hex::decode(&self.crypto.cipherparams.iv).map_err(KeystoreError::Hex)?;
+        let mut ciphertext = hex::decode(&self.crypto.ciphertext).map_err(KeystoreError::Hex)?;
+        let expected_mac = hex::decode(&self.crypto.mac).map_err(KeystoreError::Hex)?;
+        if iv.len() != 16 {
+            return Err(KeystoreError::BadIvLength(iv.len()));
+        }
+        let params = ScryptParams {
+            n: self.crypto.kdfparams.n,
+            r: self.crypto.kdfparams.r,
+            p: self.crypto.kdfparams.p,
+        };
+        let derived = derive_key(password, &salt, params)?;
+        let mac_input = [&derived[16..32], &ciphertext[..]].concat();
+        let actual_mac = keccak256(&mac_input);
+        if actual_mac.as_bytes() != expected_mac.as_slice() {
+            return Err(KeystoreError::BadMac);
+        }
+        let mut iv_arr = [0u8; 16];
+        iv_arr.copy_from_slice(&iv);
+        let mut cipher = Aes128Ctr::new((&derived[..16]).into(), (&iv_arr).into());
+        cipher.apply_keystream(&mut ciphertext);
+        Ok(ciphertext)
+    }
+
+    /// Serialise to canonical JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("EncryptedBytes is always serializable")
+    }
+
+    /// Parse from JSON.
+    ///
+    /// # Errors
+    /// Returns [`KeystoreError::Json`] if the input is not a valid
+    /// `EncryptedBytes` record.
     pub fn from_json(s: &str) -> Result<Self, KeystoreError> {
         serde_json::from_str(s).map_err(KeystoreError::Json)
     }
@@ -403,5 +537,32 @@ mod tests {
         ks.crypto.ciphertext = hex::encode(bytes);
         let err = ks.decrypt("pw").err().unwrap();
         assert!(matches!(err, KeystoreError::BadMac));
+    }
+
+    #[test]
+    fn encrypted_bytes_roundtrips_arbitrary_payload() {
+        let payload = b"validator-secret-128-byte-blob".to_vec();
+        let enc = EncryptedBytes::encrypt(&payload, "hunter2", ScryptParams::light(), "aii-test")
+            .unwrap();
+        let dec = enc.decrypt("hunter2").unwrap();
+        assert_eq!(dec, payload);
+    }
+
+    #[test]
+    fn encrypted_bytes_wrong_password_fails_mac() {
+        let payload = vec![1u8, 2, 3, 4];
+        let enc = EncryptedBytes::encrypt(&payload, "right", ScryptParams::light(), "x").unwrap();
+        let err = enc.decrypt("wrong").err().unwrap();
+        assert!(matches!(err, KeystoreError::BadMac));
+    }
+
+    #[test]
+    fn encrypted_bytes_json_round_trip() {
+        let payload = b"another-payload".to_vec();
+        let enc = EncryptedBytes::encrypt(&payload, "pw", ScryptParams::light(), "x").unwrap();
+        let json = enc.to_json();
+        let back = EncryptedBytes::from_json(&json).unwrap();
+        let dec = back.decrypt("pw").unwrap();
+        assert_eq!(dec, payload);
     }
 }

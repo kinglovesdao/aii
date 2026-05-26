@@ -241,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "bootstrap sync complete",
             ),
             Err(e) => {
-                tracing::error!(error = %e, "bootstrap sync failed — continuing with local head")
+                tracing::error!(error = %e, "bootstrap sync failed — continuing with local head");
             }
         }
     }
@@ -383,6 +383,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             slot_seconds: cli.slot_seconds,
             gas_limit: spec.initial_gas_limit,
             base_fee_per_gas: U256::from(spec.min_base_fee_per_gas),
+            // PoA seal signing (v0.0.45) is opt-in: when the operator
+            // wants signed blocks they must supply a 32-byte hex
+            // signer key via PoaConfig directly; the binary doesn't
+            // yet expose a CLI flag for it because the encrypted
+            // keystore + loader pair is the actual delivery vehicle.
+            signer_sk: None,
         };
         let genesis = genesis_block(&spec);
         let engine = PoaEngine::new(poa_cfg, &genesis)?;
