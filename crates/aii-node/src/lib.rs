@@ -11,10 +11,12 @@
 pub mod bft_bootstrap;
 pub mod bft_p2p;
 pub mod dpos;
+pub mod governance;
 pub mod staking;
 pub mod sync;
 
 pub use dpos::{elect_active_set, latest_validator_set, ValidatorEntry};
+pub use governance::{Governance, Proposal, ProposalStatus, Vote};
 pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
 
@@ -23,8 +25,8 @@ use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, ActiveValidatorsView, HeaderView, LogView, ReceiptView, RpcState, SlashView,
-    StakeView, SubchainAnchorView, SubmitTxError, TxView, ValidatorEntryView,
+    AccountView, ActiveValidatorsView, HeaderView, LogView, ProposalView, ReceiptView, RpcState,
+    SlashView, StakeView, SubchainAnchorView, SubmitTxError, TxView, ValidatorEntryView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -789,6 +791,13 @@ impl NodeState {
     pub fn stake_table(&self) -> StakeTable {
         StakeTable::new(Arc::clone(&self.backend))
     }
+
+    /// Construct a fresh `Governance` view bound to this node's
+    /// backend. Cheap — the inner `RocksDbBackend` Arc is shared.
+    #[must_use]
+    pub fn governance(&self) -> Governance {
+        Governance::new(Arc::clone(&self.backend))
+    }
 }
 
 /// `"n:" ‖ number_be8` — key form used in the `Meta` CF for the
@@ -799,6 +808,24 @@ fn number_key(n: u64) -> Vec<u8> {
     k.extend_from_slice(b"n:");
     k.extend_from_slice(&n.to_be_bytes());
     k
+}
+
+fn proposal_to_view(p: &Proposal, tally: Option<(U256, U256)>) -> ProposalView {
+    let (yes, no) = tally.unwrap_or((U256::ZERO, U256::ZERO));
+    ProposalView {
+        id: format!("0x{:x}", p.id),
+        title: p.title.clone(),
+        voting_ends_at: format!("0x{:x}", p.voting_ends_at),
+        status: match p.status {
+            ProposalStatus::Pending => "pending".into(),
+            ProposalStatus::Passed => "passed".into(),
+            ProposalStatus::Rejected => "rejected".into(),
+            ProposalStatus::Executed => "executed".into(),
+        },
+        proposer: format!("0x{}", hex::encode(p.proposer.as_bytes())),
+        yes_wei: format!("0x{yes:x}"),
+        no_wei: format!("0x{no:x}"),
+    }
 }
 
 fn stake_record_to_view(r: &StakeRecord) -> StakeView {
@@ -1020,6 +1047,21 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn governance_proposals(&self) -> Vec<ProposalView> {
+        let gov = self.governance();
+        gov.list_all()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| proposal_to_view(&p, gov.tally_of(p.id).ok().flatten()))
+            .collect()
+    }
+
+    async fn governance_proposal(&self, id: u64) -> Option<ProposalView> {
+        let gov = self.governance();
+        let p = gov.get(id).ok().flatten()?;
+        Some(proposal_to_view(&p, gov.tally_of(p.id).ok().flatten()))
     }
 
     async fn active_validator_set(&self) -> Option<ActiveValidatorsView> {

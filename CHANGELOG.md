@@ -5,6 +5,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.50] — 2026-05-26
+
+### Added — On-chain governance (roadmap E.2)
+
+A stake-weighted governance primitive: propose / vote / tally with
+2/3-supermajority quorum. Sits on top of the v0.0.48 staking table
+so vote weight tracks live bond, not a frozen snapshot. Proposals,
+votes, and tallies all persist; RPC exposes `aii_listProposals` and
+`aii_getProposal(id)` so dashboards can render the whole life-cycle.
+Executing a passed proposal is intentionally a separate phase — the
+engine-side wire-up lands when consensus learns to honour parameter
+changes mid-chain.
+
+#### `aii-node`
+
+- New module `aii_node::governance` exporting:
+  - `Proposal { id, title, voting_ends_at, status, proposer }`,
+  - `ProposalStatus` (Pending / Passed / Rejected / Executed),
+  - `Vote { proposal_id, voter, support, weight_wei }`,
+  - `Governance` — thin wrapper around `Arc<RocksDbBackend>`.
+- `Governance::propose / get / cast_vote / tally / tally_of /
+  list_all`. `propose` auto-assigns the next monotonic id;
+  `cast_vote` reads weight from `StakeTable` and rejects unstaked
+  or unbonding voters; `tally` walks every vote, sums yes / no,
+  marks `Passed` iff `yes > 2/3 * total_bonded` and caches the
+  `(yes_wei, no_wei)` totals under `Meta:tally:<id>`.
+- `NodeState::governance()` accessor.
+- 6 unit tests: id monotonicity; round-trip; vote requires bond;
+  vote after window rejected; 2/3 passes; 50/50 rejects; tally
+  cache populated.
+
+#### `aii-rpc`
+
+- New JSON-RPC methods:
+  - `aii_listProposals() -> Vec<ProposalView>`.
+  - `aii_getProposal(id) -> Option<ProposalView>`.
+- New response type `ProposalView { id, title, voting_ends_at,
+  status, proposer, yes_wei, no_wei }` — every numeric field hex.
+- Status string: `"pending" | "passed" | "rejected" | "executed"`.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No on-chain submit path yet.** Proposals + votes today come
+  through library calls (or, for ops tooling, future
+  `aii_propose` / `aii_vote` write-RPCs). A precompile address that
+  accepts standard tx calldata is the obvious follow-up.
+- **Execution is a marker, not a chain-fork.** `ProposalStatus::Passed`
+  → `Executed` requires the engine to actually apply the parameter
+  change at the next block. That hook lands together with the
+  state-root-in-header refactor.
+- **No delegation / split votes.** Each voter casts the totality of
+  their bond as one weight; partial / delegated voting is future
+  work.
+
 ## [0.0.49] — 2026-05-26
 
 ### Added — DPoS validator-set election + slashing debit hook (C.6 + C.7 close-out)

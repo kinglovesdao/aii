@@ -200,6 +200,16 @@ pub trait RpcState: Send + Sync + 'static {
     async fn active_validator_set(&self) -> Option<ActiveValidatorsView> {
         None
     }
+
+    /// List every governance proposal. Default empty.
+    async fn governance_proposals(&self) -> Vec<ProposalView> {
+        Vec::new()
+    }
+
+    /// One governance proposal lookup. Default `None`.
+    async fn governance_proposal(&self, _id: u64) -> Option<ProposalView> {
+        None
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -375,6 +385,36 @@ pub trait AiiRpc {
     /// not yet crossed its first epoch boundary.
     #[method(name = "getActiveValidators")]
     async fn get_active_validators(&self) -> RpcResult<Option<ActiveValidatorsView>>;
+
+    /// `aii_listProposals` — every governance proposal known to this
+    /// node. Empty array on a fresh chain.
+    #[method(name = "listProposals")]
+    async fn list_proposals(&self) -> RpcResult<Vec<ProposalView>>;
+
+    /// `aii_getProposal(id)` — single proposal lookup. Returns `null`
+    /// if unknown. Tally fields (`yes_wei` / `no_wei`) are populated
+    /// after `tally()` has finalised the vote.
+    #[method(name = "getProposal")]
+    async fn get_proposal(&self, id: u64) -> RpcResult<Option<ProposalView>>;
+}
+
+/// JSON-RPC view of a governance proposal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposalView {
+    /// Proposal id (`0x…` hex).
+    pub id: String,
+    /// Free-form title / description.
+    pub title: String,
+    /// Block at which voting ends (`0x…` hex).
+    pub voting_ends_at: String,
+    /// Life-cycle status — `"pending" / "passed" / "rejected" / "executed"`.
+    pub status: String,
+    /// Proposer address (`0x…` hex).
+    pub proposer: String,
+    /// Sum of yes-vote weights (`0x…` hex Wei). `"0x0"` before tally.
+    pub yes_wei: String,
+    /// Sum of no-vote weights (`0x…` hex Wei). `"0x0"` before tally.
+    pub no_wei: String,
 }
 
 /// JSON-RPC view of the elected validator set at one epoch boundary.
@@ -615,6 +655,14 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn get_active_validators(&self) -> RpcResult<Option<ActiveValidatorsView>> {
         Ok(self.state.active_validator_set().await)
+    }
+
+    async fn list_proposals(&self) -> RpcResult<Vec<ProposalView>> {
+        Ok(self.state.governance_proposals().await)
+    }
+
+    async fn get_proposal(&self, id: u64) -> RpcResult<Option<ProposalView>> {
+        Ok(self.state.governance_proposal(id).await)
     }
 }
 
