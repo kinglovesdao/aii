@@ -548,12 +548,13 @@ impl BftEngine {
         body: BlockBody,
     ) -> Block {
         let gas_used = (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS;
+        let tx_root = aii_state::transactions_root(&body);
         let header = Header {
             parent_hash,
             ommers_hash: EMPTY_LIST_HASH,
             beneficiary: coinbase,
             state_root: EMPTY_TRIE_HASH,
-            transactions_root: EMPTY_TRIE_HASH,
+            transactions_root: tx_root,
             receipts_root: EMPTY_TRIE_HASH,
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
@@ -599,12 +600,18 @@ impl BftEngine {
 
         // Build the block. Carry the VRF output into mix_hash so
         // consecutive blocks differ even with identical bodies.
+        let body = BlockBody {
+            transactions: txs,
+            ommers: Vec::new(),
+            withdrawals: Vec::new(),
+        };
+        let tx_root = aii_state::transactions_root(&body);
         let header = Header {
             parent_hash: g.head_hash,
             ommers_hash: EMPTY_LIST_HASH,
             beneficiary: self.config.coinbase,
             state_root: EMPTY_TRIE_HASH,
-            transactions_root: EMPTY_TRIE_HASH,
+            transactions_root: tx_root,
             receipts_root: EMPTY_TRIE_HASH,
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
@@ -621,14 +628,7 @@ impl BftEngine {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
         };
-        let block = Block {
-            header,
-            body: BlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
-            },
-        };
+        let block = Block { header, body };
         let block_hash = block.hash();
 
         // Drive the coordinator: submit proposal, prevote, precommit

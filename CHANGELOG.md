@@ -5,6 +5,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.41] — 2026-05-26
+
+### Added — Transactions-MPT + world-state-MPT (roadmap A.3 partial)
+
+`transactions_root` in the block header is now the real Yellow-Paper
+MPT root over the body's txs (was `EMPTY_TRIE_HASH` for every block),
+and `StateDb::state_root()` computes the world-state MPT root from
+every persisted account. Both roots use the already-existing
+`aii_state::mpt_root` (Ethereum-compatible MPT from v0.0.6).
+
+This closes one half of A.3. The other half — wiring `state_root` into
+the BFT engine's block-build path — has to wait for revm in v0.0.42:
+the engine must apply the block's txs before computing the post-block
+state root, which today happens in `commit_block` *after* the block
+hash has been finalised. Receipts-root is similarly deferred to B.2.
+
+#### `aii-state`
+
+- New `transactions_root(body)` free function (re-exported at the crate
+  root). Builds the MPT over `(rlp(i), tx.encode_2718())`. Empty body
+  returns `EMPTY_TRIE_HASH`.
+- New `StateDb::state_root() -> Result<H256, StateError>`. Iterates
+  the `ColumnFamily::State` keyspace, re-encodes each `Account` to
+  canonical RLP, folds into `mpt_root`. O(n) in account count — fine
+  for testnet; incremental per-block delta is on the B-series roadmap.
+- New tests: `state_root_empty_equals_empty_trie_hash`,
+  `state_root_changes_when_account_changes`,
+  `state_root_independent_of_insert_order`,
+  `transactions_root_empty_body_is_empty_trie_hash`,
+  `transactions_root_shifts_on_body_change`.
+
+#### `aii-consensus-bft` + `aii-consensus-poa`
+
+- Both engines now compute `transactions_root` from the drained body
+  and write it into the produced header. The BFT engine touches both
+  the single-validator (`advance_single`) and multi-validator
+  (`build_block_with_body`) paths so producer and follower agree.
+- `aii-consensus-poa` gains an `aii-state` dependency for
+  `transactions_root` (it already depends on `aii-block` for `Tx`).
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No `state_root` in the produced block header yet.** Block hash
+  still embeds `state_root = EMPTY_TRIE_HASH`. The engine has to apply
+  the block's txs before finalising the hash, which only becomes
+  cheap once revm integration (B.1) lands — at that point the engine
+  can call `state.state_root()` between `execute_with_revm` and
+  `block.hash()`. The `state_root()` API is already in place so the
+  follow-up is a one-line wire-up.
+- **No `receipts_root` in the produced block header yet.** Receipts
+  are still empty (B.2 is the dedicated milestone).
+- **Block-hash incompatibility with v0.0.40.** Any block produced
+  under v0.0.40 with non-empty txs will hash differently under
+  v0.0.41 (its `transactions_root` was wrong). Validators must wipe
+  + restart together.
+
 ## [0.0.40] — 2026-05-26
 
 ### Added — Persistent chain state (roadmap A.1 + A.2 bundled)

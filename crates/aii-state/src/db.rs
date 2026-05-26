@@ -1,9 +1,9 @@
 //! `StateDb` — `Address → Account` store backed by [`aii_storage::KvBackend`].
 
-use crate::{account::Account, error::StateError};
+use crate::{account::Account, error::StateError, trie::mpt_root};
 use aii_crypto::keccak::keccak256;
 use aii_storage::{ColumnFamily, KvBackend};
-use aii_types::Address;
+use aii_types::{Address, H256};
 use alloy_rlp::{Decodable, Encodable};
 use std::sync::Arc;
 
@@ -111,6 +111,37 @@ impl<B: KvBackend> StateDb<B> {
                 .put(ColumnFamily::AccountStorage, &key, value.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// Compute the Yellow-Paper-style world-state root by iterating
+    /// every persisted account and folding it into an MPT over
+    /// `(keccak256(address) → rlp(account))`.
+    ///
+    /// The store already keys each account by `keccak256(address)`, so
+    /// the iteration order matches MPT ingestion order without any
+    /// transformation.
+    ///
+    /// This is O(n) in the account count — fine for v0.0.41's testnet
+    /// scale (hundreds of accounts); incremental per-block deltas land
+    /// in the B-series releases.
+    ///
+    /// # Errors
+    /// Returns [`StateError`] if the backend iterator yields an error
+    /// or if a stored account fails to RLP-decode.
+    pub fn state_root(&self) -> Result<H256, StateError> {
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for kv in self.backend.iter(ColumnFamily::State) {
+            let (k, v) = kv?;
+            // Re-encode the account so the MPT value bytes are the
+            // canonical RLP of `Account` rather than whatever the
+            // backend chose to store.
+            let mut s: &[u8] = &v;
+            let acc = Account::decode(&mut s)?;
+            let mut buf = alloy_rlp::bytes::BytesMut::new();
+            acc.encode(&mut buf);
+            pairs.push((k, buf.to_vec()));
+        }
+        Ok(mpt_root(pairs))
     }
 }
 
@@ -241,6 +272,38 @@ mod tests {
             .unwrap();
         db.storage_put(&addr, &slot, &H256::ZERO).unwrap();
         assert_eq!(db.storage_get(&addr, &slot).unwrap(), H256::ZERO);
+    }
+
+    #[test]
+    fn state_root_empty_equals_empty_trie_hash() {
+        let db = fresh_db();
+        assert_eq!(db.state_root().unwrap(), crate::EMPTY_TRIE_HASH);
+    }
+
+    #[test]
+    fn state_root_changes_when_account_changes() {
+        let db = fresh_db();
+        let alice = Address::new([0xa1; 20]);
+        db.set_account(&alice, &sample_account()).unwrap();
+        let r1 = db.state_root().unwrap();
+        let mut updated = sample_account();
+        updated.nonce += 1;
+        db.set_account(&alice, &updated).unwrap();
+        let r2 = db.state_root().unwrap();
+        assert_ne!(r1, r2, "state_root must shift on account mutation");
+    }
+
+    #[test]
+    fn state_root_independent_of_insert_order() {
+        let a = Address::new([0xa1; 20]);
+        let b = Address::new([0xb2; 20]);
+        let db1 = fresh_db();
+        db1.set_account(&a, &sample_account()).unwrap();
+        db1.set_account(&b, &sample_account()).unwrap();
+        let db2 = fresh_db();
+        db2.set_account(&b, &sample_account()).unwrap();
+        db2.set_account(&a, &sample_account()).unwrap();
+        assert_eq!(db1.state_root().unwrap(), db2.state_root().unwrap());
     }
 
     #[test]

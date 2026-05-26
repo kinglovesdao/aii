@@ -10,9 +10,34 @@
 //! - The root is `keccak256(rlp(root_node))`, regardless of node size.
 
 use crate::EMPTY_TRIE_HASH;
+use aii_block::BlockBody;
 use aii_crypto::keccak::keccak256;
 use aii_types::H256;
 use alloy_rlp::Encodable;
+
+/// Compute the Yellow Paper `transactions_root` of a block body.
+///
+/// Keys are RLP-encoded tx indices (`rlp(i)`), values are the EIP-2718
+/// envelope bytes of each tx. Empty bodies return [`EMPTY_TRIE_HASH`].
+#[must_use]
+pub fn transactions_root(body: &BlockBody) -> H256 {
+    if body.transactions.is_empty() {
+        return EMPTY_TRIE_HASH;
+    }
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = body
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| {
+            let mut k = alloy_rlp::bytes::BytesMut::new();
+            (i as u64).encode(&mut k);
+            let mut v = alloy_rlp::bytes::BytesMut::new();
+            tx.encode_2718(&mut v);
+            (k.to_vec(), v.to_vec())
+        })
+        .collect();
+    mpt_root(pairs)
+}
 
 /// Compute the Merkle Patricia Tree root of an ordered KV set.
 ///
@@ -328,6 +353,44 @@ mod tests {
         let root = mpt_root(items.clone());
         // Re-compute — must match.
         assert_eq!(root, mpt_root(items));
+    }
+
+    #[test]
+    fn transactions_root_empty_body_is_empty_trie_hash() {
+        let body = BlockBody::default();
+        assert_eq!(transactions_root(&body), EMPTY_TRIE_HASH);
+    }
+
+    #[test]
+    fn transactions_root_shifts_on_body_change() {
+        use aii_block::tx::{Tx, TxLegacy};
+        use aii_types::{AlgoId, U256};
+        let tx = |nonce: u64| {
+            Tx::Legacy(TxLegacy {
+                nonce,
+                gas_price: U256::from(1_000_000_000u64),
+                gas_limit: 21_000,
+                to: Some(aii_types::Address::new([0x99; 20])),
+                value: U256::from(1u64),
+                data: vec![],
+                v: 27,
+                r: H256::new([0xaa; 32]),
+                s: H256::new([0xbb; 32]),
+                algo_id: AlgoId::Secp256k1,
+            })
+        };
+        let b1 = BlockBody {
+            transactions: vec![tx(0)],
+            ..Default::default()
+        };
+        let b2 = BlockBody {
+            transactions: vec![tx(0), tx(1)],
+            ..Default::default()
+        };
+        let r1 = transactions_root(&b1);
+        let r2 = transactions_root(&b2);
+        assert_ne!(r1, EMPTY_TRIE_HASH);
+        assert_ne!(r1, r2);
     }
 
     #[test]

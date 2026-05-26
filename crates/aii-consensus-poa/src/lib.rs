@@ -131,12 +131,18 @@ impl PoaEngine {
         drop(pending);
         let gas_used = (txs.len() as u64) * PLACEHOLDER_TX_GAS;
 
+        let body = BlockBody {
+            transactions: txs,
+            ommers: Vec::new(),
+            withdrawals: Vec::new(),
+        };
+        let tx_root = aii_state::transactions_root(&body);
         let header = Header {
             parent_hash: g.head_hash,
             ommers_hash: EMPTY_LIST_HASH,
             beneficiary: self.config.coinbase,
             state_root: EMPTY_TRIE_HASH,
-            transactions_root: EMPTY_TRIE_HASH,
+            transactions_root: tx_root,
             receipts_root: EMPTY_TRIE_HASH,
             logs_bloom: Bloom::ZERO,
             difficulty: U256::ZERO,
@@ -153,14 +159,7 @@ impl PoaEngine {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
         };
-        let block = Block {
-            header,
-            body: BlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
-            },
-        };
+        let block = Block { header, body };
         let hash = block.hash();
         g.head_hash = hash;
         g.head_number = new_number;
