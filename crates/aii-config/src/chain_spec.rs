@@ -20,11 +20,48 @@ pub struct ChainSpec {
     pub initial_gas_limit: u64,
     /// EIP-1559 base fee floor (Wei).
     pub min_base_fee_per_gas: u64,
+    /// Initial per-block subsidy in Wei (minted to the block beneficiary).
+    /// Halves every [`Self::block_reward_halving_interval`] blocks.
+    #[serde(default = "default_block_reward")]
+    pub block_reward_initial_wei: u128,
+    /// Halving period in blocks. Set to `u64::MAX` to disable halving.
+    #[serde(default = "default_halving_interval")]
+    pub block_reward_halving_interval: u64,
+}
+
+const fn default_block_reward() -> u128 {
+    // 2 AII (2 * 1e18 wei) per block — initial.
+    2_000_000_000_000_000_000
+}
+
+const fn default_halving_interval() -> u64 {
+    // ~4 years at 3 s/block: 365 * 24 * 60 * 60 * 4 / 3 = 42_048_000.
+    // We round to a clean number and keep the value tuneable per spec.
+    42_048_000
+}
+
+impl ChainSpec {
+    /// Effective per-block subsidy at block `n`. Halves every
+    /// [`Self::block_reward_halving_interval`] blocks; saturates to 0
+    /// once the halving exponent exceeds the wei mantissa.
+    #[must_use]
+    pub const fn block_reward_at(&self, n: u64) -> u128 {
+        if self.block_reward_halving_interval == 0 || self.block_reward_halving_interval == u64::MAX
+        {
+            return self.block_reward_initial_wei;
+        }
+        let halvings = n / self.block_reward_halving_interval;
+        if halvings >= 128 {
+            return 0;
+        }
+        self.block_reward_initial_wei >> halvings
+    }
 }
 
 impl ChainSpec {
     /// Validate basic invariants. Returns the first violation encountered.
-    pub const fn validate(&self) -> Result<(), &'static str> {
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn validate(&self) -> Result<(), &'static str> {
         if self.chain_id == 0 {
             return Err("chain_id must be > 0");
         }
@@ -45,6 +82,8 @@ pub const AII_MAINNET: ChainSpec = ChainSpec {
     block_time_seconds: 3,
     initial_gas_limit: 30_000_000,
     min_base_fee_per_gas: 1_000_000_000,
+    block_reward_initial_wei: 2_000_000_000_000_000_000, // 2 AII / block
+    block_reward_halving_interval: 42_048_000,           // ~4y at 3s/block
 };
 
 /// Reference AII testnet spec.
@@ -54,6 +93,8 @@ pub const AII_TESTNET: ChainSpec = ChainSpec {
     block_time_seconds: 3,
     initial_gas_limit: 30_000_000,
     min_base_fee_per_gas: 100_000_000,
+    block_reward_initial_wei: 2_000_000_000_000_000_000,
+    block_reward_halving_interval: 42_048_000,
 };
 
 impl ChainSpec {
@@ -113,5 +154,32 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let back: ChainSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn block_reward_halves_at_interval_boundary() {
+        let spec = ChainSpec::mainnet();
+        let initial = spec.block_reward_initial_wei;
+        assert_eq!(spec.block_reward_at(0), initial);
+        assert_eq!(
+            spec.block_reward_at(spec.block_reward_halving_interval - 1),
+            initial
+        );
+        assert_eq!(
+            spec.block_reward_at(spec.block_reward_halving_interval),
+            initial / 2
+        );
+        assert_eq!(
+            spec.block_reward_at(spec.block_reward_halving_interval * 2),
+            initial / 4
+        );
+    }
+
+    #[test]
+    fn block_reward_saturates_to_zero_after_many_halvings() {
+        let spec = ChainSpec::mainnet();
+        // 128 halvings shifts a u128 to 0.
+        let far = spec.block_reward_halving_interval.saturating_mul(200);
+        assert_eq!(spec.block_reward_at(far), 0);
     }
 }

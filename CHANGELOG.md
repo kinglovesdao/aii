@@ -5,6 +5,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.43] — 2026-05-26
+
+### Added — Validator economics + per-tx logs bloom (roadmap B.3 + B.4 + B.5 partial)
+
+**Block producers now earn real revenue.** Every tx pays its
+`gas_used * gas_price` fee to the block's beneficiary (B.3), and
+every block additionally mints a configurable subsidy with a Bitcoin-
+style halving schedule (B.4). Per-tx receipt blooms are populated
+from the log stream (Yellow-Paper §4.4.3), so light clients can
+already prove tx-level event presence (B.5 partial — block-level
+header bloom + `eth_getLogs` still pending).
+
+#### `aii-config::ChainSpec`
+
+- Two new fields:
+  - `block_reward_initial_wei: u128` (default **2 AII / block**),
+  - `block_reward_halving_interval: u64` (default **42 048 000
+    blocks ≈ 4 y at 3 s/block**; `u64::MAX` disables halving).
+- New method `block_reward_at(n)` returns the effective per-block
+  subsidy at block number `n`. Pure shift; saturates to 0 after 128
+  halvings (no halving can exceed a `u128`'s mantissa).
+- `#[serde(default = …)]` on both new fields so existing genesis
+  JSON / on-disk specs decode unchanged.
+- New tests: `block_reward_halves_at_interval_boundary`,
+  `block_reward_saturates_to_zero_after_many_halvings`.
+
+#### `aii-node`
+
+- `execute_block_txs` now passes the tx's `gas_price` (Legacy) or
+  `max_fee_per_gas` (EIP-1559) into `execute_with_revm` (was always
+  zero). revm now charges the sender; we additionally credit
+  `gas_used * gas_price` Wei to `header.beneficiary` so the
+  validator coinbase actually accumulates fee revenue.
+- After the per-tx loop finishes, `execute_block_txs` mints
+  `spec.block_reward_at(header.number)` Wei to `header.beneficiary`.
+  Empty blocks earn the full subsidy; tx-heavy blocks earn both.
+- New `credit(addr, delta)` helper saturates rather than wrapping —
+  no silent overflow on long-running validator accounts.
+- Per-tx Yellow-Paper bloom: every log's `address` and each topic is
+  accrued into a per-tx `Bloom`, recorded on the receipt. Block-level
+  header bloom aggregation is the remaining half of B.5.
+- New tests:
+  - `empty_block_credits_subsidy_to_beneficiary` — block 1 with no
+    txs lands exactly 2 AII at the beneficiary.
+  - `subsidy_halves_at_interval_boundary` — sanity-check pass-through.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No block-level header `logs_bloom` aggregation yet** —
+  per-tx blooms are correct, but `Block::header.logs_bloom` is still
+  `Bloom::ZERO`. Same chicken-and-egg as `state_root` /
+  `receipts_root` — the bloom should land in the header *before*
+  the hash is finalised. Engine-level apply-then-hash refactor due
+  in the v0.0.45-0.0.47 range will close all three.
+- **No `eth_getLogs` RPC** — even with per-tx blooms persisted, the
+  query path (`fromBlock`, `toBlock`, `address`, `topics`) is its
+  own work item.
+- **Sender-side balance tracking still trusts revm.** We capture
+  `sender_pre` but don't yet cross-check `sender_pre - sender_post
+  == fee + value`; that lands once we have a tighter
+  divergence-detector.
+
 ## [0.0.42] — 2026-05-26
 
 ### Added — revm in commit_block + tx receipts (roadmap B.1 + B.2)

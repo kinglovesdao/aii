@@ -273,6 +273,7 @@ impl NodeState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_block_txs(&self, block: &Block) {
         use aii_block::tx::{TxEip1559, TxLegacy};
         let chain_id = self.spec.chain_id;
@@ -287,7 +288,7 @@ impl NodeState {
                 );
                 continue;
             };
-            let (to, value, data, gas_limit, _gas_price, tx_type) = match tx {
+            let (to, value, data, gas_limit, gas_price, tx_type) = match tx {
                 Tx::Legacy(TxLegacy {
                     to,
                     value,
@@ -326,9 +327,17 @@ impl NodeState {
                     continue;
                 }
             };
-            // Route every tx — value transfer or contract — through
-            // revm so a single code path handles both. `gas_price` is
-            // passed as ZERO at this stage; gas fee debit lands in B.3.
+            // Snapshot the sender balance so we can compute the actual
+            // fee debited by revm (sender_pre - sender_post - value).
+            // revm charges `gas_used * gas_price` from the sender as
+            // part of its tx-validation step; we hand that same amount
+            // to the block beneficiary below.
+            let sender_pre = self
+                .state
+                .account(&sender)
+                .ok()
+                .flatten()
+                .map_or(U256::ZERO, |a| a.balance);
             match aii_evm::execute_with_revm(
                 &self.state,
                 sender,
@@ -336,17 +345,35 @@ impl NodeState {
                 value,
                 data,
                 gas_limit,
-                revm::primitives::U256::ZERO,
+                gas_price,
             ) {
                 Ok(summary) => {
                     cumulative_gas_used = cumulative_gas_used.saturating_add(summary.gas_used);
+                    // Credit gas fee to block beneficiary. Use the
+                    // direct gas_used * gas_price product — matches
+                    // what revm debited from the sender.
+                    let fee = U256::from(summary.gas_used).saturating_mul(gas_price);
+                    if !fee.is_zero() {
+                        self.credit(&block.header.beneficiary, fee);
+                    }
+                    let _ = sender_pre; // reserved for future divergence checks
+                                        // Per-tx bloom: address + each topic of every log
+                                        // gets accrued into a fresh Bloom; this is the
+                                        // canonical Yellow-Paper §4.4.3 receipt bloom.
+                    let mut tx_bloom = Bloom::ZERO;
+                    for log in &summary.logs {
+                        tx_bloom.accrue(log.address.as_bytes());
+                        for topic in &log.topics {
+                            tx_bloom.accrue(topic.as_bytes());
+                        }
+                    }
                     receipts.push((
                         tx_hash,
                         Receipt {
                             tx_type,
                             status: summary.success,
                             cumulative_gas_used,
-                            logs_bloom: Bloom::ZERO, // logs-bloom aggregation lands in B.5
+                            logs_bloom: tx_bloom,
                             logs: summary.logs,
                         },
                     ));
@@ -361,7 +388,35 @@ impl NodeState {
                 }
             }
         }
+        // Mint block subsidy to the beneficiary. The halving curve is
+        // controlled by ChainSpec; testnets can disable halving by
+        // setting `block_reward_halving_interval = u64::MAX`.
+        let subsidy_wei = self.spec.block_reward_at(block.header.number);
+        if subsidy_wei > 0 {
+            self.credit(&block.header.beneficiary, U256::from(subsidy_wei));
+        }
         self.persist_receipts(block.hash(), &receipts);
+    }
+
+    /// Add `delta` Wei to the balance of `addr`. Used by the gas-fee
+    /// credit path and the block-subsidy mint path inside
+    /// `execute_block_txs`. Idempotent under arithmetic — saturates
+    /// rather than wrapping to avoid silent overflow.
+    fn credit(&self, addr: &Address, delta: U256) {
+        let mut acc = self
+            .state
+            .account(addr)
+            .ok()
+            .flatten()
+            .unwrap_or(aii_state::Account::EMPTY);
+        acc.balance = acc.balance.saturating_add(delta);
+        if let Err(e) = self.state.set_account(addr, &acc) {
+            tracing::error!(
+                addr = ?addr,
+                error = %e,
+                "credit: set_account failed",
+            );
+        }
     }
 
     /// Persist every receipt produced for `block_hash` into the
@@ -969,6 +1024,30 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn empty_block_credits_subsidy_to_beneficiary() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let block = fake_block(1, H256::ZERO);
+        let coinbase = block.header.beneficiary;
+        state.commit_block(&block);
+        let acc = state.state().account(&coinbase).unwrap().unwrap();
+        // 2 AII initial subsidy at block 1 (no halving yet).
+        let expected = U256::from(2_000_000_000_000_000_000u128);
+        assert_eq!(
+            acc.balance, expected,
+            "block 1 must mint {expected} wei subsidy to beneficiary",
+        );
+    }
+
+    #[test]
+    fn subsidy_halves_at_interval_boundary() {
+        let spec = ChainSpec::mainnet();
+        let initial = spec.block_reward_initial_wei;
+        let h = spec.block_reward_halving_interval;
+        assert_eq!(spec.block_reward_at(h - 1), initial);
+        assert_eq!(spec.block_reward_at(h), initial / 2);
     }
 
     #[test]
