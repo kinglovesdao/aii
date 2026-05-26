@@ -43,3 +43,4 @@ async-trait = "0.1"
 [dev-dependencies]
 aii-node = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "net", "time"] }
+tempfile = "3"

@@ -5,6 +5,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.52] — 2026-05-26
+
+### Added — Sub-chain persistent operator state (roadmap D.1)
+
+`aii subchain run` now has a durable on-disk identity. Before this
+release every restart of the sub-chain runner spun a fresh secp256k1
+operator key, restarted the height counter from zero, and reset the
+parent-chain nonce — meaning the first flush after a restart usually
+collided with the parent's existing-nonce-from-the-previous-run and
+got rejected. v0.0.52 introduces a JSON state file
+(`<data_dir>/state.json`) that round-trips operator key, head
+counter, head hash, and the next parent nonce across restarts.
+
+#### `aii-cli`
+
+- New `SubchainPersistentState { sub_chain_id, operator_sk_hex,
+  head_number, head_hash, parent_nonce, flush_count }` struct.
+- `SubchainPersistentState::create_fresh(sub_chain_id, data_dir)` —
+  generates a new operator key and writes the initial state file.
+- `SubchainPersistentState::load(data_dir) -> Result<Option<Self>>` —
+  returns `Ok(None)` when no file exists.
+- `SubchainPersistentState::save(data_dir)` — atomic write via
+  `state.json.tmp → rename` (POSIX-atomic; a torn write cannot leave
+  a corrupted `state.json`).
+- `SubchainPersistentState::operator_secret_key()` — recover the
+  `secp256k1::SecretKey` from the hex-encoded form.
+- `aii-cli` dev-deps gain `tempfile` for the round-trip test.
+- 2 new tests: full disk round-trip, missing-file handling.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **`run_subchain` doesn't auto-load the state file yet.** The
+  `SubchainPersistentState` primitive is in place — the actual
+  swap-in (open or create, load operator key, restore counters,
+  save after every produced block) is a one-line follow-up CLI
+  refactor.
+- **No block-store persistence.** Only operator state is kept; the
+  sub-chain still doesn't persist its block bodies or receipts
+  (they're ephemeral by construction — the parent's anchor records
+  are the source of truth).
+- **No multi-engine sub-chains (D.3).** Sub-chains still only run
+  PoA; persistence here applies regardless of engine but the
+  non-PoA engines aren't yet wired into `run_subchain`.
+
 ## [0.0.51] — 2026-05-26
 
 ### Added — ERC-20 ABI helpers (roadmap E.1)

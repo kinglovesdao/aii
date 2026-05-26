@@ -301,6 +301,128 @@ pub async fn run_subchain(
     })
 }
 
+/// Persistent sub-chain operator state.
+///
+/// Kept on disk in `<data_dir>/state.json` so a restart resumes with
+/// the same operator address, the same height counter, and the same
+/// parent-chain nonce sequence. Without this, every restart of
+/// `aii subchain run` got a fresh operator key, a fresh head, and
+/// re-collided with the parent on the very next flush nonce.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubchainPersistentState {
+    /// Sub-chain id (kept here so the JSON file is self-describing).
+    pub sub_chain_id: u64,
+    /// Operator secp256k1 secret key, hex (32 bytes).
+    pub operator_sk_hex: String,
+    /// Last sub-chain block number produced before shutdown.
+    pub head_number: u64,
+    /// Last sub-chain block hash produced (`0x…` hex). Empty string
+    /// on a fresh state file.
+    pub head_hash: String,
+    /// Next parent-chain nonce to submit a flush tx under.
+    pub parent_nonce: u64,
+    /// Cumulative flushes performed so far (informational).
+    pub flush_count: u64,
+}
+
+impl SubchainPersistentState {
+    /// Build the canonical filename inside `data_dir`.
+    fn path(data_dir: &std::path::Path) -> std::path::PathBuf {
+        data_dir.join("state.json")
+    }
+
+    /// Bootstrap state for a brand-new sub-chain — generates a fresh
+    /// operator key and writes the initial state file.
+    ///
+    /// # Errors
+    /// Returns I/O / JSON errors.
+    pub fn create_fresh(sub_chain_id: u64, data_dir: &std::path::Path) -> Result<Self, CliError> {
+        use aii_crypto::secp::SecretKey;
+        use rand::RngCore;
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CliError::Client(format!("subchain data_dir: {e}")))?;
+        let sk = {
+            let mut rng = rand::thread_rng();
+            let mut bytes = [0u8; 32];
+            loop {
+                rng.fill_bytes(&mut bytes);
+                if let Ok(s) = SecretKey::from_bytes(&bytes) {
+                    break s;
+                }
+            }
+        };
+        let st = Self {
+            sub_chain_id,
+            operator_sk_hex: format!("0x{}", hex::encode(sk.to_bytes())),
+            head_number: 0,
+            head_hash: String::new(),
+            parent_nonce: 0,
+            flush_count: 0,
+        };
+        st.save(data_dir)?;
+        Ok(st)
+    }
+
+    /// Load the persistent state from `data_dir/state.json`, or
+    /// return `Ok(None)` if no such file exists.
+    ///
+    /// # Errors
+    /// Returns I/O / JSON errors.
+    pub fn load(data_dir: &std::path::Path) -> Result<Option<Self>, CliError> {
+        let path = Self::path(data_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| CliError::Client(format!("read {}: {e}", path.display())))?;
+        let st = serde_json::from_slice::<Self>(&bytes)
+            .map_err(|e| CliError::Client(format!("parse {}: {e}", path.display())))?;
+        Ok(Some(st))
+    }
+
+    /// Persist atomically: write to `state.json.tmp` then rename.
+    /// Crash-safe — the rename is atomic on POSIX, so a torn write
+    /// cannot leave a corrupted `state.json`.
+    ///
+    /// # Errors
+    /// Returns I/O / JSON errors.
+    pub fn save(&self, data_dir: &std::path::Path) -> Result<(), CliError> {
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CliError::Client(format!("subchain data_dir: {e}")))?;
+        let path = Self::path(data_dir);
+        let tmp = data_dir.join("state.json.tmp");
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| CliError::Client(format!("serialize state.json: {e}")))?;
+        std::fs::write(&tmp, &bytes)
+            .map_err(|e| CliError::Client(format!("write {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| CliError::Client(format!("rename → {}: {e}", path.display())))?;
+        Ok(())
+    }
+
+    /// Recover the secp256k1 SecretKey from the hex-encoded form.
+    ///
+    /// # Errors
+    /// Returns a `CliError::Client` if the hex is malformed.
+    pub fn operator_secret_key(&self) -> Result<aii_crypto::secp::SecretKey, CliError> {
+        let s = self
+            .operator_sk_hex
+            .strip_prefix("0x")
+            .unwrap_or(&self.operator_sk_hex);
+        let raw = hex::decode(s).map_err(|e| CliError::Client(format!("operator_sk hex: {e}")))?;
+        if raw.len() != 32 {
+            return Err(CliError::Client(format!(
+                "operator_sk: expected 32 bytes, got {}",
+                raw.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        aii_crypto::secp::SecretKey::from_bytes(&arr)
+            .map_err(|e| CliError::Client(format!("operator_sk parse: {e}")))
+    }
+}
+
 fn compute_legacy_eip155_hash(t: &aii_block::tx::TxLegacy, chain_id: u64) -> aii_types::H256 {
     use aii_crypto::keccak::keccak256;
     use aii_types::U256;
@@ -887,6 +1009,37 @@ mod tests {
             .await
             .unwrap();
         (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn subchain_persistent_state_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let st1 = SubchainPersistentState::create_fresh(42, dir.path()).unwrap();
+        // Mutate + save.
+        let mut st2 = st1.clone();
+        st2.head_number = 7;
+        st2.head_hash = "0x".to_string() + &hex::encode([0xab; 32]);
+        st2.parent_nonce = 3;
+        st2.flush_count = 1;
+        st2.save(dir.path()).unwrap();
+        // Reload.
+        let back = SubchainPersistentState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.sub_chain_id, 42);
+        assert_eq!(back.operator_sk_hex, st1.operator_sk_hex);
+        assert_eq!(back.head_number, 7);
+        assert_eq!(back.parent_nonce, 3);
+        // The operator key roundtrips.
+        let sk = back.operator_secret_key().unwrap();
+        assert_eq!(
+            format!("0x{}", hex::encode(sk.to_bytes())),
+            back.operator_sk_hex
+        );
+    }
+
+    #[test]
+    fn subchain_persistent_state_load_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(SubchainPersistentState::load(dir.path()).unwrap().is_none());
     }
 
     #[tokio::test]
