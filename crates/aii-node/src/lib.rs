@@ -12,10 +12,10 @@ pub mod bft_bootstrap;
 pub mod bft_p2p;
 
 use aii_block::tx::Tx;
-use aii_block::{Block, Hashable, Header};
+use aii_block::{Block, BlockBody, Hashable, Header};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
-use aii_rpc::{AccountView, HeaderView, RpcState, SubmitTxError};
+use aii_rpc::{AccountView, HeaderView, RpcState, SubmitTxError, TxView};
 use aii_state::StateDb;
 use aii_storage::MemoryBackend;
 use aii_types::{Address, H256, U256};
@@ -42,14 +42,23 @@ pub struct NodeState {
     tx_pool: TxPool,
 }
 
-/// Headers keyed by hash + a number→hash index, plus an insertion-order
-/// vector used to serve "recent N blocks".
+/// Headers + bodies keyed by hash and number, plus an insertion-order
+/// vector used to serve "recent N blocks" and a tx-hash → (block_number,
+/// in-block index) map so `aii_getTransaction` can do single-hop lookups.
 #[derive(Default)]
 struct BlockStore {
     by_hash: HashMap<H256, Header>,
     by_number: HashMap<u64, H256>,
     /// Insertion order for `recent_headers` — push on commit, scan tail.
     order: Vec<H256>,
+    /// Block bodies keyed by block hash. Empty `BlockBody` for genesis-
+    /// like blocks with no txs is stored normally (always present once
+    /// indexed). Needed for `aii_getBlockTransactions` / per-tx lookups.
+    body_by_hash: HashMap<H256, BlockBody>,
+    /// `tx_hash → (block_number, in-block index)`. Lets a single
+    /// `aii_getTransaction` call resolve a transaction without scanning
+    /// every block. Populated on commit alongside `body_by_hash`.
+    tx_index: HashMap<H256, (u64, usize)>,
 }
 
 impl NodeState {
@@ -77,17 +86,58 @@ impl NodeState {
     }
 
     /// Index a finalised block so RPC clients can look it up via
-    /// `aii_getBlockHeader` / `aii_recentBlocks`. Idempotent on the
-    /// same hash.
+    /// `aii_getBlockHeader` / `aii_recentBlocks`, and execute every
+    /// transaction in the block body against the world-state.
+    ///
+    /// Idempotent on the same hash — a re-applied block is skipped
+    /// before any state mutation, so node1 and node2 each apply each
+    /// finalised block exactly once even though both nodes call
+    /// `commit_block` independently from their own harvest loops.
+    ///
+    /// Tx execution today goes through [`aii_evm::execute_transfer`] —
+    /// the fast-path EOA-to-EOA value-transfer executor. Failing txs
+    /// (bad nonce, insufficient balance, contract-call attempt) are
+    /// logged at `warn` and skipped; the block-hash agreement between
+    /// validators is unaffected because gas accounting is per-tx-count,
+    /// not per-tx-receipt.
     pub fn commit_block(&self, block: &Block) {
         let hash = block.hash();
-        let mut s = self.blocks.write().expect("BlockStore lock not poisoned");
-        if s.by_hash.contains_key(&hash) {
-            return;
+        {
+            let mut s = self.blocks.write().expect("BlockStore lock not poisoned");
+            if s.by_hash.contains_key(&hash) {
+                return;
+            }
+            s.by_hash.insert(hash, block.header.clone());
+            s.by_number.insert(block.header.number, hash);
+            s.order.push(hash);
+            // Index every tx by hash so `aii_getTransaction` is O(1).
+            for (idx, tx) in block.body.transactions.iter().enumerate() {
+                s.tx_index.insert(tx.hash(), (block.header.number, idx));
+            }
+            s.body_by_hash.insert(hash, block.body.clone());
         }
-        s.by_hash.insert(hash, block.header.clone());
-        s.by_number.insert(block.header.number, hash);
-        s.order.push(hash);
+        self.execute_block_txs(block);
+    }
+
+    fn execute_block_txs(&self, block: &Block) {
+        let chain_id = self.spec.chain_id;
+        for tx in &block.body.transactions {
+            let Ok(sender) = tx.recover_signer(chain_id) else {
+                tracing::warn!(
+                    block = block.header.number,
+                    "tx signer recovery failed — skipping",
+                );
+                continue;
+            };
+            if let Err(e) = aii_evm::execute_transfer(&self.state, sender, tx) {
+                tracing::warn!(
+                    block = block.header.number,
+                    sender = ?sender,
+                    error = %e,
+                    "execute_transfer failed — skipping tx",
+                );
+            }
+        }
     }
 
     /// Total number of indexed blocks (test-only diagnostic).
@@ -129,6 +179,79 @@ fn parse_hash_str(s: &str) -> Option<H256> {
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(s, &mut bytes).ok()?;
     Some(H256::new(bytes))
+}
+
+fn parse_hash_h256(s: &str) -> Option<H256> {
+    parse_hash_str(s)
+}
+
+fn tx_to_view(tx: &Tx, chain_id: u64) -> TxView {
+    use aii_block::tx::{TxEip1559, TxEip4844, TxLegacy};
+    let hash = format!("0x{}", hex::encode(tx.hash().as_bytes()));
+    let from = tx
+        .recover_signer(chain_id)
+        .map(|a| format!("0x{}", hex::encode(a.as_bytes())))
+        .unwrap_or_default();
+    let (to_opt, value, nonce, gas_limit, max_fee, max_pri, tx_type) = match tx {
+        Tx::Legacy(TxLegacy {
+            nonce,
+            gas_price,
+            gas_limit,
+            to,
+            value,
+            ..
+        }) => (
+            *to, *value, *nonce, *gas_limit, *gas_price, *gas_price, "legacy",
+        ),
+        Tx::Eip1559(TxEip1559 {
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            value,
+            ..
+        }) => (
+            *to,
+            *value,
+            *nonce,
+            *gas_limit,
+            *max_fee_per_gas,
+            *max_priority_fee_per_gas,
+            "eip1559",
+        ),
+        Tx::Eip4844(TxEip4844 {
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            value,
+            ..
+        }) => (
+            Some(*to),
+            *value,
+            *nonce,
+            *gas_limit,
+            *max_fee_per_gas,
+            *max_priority_fee_per_gas,
+            "eip4844",
+        ),
+    };
+    let to = to_opt
+        .map(|a| format!("0x{}", hex::encode(a.as_bytes())))
+        .unwrap_or_default();
+    TxView {
+        hash,
+        from,
+        to,
+        value: format!("0x{value:x}"),
+        nonce: format!("0x{nonce:x}"),
+        gas_limit: format!("0x{gas_limit:x}"),
+        max_fee_per_gas: format!("0x{max_fee:x}"),
+        max_priority_fee_per_gas: format!("0x{max_pri:x}"),
+        tx_type: tx_type.to_string(),
+    }
 }
 
 #[async_trait]
@@ -173,6 +296,34 @@ impl RpcState for NodeState {
             .take(limit)
             .filter_map(|h| s.by_hash.get(h).map(|hdr| header_to_view(*h, hdr)))
             .collect()
+    }
+
+    async fn block_transactions(&self, n: u64) -> Option<Vec<TxView>> {
+        let chain_id = self.spec.chain_id;
+        let Ok(s) = self.blocks.read() else {
+            return None;
+        };
+        let hash = *s.by_number.get(&n)?;
+        let body = s.body_by_hash.get(&hash)?;
+        Some(
+            body.transactions
+                .iter()
+                .map(|tx| tx_to_view(tx, chain_id))
+                .collect(),
+        )
+    }
+
+    async fn transaction_by_hash(&self, hash_hex: &str) -> Option<(TxView, u64)> {
+        let chain_id = self.spec.chain_id;
+        let h = parse_hash_h256(hash_hex)?;
+        let Ok(s) = self.blocks.read() else {
+            return None;
+        };
+        let (block_number, idx) = *s.tx_index.get(&h)?;
+        let block_hash = *s.by_number.get(&block_number)?;
+        let body = s.body_by_hash.get(&block_hash)?;
+        let tx = body.transactions.get(idx)?;
+        Some((tx_to_view(tx, chain_id), block_number))
     }
 
     async fn submit_raw_tx(&self, raw_hex: &str) -> Result<String, SubmitTxError> {

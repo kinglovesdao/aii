@@ -34,7 +34,8 @@ pub use engine::{AdvanceOutput, BftConfig, BftEngine, PLACEHOLDER_TX_GAS};
 pub use gossip::{BftGossip, BftTransport};
 pub use slashing::{EquivocationDetector, EquivocationEvidence, SlashingError};
 pub use wire::{
-    BftMessage, CodecError, PROPOSAL_LEN, TAG_PRECOMMIT, TAG_PREVOTE, TAG_PROPOSAL, VOTE_LEN,
+    BftMessage, CodecError, MAX_PROPOSAL_BODY_LEN, PROPOSAL_HEADER_LEN, PROPOSAL_MIN_LEN,
+    TAG_PRECOMMIT, TAG_PREVOTE, TAG_PROPOSAL, VOTE_LEN,
 };
 
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
@@ -288,6 +289,13 @@ pub enum BftError {
     /// leader_proof)` — likely a forged or mis-encoded proposal.
     #[error("proposal block-hash mismatch")]
     ProposalHashMismatch,
+
+    /// A peer's `Proposal` carries a `body_bytes` payload that does not
+    /// RLP-decode into a valid [`aii_block::BlockBody`]. The string
+    /// payload is the RLP error reported by `alloy_rlp`, useful for
+    /// debugging a misbehaving peer.
+    #[error("invalid proposal body: {0}")]
+    InvalidProposalBody(String),
 }
 
 #[cfg(test)]

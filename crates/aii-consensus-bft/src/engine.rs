@@ -185,10 +185,31 @@ impl BftEngine {
         }
     }
 
-    /// Stage transactions to include in the next produced block.
-    /// Overwrites any previously-staged batch.
+    /// Stage transactions to include in the next produced block,
+    /// **replacing** any previously-staged batch. Use this when you
+    /// know the caller fully owns the staging window (typically in
+    /// single-validator dev mode where every slot deterministically
+    /// drains everything pending in one shot).
     pub fn set_pending_txs(&self, txs: Vec<Tx>) {
         *self.pending_txs.lock() = txs;
+    }
+
+    /// Stage additional transactions onto the pending-tx queue without
+    /// dropping anything already staged. Multi-validator BFT pumps
+    /// mempool drains into the engine on a separate cadence from the
+    /// gossip proposer; an overwriting `set_pending_txs` there would
+    /// silently drop txs whose round had not yet fired.
+    pub fn extend_pending_txs(&self, txs: Vec<Tx>) {
+        if txs.is_empty() {
+            return;
+        }
+        self.pending_txs.lock().extend(txs);
+    }
+
+    /// Snapshot count of staged-but-unproposed txs (for diagnostics).
+    #[must_use]
+    pub fn pending_tx_count(&self) -> usize {
+        self.pending_txs.lock().len()
     }
 
     /// Snapshot the chain head.
@@ -202,6 +223,16 @@ impl BftEngine {
     #[must_use]
     pub fn is_single_validator(&self) -> bool {
         self.config.validator_set.size() == 1
+    }
+
+    /// This node's coinbase — i.e. the address that becomes the
+    /// `header.beneficiary` of any block this engine proposes. Used by
+    /// the gossip layer to stamp the outbound `BftMessage::Proposal`
+    /// so peers reconstruct the header with the leader's coinbase
+    /// (not their own).
+    #[must_use]
+    pub const fn coinbase(&self) -> Address {
+        self.config.coinbase
     }
 
     /// Current `(height, round, Phase)` if a coordinator is active.
@@ -244,16 +275,53 @@ impl BftEngine {
         self.config.validator_set.size()
     }
 
-    /// Reconstruct the exact block the engine would `cast_proposal` at
-    /// `height` against its current head + `leader_proof`. Used by the
-    /// gossip layer to recover the full block from a `Proposal` wire
-    /// message that only carries `block_hash + leader_proof`.
+    /// Reconstruct an empty-body block under this engine's own coinbase
+    /// — used by callers (and tests) that only care about the header
+    /// and don't need to mirror a remote leader's beneficiary.
+    /// Multi-validator gossip uses
+    /// [`Self::reconstruct_proposed_block_with_body`] instead so that
+    /// (a) the leader's txs are slotted in and (b) the leader's
+    /// `--coinbase` is honoured as the block's `beneficiary`.
     #[must_use]
     pub fn reconstruct_proposed_block(&self, height: u64, leader_proof: &LeaderProof) -> Block {
+        self.reconstruct_proposed_block_with_body(
+            height,
+            leader_proof,
+            self.config.coinbase,
+            BlockBody::default(),
+        )
+    }
+
+    /// Reconstruct the block the engine would `cast_proposal` at
+    /// `height` against its current head + `leader_proof`, slotting in
+    /// the supplied `coinbase` and `body`. Used by the gossip layer to
+    /// recover the full block a peer leader proposed (the body and the
+    /// leader's coinbase arrive on the wire alongside `block_hash +
+    /// leader_proof`).
+    ///
+    /// The reconstructed block's header derives `gas_used` from the
+    /// body so that `block.hash()` here equals `block.hash()` on the
+    /// leader — that equality is what the gossip layer verifies
+    /// before accepting the proposal.
+    #[must_use]
+    pub fn reconstruct_proposed_block_with_body(
+        &self,
+        height: u64,
+        leader_proof: &LeaderProof,
+        coinbase: Address,
+        body: BlockBody,
+    ) -> Block {
         let g = self.state.lock();
-        // `build_block` reads head_hash + head_timestamp, which mirrors
-        // what the leader did when they signed the proposal.
-        self.build_block(g.head_hash, g.head_timestamp, height, leader_proof)
+        // `build_block_with_body` reads head_hash + head_timestamp,
+        // which mirrors what the leader did when they signed the proposal.
+        self.build_block_with_body(
+            g.head_hash,
+            g.head_timestamp,
+            height,
+            leader_proof,
+            coinbase,
+            body,
+        )
     }
 
     /// `&self` harvest: if the coordinator is in `Committed`, commit
@@ -288,6 +356,11 @@ impl BftEngine {
     /// coordinator. Caller is responsible for broadcasting the returned
     /// `(Block, LeaderProof)` to peers. Only valid when this node is
     /// the elected leader for the round.
+    ///
+    /// Drains up to `gas_limit / PLACEHOLDER_TX_GAS` transactions from
+    /// the engine's pending pool into the block body so the followers'
+    /// reconstructed block (which uses the wire-shipped body) hashes
+    /// identically.
     pub fn cast_proposal(&self) -> Result<(Block, LeaderProof), BftError> {
         let mut g = self.state.lock();
         self.ensure_coordinator(&mut g);
@@ -305,7 +378,15 @@ impl BftEngine {
         let head_hash = g.head_hash;
         let head_ts = g.head_timestamp;
         let proof = LeaderProof::produce(&self.config.my_vrf_sk, height, round, &seed);
-        let block = self.build_block(head_hash, head_ts, height, &proof);
+        let body = self.drain_pending_txs_into_body();
+        let block = self.build_block_with_body(
+            head_hash,
+            head_ts,
+            height,
+            &proof,
+            self.config.coinbase,
+            body,
+        );
         let block_hash = block.hash();
         g.coordinator
             .as_mut()
@@ -313,6 +394,21 @@ impl BftEngine {
             .submit_proposal(block_hash, &proof)?;
         g.proposal = Some((block.clone(), proof.clone()));
         Ok((block, proof))
+    }
+
+    /// Take pending transactions up to the per-block cap and pack them
+    /// into a fresh `BlockBody`. Shared between [`Self::cast_proposal`]
+    /// (multi-validator path) and [`Self::advance_single`].
+    fn drain_pending_txs_into_body(&self) -> BlockBody {
+        let max_txs = (self.config.gas_limit / PLACEHOLDER_TX_GAS) as usize;
+        let mut pending = self.pending_txs.lock();
+        let take = pending.len().min(max_txs);
+        let transactions: Vec<Tx> = pending.drain(..take).collect();
+        BlockBody {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals: Vec::new(),
+        }
     }
 
     /// Sign + submit my own PRE-VOTE for whatever block the coordinator
@@ -430,20 +526,32 @@ impl BftEngine {
     }
 
     /// Build the block this node would propose for `height` on top of
-    /// `parent_hash` at `parent_timestamp`. The leader's VRF output is
-    /// embedded in `mix_hash` so every legitimate proposer for the
-    /// same height produces a distinct block.
-    fn build_block(
+    /// `parent_hash` at `parent_timestamp` with the supplied
+    /// `coinbase` and `body`. The leader's VRF output is embedded in
+    /// `mix_hash` so every legitimate proposer for the same height
+    /// produces a distinct block, and `beneficiary` is taken from the
+    /// supplied `coinbase` so a follower reconstructing the leader's
+    /// block builds the same header bytes (and thus the same block
+    /// hash) instead of stamping the header with its own coinbase.
+    ///
+    /// `gas_used` is derived from the body's tx count using the
+    /// per-block `PLACEHOLDER_TX_GAS` accounting — this is what the
+    /// followers compute as well, so the resulting block hash is
+    /// deterministic across the validator set.
+    fn build_block_with_body(
         &self,
         parent_hash: H256,
         parent_timestamp: u64,
         height: u64,
         leader_proof: &LeaderProof,
+        coinbase: Address,
+        body: BlockBody,
     ) -> Block {
+        let gas_used = (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS;
         let header = Header {
             parent_hash,
             ommers_hash: EMPTY_LIST_HASH,
-            beneficiary: self.config.coinbase,
+            beneficiary: coinbase,
             state_root: EMPTY_TRIE_HASH,
             transactions_root: EMPTY_TRIE_HASH,
             receipts_root: EMPTY_TRIE_HASH,
@@ -451,7 +559,7 @@ impl BftEngine {
             difficulty: U256::ZERO,
             number: height,
             gas_limit: self.config.gas_limit,
-            gas_used: 0,
+            gas_used,
             timestamp: parent_timestamp + self.config.slot_seconds,
             extra_data: b"aii-bft".to_vec(),
             mix_hash: H256::new(leader_proof.vrf_output),
@@ -462,10 +570,7 @@ impl BftEngine {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
         };
-        Block {
-            header,
-            body: BlockBody::default(),
-        }
+        Block { header, body }
     }
 
     /// Run one full BFT round (propose + vote + commit) against

@@ -5,6 +5,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.39] — 2026-05-26
+
+### Added — Multi-validator BFT body gossip + real tx execution
+
+**The two-node BFT testnet finalises real, tx-bearing, gas-charged
+blocks across both validators**, closing the v0.0.37 deferral. Before
+this release `BftMessage::Proposal` carried only `(hash, leader_proof)`
+and followers reconstructed an empty body — so multi-validator BFT
+finalised empty blocks even when the mempool was full. Now the leader
+ships the RLP-encoded body plus its `coinbase` over the wire, the
+follower reconstructs the same block (same `beneficiary`, same
+`gas_used`, same hash) and votes on it, and `commit_block` runs every
+transaction through `aii_evm::execute_transfer` so balances and nonces
+mutate on both nodes in lock-step.
+
+**Live testnet result** (JP + CN, both validators, real gas, three
+back-to-back rounds of 100 A→B via node1 + 100 B→A via node2 each):
+
+| Round | A->B total | B->A total | Net A delta actual | expected | n1==n2 |
+|---|---|---|---|---|---|
+| 1 | 508.10 AII | 506.85 AII | -1.241949 | -1.241949 | ✅ |
+| 2 | 503.56 AII | 540.73 AII | +37.172426 | +37.172426 | ✅ |
+| 3 | 449.31 AII | 490.17 AII | +40.863342 | +40.863342 | ✅ |
+
+#### `aii-consensus-bft`
+
+- `BftMessage::Proposal` now carries `coinbase: Address` and a length-
+  prefixed `body_bytes: Vec<u8>` (RLP-encoded `BlockBody`). Wire
+  layout: `tag ‖ height_be8 ‖ round_be4 ‖ block_hash[32] ‖ vrf_preout[32]
+  ‖ vrf_proof[64] ‖ vrf_output[32] ‖ coinbase[20] ‖ body_len_be4 ‖
+  body_bytes`. Header is fixed-size; body is capped at
+  `MAX_PROPOSAL_BODY_LEN` (16 MiB) to bound peer memory pressure.
+- New `BftEngine::extend_pending_txs(txs)` appends without dropping
+  what the proposer hasn't packed yet — `set_pending_txs` overwrote,
+  which silently dropped txs between slots in multi-validator mode.
+- `BftEngine::reconstruct_proposed_block_with_body(height, leader_proof,
+  coinbase, body)` rebuilds the leader's exact block (so block_hash
+  matches and prevote can fire).
+- New `BftError::InvalidProposalBody(String)` for peers that ship an
+  unparseable RLP body — replaces silent acceptance.
+
+#### `aii-rpc`
+
+- New JSON-RPC methods:
+  - `aii_getBlockTransactions(numberOrHash)` — every tx in a block
+    (hash, from, to, value, nonce, gas_limit, max_fee, max_priority,
+    tx_type) in inclusion order. Returns `null` if block unknown,
+    `[]` if block has no txs.
+  - `aii_getTransaction(hash)` — single-hop lookup of a tx by its
+    keccak256 hash. Returns `{ tx, block_number }`.
+- New `TxView` and `TxLookup` response types. `from` is derived via
+  `Tx::recover_signer(chain_id)` so the field is the real EOA, not
+  the empty-string default that legacy headers had.
+
+#### `aii-node`
+
+- `NodeState::commit_block` is no longer a header-only indexer:
+  every transaction in the block body is dispatched to
+  `aii_evm::execute_transfer`, which validates nonce + balance and
+  mutates the state DB. Idempotent (re-applied block is a no-op).
+- `BlockStore` gained `body_by_hash` + `tx_index` so the two new
+  RPC methods are O(1). Genesis `alloc` entries are now actually
+  applied: `apply_genesis_alloc` runs once at startup and seeds the
+  world-state from the `Genesis::alloc` list (the file was being
+  parsed but never materialised before — `eth_getBalance` returned
+  zero for every pre-funded address).
+- Multi-validator BFT main loop drains the mempool on every tick and
+  calls the new `extend_pending_txs` so the proposer always has the
+  latest queue (no per-slot replace-race).
+
+#### Live testnet ops
+
+- Both nodes now run with distinct `--coinbase`:
+  - JP node: `0xD5495A2DeB59252464f510aF6fd246Ae72a1e213`
+  - CN node: `0x09c401F8EB333E1943B38d944D28Ad1D5A45B631`
+  So `block.beneficiary` actually reflects the proposer instead of
+  `0x0000…0000` for every block.
+- Explorer's `ExpBlockDetail` now lists every tx in the block (hash,
+  from, to, value in AII, type), each tx hash linking to a new
+  `/explorer/tx/<hash>` detail page (`ExpTxDetail`) that calls
+  `aii_getTransaction`. Validators page row for the CN node no
+  longer hard-codes `STANDBY` — it follows `stats.online`, which is
+  authoritative under 2-of-2 BFT (no block finalises unless both
+  validators sign).
+
+#### Scope discipline
+
+- **In scope**: multi-validator BFT body gossip + tx execution +
+  per-block coinbase + explorer tx-detail surface. End-to-end live-
+  verified on two-node testnet.
+- **Not in this release**:
+  - **Persistent block index** — `BlockStore` is still in-memory
+    (RocksDB store on the roadmap). A restart still loses the index;
+    state is also still memory-backed.
+  - **Full revm contract execution** — `execute_transfer` is the
+    fast-path EOA-to-EOA executor; contract calls / CREATE / arbitrary
+    bytecode still go through `execute_with_revm` which is not yet
+    wired into `commit_block`.
+  - **Receipts** stored or returned by RPC. Logs / events / tx-receipt
+    lookups still defer to a later release.
+  - **Block-body sync on cold-join** — a freshly-restarted validator
+    has no way to fetch missing blocks from peers; the only safe
+    "rejoin" is a coordinated full wipe.
+
 ## [0.0.38] — 2026-05-25
 
 ### Added — Sub-chain runtime + flush to parent chain

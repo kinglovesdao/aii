@@ -20,6 +20,7 @@ aii-consensus-iface = { workspace = true }
 aii-vnode = { workspace = true }
 aii-state = { workspace = true }
 aii-config = { workspace = true }
+alloy-rlp = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"

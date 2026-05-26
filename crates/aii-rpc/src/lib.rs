@@ -35,6 +35,36 @@ pub struct AccountView {
     pub code_hash: String,
 }
 
+/// JSON-shaped transaction record (subset suitable for explorers).
+///
+/// `value`, `nonce`, `gas_limit`, `max_fee_per_gas`, and `max_priority_fee_per_gas`
+/// are stringified hex so JSON consumers never get truncation surprises around
+/// `2^53 - 1`. `tx_type` is `"legacy" | "eip1559" | "eip4844"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TxView {
+    /// Keccak-256 hash of the encoded transaction (`0x…` 32-byte hex).
+    pub hash: String,
+    /// Recovered sender address (`0x…` 20-byte hex). Comes from
+    /// `Tx::recover_signer(chain_id)`.
+    pub from: String,
+    /// Recipient address (`0x…` 20-byte hex), or empty string for contract
+    /// creations (`to == None`).
+    pub to: String,
+    /// Transferred value in Wei (`0x…` hex of a u256).
+    pub value: String,
+    /// Sender's nonce on this tx (`0x…` hex).
+    pub nonce: String,
+    /// Gas limit reserved by the tx (`0x…` hex).
+    pub gas_limit: String,
+    /// EIP-1559 / 4844: max fee per gas (`0x…` hex). Mirrors `gas_price` for legacy.
+    pub max_fee_per_gas: String,
+    /// EIP-1559 / 4844: priority fee per gas (`0x…` hex). Same as
+    /// `max_fee_per_gas` for legacy (priority concept doesn't apply).
+    pub max_priority_fee_per_gas: String,
+    /// Variant: `"legacy"`, `"eip1559"`, or `"eip4844"`.
+    pub tx_type: String,
+}
+
 /// JSON-shaped block header (subset suitable for explorers).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeaderView {
@@ -101,6 +131,20 @@ pub trait RpcState: Send + Sync + 'static {
     /// returns empty; node impls override.
     async fn recent_headers(&self, _limit: usize) -> Vec<HeaderView> {
         Vec::new()
+    }
+
+    /// Transactions inside the block at `n`, in inclusion order. Default
+    /// returns `None` (block not found / not tracked); node impls override.
+    /// A returned `Some(Vec::new())` means "block exists but had no txs".
+    async fn block_transactions(&self, _n: u64) -> Option<Vec<TxView>> {
+        None
+    }
+
+    /// Look up a single transaction by hash and return its body view +
+    /// the block number it landed in (or `None` if unknown). Default
+    /// returns `None`; node impls override.
+    async fn transaction_by_hash(&self, _hash: &str) -> Option<(TxView, u64)> {
+        None
     }
 
     /// Submit a signed raw transaction. Default rejects; node impls
@@ -191,6 +235,29 @@ pub trait AiiRpc {
     /// first. `limit` is capped at 100.
     #[method(name = "recentBlocks")]
     async fn recent_blocks(&self, limit: u64) -> RpcResult<Vec<HeaderView>>;
+
+    /// `aii_getBlockTransactions(numberOrHash)` — every transaction
+    /// inside a finalised block, in inclusion order. Returns `null` if
+    /// the block is unknown; returns `[]` if the block exists but
+    /// contains no transactions (the common no-traffic case).
+    #[method(name = "getBlockTransactions")]
+    async fn get_block_transactions(&self, query: String) -> RpcResult<Option<Vec<TxView>>>;
+
+    /// `aii_getTransaction(hash)` — look up a single transaction by its
+    /// keccak256 hash. Returns `null` if the hash is unknown; otherwise
+    /// `{ tx, block_number }` so explorers can render a tx-detail page
+    /// with a link back to its containing block.
+    #[method(name = "getTransaction")]
+    async fn get_transaction(&self, hash: String) -> RpcResult<Option<TxLookup>>;
+}
+
+/// Response shape for `aii_getTransaction`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TxLookup {
+    /// The transaction record itself.
+    pub tx: TxView,
+    /// Block number that included this transaction (`0x…` hex).
+    pub block_number: String,
 }
 
 struct EthRpcImpl<S: RpcState> {
@@ -277,6 +344,61 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
     async fn recent_blocks(&self, limit: u64) -> RpcResult<Vec<HeaderView>> {
         let capped = usize::try_from(limit.min(100)).unwrap_or(100);
         Ok(self.state.recent_headers(capped).await)
+    }
+
+    async fn get_block_transactions(&self, query: String) -> RpcResult<Option<Vec<TxView>>> {
+        // Resolve {decimal | "0x..." hex number | "0x..." 32-byte hash} → block number.
+        let trimmed = query.strip_prefix("0x").unwrap_or(&query);
+        if trimmed.len() == 64 {
+            // Hash → header lookup → number → body lookup.
+            let Some(h) = self.state.header_by_hash(&format!("0x{trimmed}")).await else {
+                return Ok(None);
+            };
+            let n_hex = h.number.trim_start_matches("0x");
+            let n = u64::from_str_radix(n_hex, 16).map_err(|e| {
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32603,
+                    format!("internal: header.number not parseable: {e}"),
+                    None::<()>,
+                )
+            })?;
+            return Ok(self.state.block_transactions(n).await);
+        }
+        let n = if let Some(rest) = query.strip_prefix("0x") {
+            u64::from_str_radix(rest, 16)
+        } else {
+            query.parse::<u64>()
+        }
+        .map_err(|e| {
+            jsonrpsee::types::ErrorObjectOwned::owned(
+                -32602,
+                format!(
+                    "getBlockTransactions: '{query}' is neither a number nor a 32-byte hash: {e}"
+                ),
+                None::<()>,
+            )
+        })?;
+        Ok(self.state.block_transactions(n).await)
+    }
+
+    async fn get_transaction(&self, hash: String) -> RpcResult<Option<TxLookup>> {
+        let trimmed = hash.strip_prefix("0x").unwrap_or(&hash);
+        if trimmed.len() != 64 {
+            return Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32602,
+                "getTransaction: hash must be 0x + 64 hex chars",
+                None::<()>,
+            ));
+        }
+        let normalized = format!("0x{trimmed}");
+        Ok(self
+            .state
+            .transaction_by_hash(&normalized)
+            .await
+            .map(|(tx, block_number)| TxLookup {
+                tx,
+                block_number: format!("0x{block_number:x}"),
+            }))
     }
 }
 

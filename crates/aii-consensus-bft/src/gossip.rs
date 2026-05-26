@@ -26,13 +26,14 @@
 
 use std::sync::Arc;
 
+use alloy_rlp::{Decodable, Encodable};
 use parking_lot::Mutex;
 
 use crate::bft::{LeaderProof, Phase};
 use crate::engine::BftEngine;
 use crate::wire::BftMessage;
 use crate::BftError;
-use aii_block::Hashable;
+use aii_block::{BlockBody, Hashable};
 
 /// Sync sink/source of opaque gossip bytes.
 ///
@@ -155,11 +156,14 @@ impl<T: BftTransport> BftGossip<T> {
             .engine
             .current_round_state()
             .expect("cast_proposal creates coordinator");
+        let body_bytes = encode_block_body(&block.body);
         let msg = BftMessage::Proposal {
             height: h,
             round: r,
             block_hash: block.hash(),
             leader_proof: proof,
+            coinbase: self.engine.coinbase(),
+            body_bytes,
         };
         let bytes = msg.encode();
         {
@@ -211,11 +215,14 @@ impl<T: BftTransport> BftGossip<T> {
         let Ok((block, proof)) = self.engine.cast_proposal() else {
             return 0;
         };
+        let body_bytes = encode_block_body(&block.body);
         let msg = BftMessage::Proposal {
             height: h,
             round: r,
             block_hash: block.hash(),
             leader_proof: proof,
+            coinbase: self.engine.coinbase(),
+            body_bytes,
         };
         let bytes = msg.encode();
         {
@@ -298,32 +305,66 @@ impl<T: BftTransport> BftGossip<T> {
                 round,
                 block_hash,
                 leader_proof,
-            } => self.handle_proposal_msg(height, round, block_hash, leader_proof),
+                coinbase,
+                body_bytes,
+            } => self.handle_proposal_msg(
+                height,
+                round,
+                block_hash,
+                leader_proof,
+                coinbase,
+                &body_bytes,
+            ),
             BftMessage::Prevote(v) => self.engine.submit_remote_prevote(v),
             BftMessage::Precommit(v) => self.engine.submit_remote_precommit(v),
         }
     }
 
-    /// `BftMessage::Proposal` carries only `block_hash + leader_proof`,
-    /// not the full block. For v0.0.34 we synthesize the block from the
-    /// header data we can derive (the engine reads its own
-    /// `build_block` to produce a block; for now we expose a helper
-    /// that lets us reconstruct it from `(parent, proof, height)`).
+    /// Reconstruct the proposed block from the engine's header view +
+    /// the RLP-encoded body the leader sent on the wire, then submit
+    /// it to the engine.
+    ///
+    /// Hash verification is end-to-end: the reconstructed block's hash
+    /// (which folds in `transactions_root` derived from the body) must
+    /// match the `block_hash` field of the proposal, or the proposal is
+    /// rejected. This is what makes multi-validator BFT carry real txs
+    /// safely — a peer cannot smuggle in a body that disagrees with the
+    /// leader's stated hash.
     fn handle_proposal_msg(
         &self,
         height: u64,
         _round: u32,
         block_hash: aii_types::H256,
         leader_proof: LeaderProof,
+        coinbase: aii_types::Address,
+        body_bytes: &[u8],
     ) -> Result<(), BftError> {
-        let block = self
-            .engine
-            .reconstruct_proposed_block(height, &leader_proof);
+        let body = decode_block_body(body_bytes)?;
+        let block =
+            self.engine
+                .reconstruct_proposed_block_with_body(height, &leader_proof, coinbase, body);
         if block.hash() != block_hash {
             return Err(BftError::ProposalHashMismatch);
         }
         self.engine.submit_remote_proposal(block, leader_proof)
     }
+}
+
+/// Serialize a [`BlockBody`] to RLP bytes for inclusion in a
+/// `BftMessage::Proposal`. The leader calls this when broadcasting; the
+/// follower calls [`decode_block_body`] on receipt.
+fn encode_block_body(body: &BlockBody) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(body.length());
+    body.encode(&mut buf);
+    buf
+}
+
+/// Inverse of [`encode_block_body`]. RLP-decode the body bytes received
+/// from a peer. Maps an RLP error to [`BftError::InvalidProposalBody`]
+/// so the gossip layer can reject malformed proposals without panicking.
+fn decode_block_body(bytes: &[u8]) -> Result<BlockBody, BftError> {
+    let mut slice = bytes;
+    BlockBody::decode(&mut slice).map_err(|e| BftError::InvalidProposalBody(e.to_string()))
 }
 
 #[cfg(test)]
@@ -425,6 +466,99 @@ mod tests {
             slot_seconds: 3,
         };
         Arc::new(BftEngine::new(cfg, g))
+    }
+
+    /// Build a synthetic EIP-1559 self-transfer tx — enough to be a
+    /// real `Tx::Eip1559` variant that RLP-round-trips cleanly. Used
+    /// purely to populate non-empty block bodies for the body-gossip
+    /// integration test below.
+    fn dummy_signed_tx(nonce: u64) -> aii_block::tx::Tx {
+        use aii_block::tx::{Tx, TxEip1559};
+        use aii_types::AlgoId;
+        Tx::Eip1559(TxEip1559 {
+            chain_id: 9999,
+            nonce,
+            max_priority_fee_per_gas: U256::from(1u64),
+            max_fee_per_gas: U256::from(2u64),
+            gas_limit: 21_000,
+            to: Some(Address::new([0x42; 20])),
+            value: U256::from(1u64),
+            data: Vec::new(),
+            access_list: Vec::new(),
+            v: 0,
+            r: H256::new([0u8; 32]),
+            s: H256::new([0u8; 32]),
+            algo_id: AlgoId::Secp256k1,
+        })
+    }
+
+    #[test]
+    fn two_node_gossip_finalises_block_carrying_txs() {
+        // 2-validator BFT (quorum = 2 of 2). Leader stages two txs;
+        // proposal carries the body; follower reconstructs the same
+        // block hash and votes; both finalise one block with txs == 2.
+        let mut keys = Vec::new();
+        let mut vs_list = Vec::new();
+        for i in 0..2u8 {
+            let bls = bls_sk(i + 1);
+            let vrf = vrf_sk();
+            vs_list.push(Validator {
+                bls_pubkey: bls.public_key(),
+                vrf_pubkey: vrf.public_key(),
+                stake: 100,
+            });
+            keys.push((bls, vrf));
+        }
+        let vs = ValidatorSet::new(vs_list).unwrap();
+        let g = genesis();
+
+        let e_a = build_engine(0, &vs, &keys, &g);
+        let e_b = build_engine(1, &vs, &keys, &g);
+
+        // Stage txs on BOTH nodes' pools — only the actual leader will
+        // drain its pool when it casts the proposal; the other node's
+        // pool stays untouched but its body comes from the wire.
+        let txs = vec![dummy_signed_tx(0), dummy_signed_tx(1)];
+        e_a.set_pending_txs(txs.clone());
+        e_b.set_pending_txs(txs);
+
+        let (t_a, t_b) = MemoryTransport::pair();
+        let gossip_a = BftGossip::new(e_a.clone(), t_a);
+        let gossip_b = BftGossip::new(e_b.clone(), t_b);
+
+        let mut committed_a: Option<Block> = None;
+        let mut committed_b: Option<Block> = None;
+        for _ in 0..50 {
+            gossip_a.tick();
+            gossip_b.tick();
+            if committed_a.is_none() {
+                committed_a = e_a.try_harvest_committed();
+            }
+            if committed_b.is_none() {
+                committed_b = e_b.try_harvest_committed();
+            }
+            if committed_a.is_some() && committed_b.is_some() {
+                break;
+            }
+        }
+        let a = committed_a.expect("node A should commit one block");
+        let b = committed_b.expect("node B should commit one block");
+        assert_eq!(a.header.number, 1);
+        assert_eq!(b.header.number, 1);
+        assert_eq!(a.hash(), b.hash(), "both nodes agree on block hash");
+        assert_eq!(
+            a.body.transactions.len(),
+            2,
+            "committed block carries leader's txs",
+        );
+        assert_eq!(
+            b.body.transactions.len(),
+            2,
+            "follower's reconstructed block has the same txs",
+        );
+        // gas_used must reflect tx count (2 × PLACEHOLDER_TX_GAS).
+        assert_eq!(a.header.gas_used, 2 * crate::PLACEHOLDER_TX_GAS);
+        assert_eq!(b.header.gas_used, 2 * crate::PLACEHOLDER_TX_GAS);
     }
 
     #[test]
