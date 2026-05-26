@@ -25,8 +25,8 @@ use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, ActiveValidatorsView, HeaderView, LogView, ProposalView, ReceiptView, RpcState,
-    SlashView, StakeView, SubchainAnchorView, SubmitTxError, TxView, ValidatorEntryView,
+    AccountView, ActiveValidatorsView, ForkView, HeaderView, LogView, ProposalView, ReceiptView,
+    RpcState, SlashView, StakeView, SubchainAnchorView, SubmitTxError, TxView, ValidatorEntryView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -46,6 +46,28 @@ const META_KEY_HEAD_HASH: &[u8] = b"head_block_hash";
 /// `phase_byte` is `0` for prevote, `1` for precommit. Yields one entry
 /// per slashed `(validator, height, phase)` triple, listable by prefix.
 const META_KEY_SLASH_PREFIX: &[u8] = b"slash:";
+/// Meta-CF key prefix for persisted fork-detection records.
+/// Layout: `b"fork:" ‖ height_be8 ‖ fork_hash[32]`. Multiple records
+/// per height are allowed — every conflicting hash seen lands here so
+/// the operator can audit re-org candidates.
+const META_KEY_FORK_PREFIX: &[u8] = b"fork:";
+
+/// One observed competing block at a given height.
+///
+/// Recorded by `commit_block` when a new block lands whose height
+/// already has a different canonical block. Re-org execution is
+/// intentionally deferred (state rollback requires the engine
+/// apply-then-hash refactor); this primitive is observability-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkRecord {
+    /// Height at which the fork was detected.
+    pub height: u64,
+    /// Hash currently recorded as the local canonical block at this
+    /// height.
+    pub canonical_hash: H256,
+    /// Conflicting hash that was rejected.
+    pub fork_hash: H256,
+}
 
 /// Persistent slashing record. Built by `NodeState::record_slashing` from
 /// an `aii_consensus_bft::EquivocationEvidence`; queryable via the new
@@ -255,24 +277,95 @@ impl NodeState {
     /// not per-tx-receipt.
     pub fn commit_block(&self, block: &Block) {
         let hash = block.hash();
+        let mut fork_detected: Option<H256> = None;
         {
             let mut s = self.blocks.write().expect("BlockStore lock not poisoned");
             if s.by_hash.contains_key(&hash) {
                 return;
             }
-            s.by_hash.insert(hash, block.header.clone());
-            s.by_number.insert(block.header.number, hash);
-            s.order.push(hash);
-            // Index every tx by hash so `aii_getTransaction` is O(1).
-            for (idx, tx) in block.body.transactions.iter().enumerate() {
-                s.tx_index.insert(tx.hash(), (block.header.number, idx));
+            // Fork detection: same height, different hash → record the
+            // conflict and skip the canonical-update path. Real
+            // re-org execution (rollback + re-apply) lands in a future
+            // release once state-checkpointing is in place.
+            if let Some(existing) = s.by_number.get(&block.header.number).copied() {
+                if existing != hash {
+                    fork_detected = Some(existing);
+                }
             }
-            s.body_by_hash.insert(hash, block.body.clone());
+            if fork_detected.is_none() {
+                s.by_hash.insert(hash, block.header.clone());
+                s.by_number.insert(block.header.number, hash);
+                s.order.push(hash);
+                // Index every tx by hash so `aii_getTransaction` is O(1).
+                for (idx, tx) in block.body.transactions.iter().enumerate() {
+                    s.tx_index.insert(tx.hash(), (block.header.number, idx));
+                }
+                s.body_by_hash.insert(hash, block.body.clone());
+            }
+        }
+        if let Some(canonical) = fork_detected {
+            self.record_fork(block.header.number, canonical, hash);
+            tracing::warn!(
+                height = block.header.number,
+                canonical = ?canonical,
+                fork = ?hash,
+                "fork detected — recorded for audit, not re-orged",
+            );
+            return;
         }
         self.persist_block(block, hash);
         self.execute_block_txs(block);
         self.scan_microchain_anchors(block, hash);
         self.maybe_elect_validator_set(block.header.number);
+    }
+
+    /// Persist a fork-detection record. Key: `b"fork:" ‖ height_be8 ‖
+    /// fork_hash[32]`; value: `canonical_hash[32]`. Multiple records
+    /// per height are kept so the operator can see every rejected
+    /// candidate.
+    fn record_fork(&self, height: u64, canonical: H256, fork: H256) {
+        let mut key = Vec::with_capacity(META_KEY_FORK_PREFIX.len() + 8 + 32);
+        key.extend_from_slice(META_KEY_FORK_PREFIX);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(fork.as_bytes());
+        if let Err(e) = self
+            .backend
+            .put(ColumnFamily::Meta, &key, canonical.as_bytes())
+        {
+            tracing::error!(error = %e, "record_fork: write failed");
+        }
+    }
+
+    /// List every persisted fork record. Used by `aii_listForks` RPC
+    /// + ops tooling.
+    ///
+    /// # Errors
+    /// Propagates backend errors / decode failures.
+    pub fn list_forks(&self) -> Result<Vec<ForkRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for kv in self
+            .backend
+            .iter_prefix(ColumnFamily::Meta, META_KEY_FORK_PREFIX)
+        {
+            let (k, v) = kv?;
+            let suffix = &k[META_KEY_FORK_PREFIX.len()..];
+            if suffix.len() != 8 + 32 || v.len() != 32 {
+                continue;
+            }
+            let mut h_arr = [0u8; 8];
+            h_arr.copy_from_slice(&suffix[..8]);
+            let height = u64::from_be_bytes(h_arr);
+            let mut fork_arr = [0u8; 32];
+            fork_arr.copy_from_slice(&suffix[8..40]);
+            let mut canonical_arr = [0u8; 32];
+            canonical_arr.copy_from_slice(&v);
+            out.push(ForkRecord {
+                height,
+                canonical_hash: H256::new(canonical_arr),
+                fork_hash: H256::new(fork_arr),
+            });
+        }
+        Ok(out)
     }
 
     /// If `block_number` is a multiple of the chain's
@@ -1049,6 +1142,18 @@ impl RpcState for NodeState {
         Some((tx_to_view(tx, chain_id), block_number))
     }
 
+    async fn forks(&self) -> Vec<ForkView> {
+        self.list_forks()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| ForkView {
+                height: format!("0x{:x}", f.height),
+                canonical_hash: format!("0x{}", hex::encode(f.canonical_hash.as_bytes())),
+                fork_hash: format!("0x{}", hex::encode(f.fork_hash.as_bytes())),
+            })
+            .collect()
+    }
+
     async fn governance_proposals(&self) -> Vec<ProposalView> {
         let gov = self.governance();
         gov.list_all()
@@ -1460,6 +1565,30 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn fork_at_same_height_records_evidence() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let mut canonical = fake_block(1, H256::ZERO);
+        canonical.header.extra_data = b"canonical".to_vec();
+        let mut fork = fake_block(1, H256::ZERO);
+        fork.header.extra_data = b"fork-branch".to_vec();
+        let canonical_hash = canonical.hash();
+        let fork_hash = fork.hash();
+        assert_ne!(canonical_hash, fork_hash);
+        // Commit canonical first.
+        state.commit_block(&canonical);
+        assert_eq!(state.block_count(), 1);
+        // Now commit the fork — should be rejected from the index
+        // but recorded as a fork record.
+        state.commit_block(&fork);
+        assert_eq!(state.block_count(), 1, "fork must not advance head");
+        let forks = state.list_forks().unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].height, 1);
+        assert_eq!(forks[0].canonical_hash, canonical_hash);
+        assert_eq!(forks[0].fork_hash, fork_hash);
     }
 
     #[test]

@@ -210,6 +210,11 @@ pub trait RpcState: Send + Sync + 'static {
     async fn governance_proposal(&self, _id: u64) -> Option<ProposalView> {
         None
     }
+
+    /// List every fork-detection record. Default empty.
+    async fn forks(&self) -> Vec<ForkView> {
+        Vec::new()
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -396,6 +401,24 @@ pub trait AiiRpc {
     /// after `tally()` has finalised the vote.
     #[method(name = "getProposal")]
     async fn get_proposal(&self, id: u64) -> RpcResult<Option<ProposalView>>;
+
+    /// `aii_listForks` — every fork-detection record recorded by the
+    /// node. Empty on a healthy chain; non-empty when a competing
+    /// block has been seen at an already-finalised height. v0.0.54
+    /// is observability-only — re-org execution lands later.
+    #[method(name = "listForks")]
+    async fn list_forks(&self) -> RpcResult<Vec<ForkView>>;
+}
+
+/// JSON-RPC view of one fork-detection record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkView {
+    /// Height at which the fork was detected (`0x…` hex).
+    pub height: String,
+    /// Local canonical block hash at that height (`0x…` hex).
+    pub canonical_hash: String,
+    /// Rejected conflicting hash (`0x…` hex).
+    pub fork_hash: String,
 }
 
 /// JSON-RPC view of a governance proposal.
@@ -663,6 +686,10 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn get_proposal(&self, id: u64) -> RpcResult<Option<ProposalView>> {
         Ok(self.state.governance_proposal(id).await)
+    }
+
+    async fn list_forks(&self) -> RpcResult<Vec<ForkView>> {
+        Ok(self.state.forks().await)
     }
 }
 

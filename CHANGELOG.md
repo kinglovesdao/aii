@@ -5,6 +5,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.54] — 2026-05-26
+
+### Added — Fork-detection primitive + RPC (C.2 observability)
+
+`NodeState::commit_block` now distinguishes between "novel block" and
+"competing block at an already-finalised height". The novel path
+behaves unchanged; the competing path persists a `ForkRecord` under
+`Meta:fork:<height_be8>:<fork_hash[32]>` and refuses to overwrite the
+canonical head. Operators get an audit trail of every conflicting
+hash the gossip layer surfaced; re-org *execution* (rollback +
+re-apply) is intentionally deferred until the engine learns
+apply-then-hash so we can re-derive `state_root` on the rolled-back
+branch without trusting a peer.
+
+#### `aii-node`
+
+- New `ForkRecord { height, canonical_hash, fork_hash }` public
+  struct.
+- `commit_block` short-circuits on `by_number[h] != hash` and emits
+  a `tracing::warn!` with both hashes, then writes the record via
+  `record_fork`. The persistent block index is untouched.
+- New `NodeState::list_forks() -> Result<Vec<ForkRecord>>` for the
+  RPC + ops tooling.
+- New test
+  `fork_at_same_height_records_evidence` commits two distinct
+  blocks at height 1, asserts head doesn't advance and the
+  `ForkRecord` round-trips with both hashes intact.
+
+#### `aii-rpc`
+
+- New JSON-RPC method `aii_listForks() -> Vec<ForkView>`.
+- New response type
+  `ForkView { height, canonical_hash, fork_hash }` (every field
+  hex-encoded).
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **Re-org execution still missing.** Persisting the rejected block
+  is one half of fork choice; rolling state mutations back to the
+  common ancestor and replaying the heavier branch is the other.
+  That sits on the engine apply-then-hash refactor that also fixes
+  `state_root` / `receipts_root` in the header.
+- **No fork-weight comparison yet.** Today's rule is "first-block-
+  wins at any height" — the BFT certificate from the actual leader
+  doesn't yet override an earlier same-height arrival. Weight-based
+  tiebreaking lands together with re-org execution.
+
 ## [0.0.53] — 2026-05-26
 
 ### Added — Sub-chain consensus selector + persisted label (D.3 primitive)
