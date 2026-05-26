@@ -1,0 +1,17 @@
+[package]
+name = "aii-erc20"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ERC20-compatible token ABI helpers (selectors + ABI encode/decode) for AII."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+aii-types = { workspace = true }
+aii-crypto = { workspace = true }

@@ -5,6 +5,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.51] — 2026-05-26
+
+### Added — ERC-20 ABI helpers (roadmap E.1)
+
+A new `aii-erc20` crate ships the canonical 4-byte function selectors
++ ABI encoder/decoder helpers for every ERC-20 method. With this
+crate, building token-aware clients on top of `eth_sendRawTransaction`
++ `eth_call` requires zero offline tooling — selectors and call data
+are produced from `Address` + `U256` arguments in pure Rust.
+
+#### `aii-erc20` (new crate)
+
+- Compile-time consts for every standard selector
+  (`SELECTOR_TOTAL_SUPPLY`, `SELECTOR_BALANCE_OF`, `SELECTOR_TRANSFER`,
+  `SELECTOR_APPROVE`, `SELECTOR_ALLOWANCE`, `SELECTOR_TRANSFER_FROM`).
+- `encode_balance_of / encode_total_supply / encode_transfer /
+  encode_approve / encode_allowance / encode_transfer_from` produce
+  ABI-correct calldata (left-padded address words + big-endian
+  uint256 amounts).
+- `decode_uint256_result / decode_bool_result` parse the 32-byte
+  return slots returned by Solidity contracts. Solidity's bool
+  convention (`0x00..01` for true) is handled.
+- 7 unit tests verify selectors match `keccak256(canonical_sig)[..4]`,
+  ABI layouts are byte-perfect, and decoders handle padding.
+- README documents the selector table and shows a balanceOf →
+  decode example.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No bundled reference bytecode.** The crate is ABI helpers only;
+  pair with any solc-compiled token (OpenZeppelin `ERC20Mock` is
+  the obvious choice). Adding a vendored stable bytecode constant
+  + an end-to-end revm deploy test is a v0.0.52+ chore.
+- **No event-bloom helpers.** `Transfer` / `Approval` event signature
+  decoders land alongside `eth_getLogs` (B.5 stretch).
+- **No EIP-2612 permit / EIP-3009 transferWithAuthorization** —
+  this crate sticks to the canonical ERC-20 surface.
+
 ## [0.0.50] — 2026-05-26
 
 ### Added — On-chain governance (roadmap E.2)
