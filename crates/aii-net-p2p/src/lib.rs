@@ -15,6 +15,9 @@
 #![warn(missing_docs)]
 
 pub mod discovery;
+pub mod noise;
+
+pub use noise::{handshake_initiator, handshake_responder, EncryptedSession, NoiseError};
 
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use std::net::SocketAddr;

@@ -5,6 +5,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.55] — 2026-05-26
+
+### Added — Noise XX encrypted transport primitive (C.4)
+
+The BFT gossip socket today is plaintext TCP — any intermediary can
+read consensus traffic and (worse) inject forged messages, since the
+application layer trusts on-wire bytes for signature inputs. v0.0.55
+ships the Noise primitive that closes that gap: a 3-message Noise XX
+handshake over the `Noise_XX_25519_ChaChaPoly_BLAKE2s` suite, followed
+by AEAD-encrypted application messages with a 16-bit length prefix.
+The primitive plugs onto any `AsyncRead + AsyncWrite` stream; wiring
+it into `Peer` / `Server` is the next chore.
+
+#### `aii-net-p2p`
+
+- New module `aii_net_p2p::noise` exporting:
+  - `initiator() / responder()` build handshake states with fresh
+    x25519 keypairs.
+  - `handshake_initiator(hs, stream) / handshake_responder(hs, stream)`
+    drive the 3-message XX exchange and return an `EncryptedSession`.
+  - `EncryptedSession::send_msg / recv_msg` encrypt + decrypt
+    application messages with a `u16` BE length prefix (Noise max
+    frame is 65 535 bytes).
+  - `NoiseError` covers snow state-machine, I/O, and oversized-frame
+    rejection.
+- Dependency on `snow = "0.9"` (default-resolver feature for the
+  pure-Rust crypto suite).
+- `tokio` feature set bumped to include `"time"` to fix a pre-existing
+  `discovery` compile-time gap surfaced by this build.
+- 2 integration tests over `tokio::io::duplex`:
+  - `xx_handshake_round_trips_encrypted_messages` — full XX → both
+    sides send + receive encrypted application messages.
+  - `encrypted_payload_is_not_plaintext` — sanity that the AEAD path
+    actually decrypts (a tampered byte would fail).
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **`Peer` and `Server` are still plaintext.** The Noise primitive
+  is in isolation; the existing TCP transport in `lib.rs` hasn't
+  been switched to it yet. Wiring is a one-method-per-side change
+  but pairs cleanly with the libp2p (C.3) protocol-stack work.
+- **No static-key identity binding.** Each session uses a fresh
+  x25519 keypair — peer identity is bound by the higher-layer
+  `Hello` message, not the Noise static key. A static-key plus
+  signed handshake-pubkey commit is a v0.0.57+ deliverable.
+- **No multiplexing.** Each Noise session is a single
+  encrypted-byte-stream; running BFT gossip + discovery over one
+  socket needs an outer mux (yamux / mplex / libp2p substreams)
+  before C.3 can fold this in.
+
 ## [0.0.54] — 2026-05-26
 
 ### Added — Fork-detection primitive + RPC (C.2 observability)
