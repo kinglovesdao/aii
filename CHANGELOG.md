@@ -5,6 +5,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.44] — 2026-05-26
+
+### Added — Cold-join block sync (roadmap C.1)
+
+**A fresh node can finally join the chain without a full data-dir
+copy.** Before this release the only way to add a third node to the
+testnet was to `scp` the entire RocksDB directory off an existing
+node (or wipe + restart every validator together). Now a node started
+with `--bootnode http://peer:8545` walks blocks from `local_head + 1`
+to the peer's tip, fetches each as RLP bytes via the new
+`aii_getRawBlock` RPC, and commits them into the local backend
+before opening its own RPC port. Each fetched block runs through the
+same `commit_block` path as a freshly produced one — so state
+mutations (subsidy minting, gas-fee credits, receipt indexing)
+deterministically replay.
+
+#### `aii-rpc`
+
+- New JSON-RPC method `aii_getRawBlock(numberOrHash) -> Option<String>`.
+  Returns the RLP-encoded `Block` (header + body) as `0x…` hex, or
+  `null` if unknown. Accepts decimal number, `0x…`-prefixed hex
+  number, or 32-byte block hash.
+- New trait method `RpcState::raw_block(&self, query)`; default
+  returns `None` so non-persistent backends compile unchanged.
+
+#### `aii-node`
+
+- New module `aii_node::sync`, public free function
+  `bootstrap_sync_from_peer(local: &NodeState, peer_url: &str) ->
+  Result<u64, _>`. Queries the peer's `eth_blockNumber`, fetches +
+  decodes + commits every missing block, returns the count synced.
+  Each block goes through the existing `commit_block` so all
+  downstream effects (state mutation, receipt index, subsidy) fire.
+- `aiid --bootnode URL` CLI flag: invokes the sync helper after
+  `recover()`/`new()` and before opening the RPC server, so the node
+  doesn't expose a partial view to clients during catch-up.
+- `NodeState::raw_block(query)` impl: walks the in-memory index,
+  RLP-encodes `Block { header, body }`, returns `0x…` hex.
+- Test-only accessor `blocks_read_test_hash_by_number(n)` exposed
+  via `#[doc(hidden)]` so the sync integration test can assert
+  byte-identical block hashes on the joining node.
+- New integration test
+  `sync::tests::cold_join_replays_full_chain_from_peer`: spawns a
+  producer with 5 indexed blocks + an RPC server, instantiates a
+  cold node against a fresh tempdir, calls `bootstrap_sync_from_peer`,
+  asserts the cold node ends at head=5 and every block hash matches
+  the producer's.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No cryptographic verification of synced blocks.** The cold-join
+  protocol trusts the bootnode — each synced block is committed
+  without checking the BFT certificate or leader VRF proof. A
+  light-client variant that does verify is C.2 / future work; today's
+  flow is safe only if the bootnode is honest.
+- **No incremental sync on a running node.** `bootstrap_sync_from_peer`
+  fires once at startup; if the node falls behind during operation,
+  it does not auto-resync from a peer. The BFT gossip path keeps
+  reconnected validators in lock-step, so the gap is only relevant
+  for non-validator full nodes (those will need a periodic
+  sync_tick).
+- **No sync over the BFT gossip socket.** We reuse the HTTP RPC
+  client to keep the dependency surface tiny. A binary-framed sync
+  protocol on the existing `aii-net-p2p` transport is a follow-up.
+
 ## [0.0.43] — 2026-05-26
 
 ### Added — Validator economics + per-tx logs bloom (roadmap B.3 + B.4 + B.5 partial)

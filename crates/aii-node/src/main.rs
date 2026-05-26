@@ -91,6 +91,14 @@ struct Cli {
     /// proposer for height N. Required when `--consensus poa`.
     #[arg(long, value_delimiter = ',')]
     authorities: Vec<String>,
+
+    /// Bootstrap RPC URL of an already-synced node. When set, on
+    /// startup the local node walks blocks from `local_head + 1` to
+    /// the peer's tip, fetching each via `aii_getRawBlock`, and
+    /// commits them into the local backend before opening RPC.
+    /// Skipped if the peer is at or behind the local head.
+    #[arg(long)]
+    bootnode: Option<String>,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -219,6 +227,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         NodeState::new(spec.clone(), Arc::clone(&backend))
     };
+
+    // Cold-join sync: catch up to the bootnode's head before opening
+    // RPC. Skips when no bootnode is set or when the peer is at/below
+    // our local head. Each fetched block goes through the same
+    // commit_block path as a freshly produced one — so state mutations
+    // (including subsidy minting) run as part of catch-up.
+    if let Some(boot_url) = cli.bootnode.as_deref() {
+        match aii_node::bootstrap_sync_from_peer(&node_state, boot_url).await {
+            Ok(synced) => tracing::info!(
+                head = node_state.head_block_number_sync(),
+                blocks_added = synced,
+                "bootstrap sync complete",
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "bootstrap sync failed — continuing with local head")
+            }
+        }
+    }
 
     // Production path: real BFT engine driven by genesis + keystore.
     let producer_handle = if cli.bft {

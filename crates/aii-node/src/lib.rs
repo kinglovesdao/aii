@@ -10,6 +10,9 @@
 
 pub mod bft_bootstrap;
 pub mod bft_p2p;
+pub mod sync;
+
+pub use sync::bootstrap_sync_from_peer;
 
 use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
@@ -476,6 +479,18 @@ impl NodeState {
         self.head.load(Ordering::Relaxed)
     }
 
+    /// Test-only: peek the in-memory `number → hash` map. Used by the
+    /// cold-join sync test to verify byte-identical block
+    /// reconstruction across producer/consumer pairs.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn blocks_read_test_hash_by_number(&self, n: u64) -> Option<H256> {
+        self.blocks
+            .read()
+            .ok()
+            .and_then(|s| s.by_number.get(&n).copied())
+    }
+
     /// Borrow the world-state for embedders who want to read/write accounts
     /// directly (e.g. apply a genesis allocation).
     pub const fn state(&self) -> &Arc<StateDb<RocksDbBackend>> {
@@ -710,6 +725,28 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn raw_block(&self, query: &str) -> Option<String> {
+        let s = self.blocks.read().ok()?;
+        let hash = if let Ok(n) = query.parse::<u64>() {
+            *s.by_number.get(&n)?
+        } else if let Some(stripped) = query.strip_prefix("0x") {
+            if let Ok(n) = u64::from_str_radix(stripped, 16) {
+                *s.by_number.get(&n)?
+            } else {
+                parse_hash_str(query)?
+            }
+        } else {
+            parse_hash_str(query)?
+        };
+        let header = s.by_hash.get(&hash)?.clone();
+        let body = s.body_by_hash.get(&hash)?.clone();
+        drop(s);
+        let block = Block { header, body };
+        let mut buf = alloy_rlp::bytes::BytesMut::new();
+        block.encode(&mut buf);
+        Some(format!("0x{}", hex::encode(&buf)))
     }
 
     async fn submit_raw_tx(&self, raw_hex: &str) -> Result<String, SubmitTxError> {

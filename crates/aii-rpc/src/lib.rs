@@ -160,6 +160,12 @@ pub trait RpcState: Send + Sync + 'static {
     async fn receipt_by_tx_hash(&self, _hash: &str) -> Option<ReceiptView> {
         None
     }
+
+    /// Return the RLP-encoded full `Block` (header + body) as `0x…`
+    /// hex. Default returns `None`; persistent backends should override.
+    async fn raw_block(&self, _query: &str) -> Option<String> {
+        None
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -291,6 +297,14 @@ pub trait AiiRpc {
     /// with a link back to its containing block.
     #[method(name = "getTransaction")]
     async fn get_transaction(&self, hash: String) -> RpcResult<Option<TxLookup>>;
+
+    /// `aii_getRawBlock(numberOrHash)` — full RLP-encoded `Block`
+    /// (header + body), returned as `0x…` hex. Lets a cold-joining
+    /// node reconstruct a byte-identical block (and therefore the
+    /// same block hash) without needing every header/body field
+    /// shipped through their typed views. Returns `null` if unknown.
+    #[method(name = "getRawBlock")]
+    async fn get_raw_block(&self, query: String) -> RpcResult<Option<String>>;
 }
 
 /// Response shape for `aii_getTransaction`.
@@ -445,6 +459,10 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
                 tx,
                 block_number: format!("0x{block_number:x}"),
             }))
+    }
+
+    async fn get_raw_block(&self, query: String) -> RpcResult<Option<String>> {
+        Ok(self.state.raw_block(&query).await)
     }
 }
 
