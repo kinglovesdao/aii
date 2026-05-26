@@ -25,6 +25,55 @@ const fn default_consensus_kind() -> ConsensusKind {
     ConsensusKind::Bft
 }
 
+/// Magic prefix used by sub-chain → parent flush transactions.
+///
+/// A self-transfer (`to == sender`, `value == 0`) whose calldata
+/// starts with these 9 bytes is interpreted by the parent's anchor
+/// decoder as a microchain checkpoint. See [`parse_flush_anchor`]
+/// for the exact wire layout.
+pub const FLUSH_TX_MAGIC: &[u8] = b"AII_FLUSH";
+
+/// Parsed flush-anchor calldata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushTxPayload {
+    /// Sub-chain id being anchored.
+    pub sub_chain_id: MicroChainId,
+    /// Block hash being checkpointed.
+    pub sub_block_hash: H256,
+    /// Sub-chain block number at the time of the checkpoint.
+    pub sub_block_number: u64,
+}
+
+/// Decode a sub-chain flush-tx calldata. Returns `None` if `data`
+/// doesn't carry the `AII_FLUSH` magic, has the wrong length, or
+/// fails any structural check. Safe to call on every tx; the magic
+/// + fixed length make false positives effectively impossible.
+///
+/// Wire layout (53 bytes total):
+/// `AII_FLUSH (9) ‖ sub_chain_id_be4 ‖ sub_block_hash[32] ‖ sub_block_number_be8`.
+#[must_use]
+pub fn parse_flush_anchor(data: &[u8]) -> Option<FlushTxPayload> {
+    const FRAME_LEN: usize = 9 + 4 + 32 + 8;
+    if data.len() != FRAME_LEN || !data.starts_with(FLUSH_TX_MAGIC) {
+        return None;
+    }
+    let rest = &data[FLUSH_TX_MAGIC.len()..];
+    let mut id_arr = [0u8; 4];
+    id_arr.copy_from_slice(&rest[..4]);
+    let sub_chain_id = MicroChainId(u32::from_be_bytes(id_arr));
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&rest[4..36]);
+    let sub_block_hash = H256::new(hash_arr);
+    let mut num_arr = [0u8; 8];
+    num_arr.copy_from_slice(&rest[36..44]);
+    let sub_block_number = u64::from_be_bytes(num_arr);
+    Some(FlushTxPayload {
+        sub_chain_id,
+        sub_block_hash,
+        sub_block_number,
+    })
+}
+
 /// Sub-chain identifier (32-bit, reserved 0 for main chain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MicroChainId(pub u32);
@@ -167,6 +216,37 @@ mod tests {
     fn empty_registry() {
         let r = Registry::new();
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn parse_flush_anchor_decodes_well_formed_payload() {
+        let mut data = Vec::with_capacity(53);
+        data.extend_from_slice(FLUSH_TX_MAGIC);
+        data.extend_from_slice(&77u32.to_be_bytes());
+        data.extend_from_slice(&[0xab; 32]);
+        data.extend_from_slice(&42u64.to_be_bytes());
+        let p = parse_flush_anchor(&data).expect("must decode");
+        assert_eq!(p.sub_chain_id.0, 77);
+        assert_eq!(p.sub_block_hash.as_bytes(), &[0xab; 32]);
+        assert_eq!(p.sub_block_number, 42);
+    }
+
+    #[test]
+    fn parse_flush_anchor_rejects_missing_magic() {
+        let mut data = vec![0u8; 53];
+        assert!(parse_flush_anchor(&data).is_none());
+        data[..9].copy_from_slice(b"NOT_FLUSH");
+        assert!(parse_flush_anchor(&data).is_none());
+    }
+
+    #[test]
+    fn parse_flush_anchor_rejects_wrong_length() {
+        let mut data = Vec::new();
+        data.extend_from_slice(FLUSH_TX_MAGIC);
+        data.extend_from_slice(&77u32.to_be_bytes());
+        data.extend_from_slice(&[0xab; 32]);
+        // Missing the 8-byte block number.
+        assert!(parse_flush_anchor(&data).is_none());
     }
 
     #[test]

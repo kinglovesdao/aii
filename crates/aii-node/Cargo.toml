@@ -31,6 +31,7 @@ aii-net-p2p = { workspace = true }
 aii-consensus-iface = { workspace = true }
 aii-consensus-poa = { workspace = true }
 aii-net-txpool = { workspace = true }
+aii-microchain = { workspace = true }
 aii-evm = { workspace = true }
 revm = "18"
 alloy-rlp = { workspace = true }

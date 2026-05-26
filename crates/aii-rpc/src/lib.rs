@@ -172,6 +172,12 @@ pub trait RpcState: Send + Sync + 'static {
     async fn slashings(&self) -> Vec<SlashView> {
         Vec::new()
     }
+
+    /// Return the most recent flush anchor for sub-chain `id`, or
+    /// `None` if no anchor has been recorded.
+    async fn subchain_anchor(&self, _id: u32) -> Option<SubchainAnchorView> {
+        None
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -317,6 +323,23 @@ pub trait AiiRpc {
     /// validators across history. Empty array = no slashings yet.
     #[method(name = "listSlashings")]
     async fn list_slashings(&self) -> RpcResult<Vec<SlashView>>;
+
+    /// `aii_getSubchainAnchor(sub_chain_id)` — most recent flush anchor
+    /// recorded by the parent chain for sub-chain `id`. Returns `null`
+    /// if no anchor has been flushed yet.
+    #[method(name = "getSubchainAnchor")]
+    async fn get_subchain_anchor(&self, id: u32) -> RpcResult<Option<SubchainAnchorView>>;
+}
+
+/// JSON-RPC view of a sub-chain flush anchor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubchainAnchorView {
+    /// Sub-chain block hash that was checkpointed (`0x…` hex).
+    pub sub_block_hash: String,
+    /// Parent-chain block hash that carries the checkpoint (`0x…` hex).
+    pub parent_block_hash: String,
+    /// Sub-chain block number at the time of the checkpoint (`0x…` hex).
+    pub sub_block_number: String,
 }
 
 /// JSON-RPC view of a slashing record.
@@ -492,6 +515,10 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn list_slashings(&self) -> RpcResult<Vec<SlashView>> {
         Ok(self.state.slashings().await)
+    }
+
+    async fn get_subchain_anchor(&self, id: u32) -> RpcResult<Option<SubchainAnchorView>> {
+        Ok(self.state.subchain_anchor(id).await)
     }
 }
 

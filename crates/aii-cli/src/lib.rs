@@ -233,8 +233,21 @@ pub async fn run_subchain(
         sub_head_hash = h;
 
         if n % flush_interval_blocks == 0 {
-            // Build flush tx: self-transfer with calldata = sub_hash || u64::be(n)
-            let mut data = Vec::with_capacity(40);
+            // Build flush tx: self-transfer with calldata =
+            //   b"AII_FLUSH" (9)
+            // ‖ sub_chain_id_be4    (4)
+            // ‖ sub_block_hash      (32)
+            // ‖ sub_block_number_be8(8)
+            // = 53 bytes. The 9-byte ASCII magic lets the parent's
+            // anchor-decoder identify a sub-chain flush among
+            // ordinary self-transfers, and the embedded id removes
+            // any ambiguity when multiple sub-chains anchor into
+            // the same parent.
+            let mut data = Vec::with_capacity(9 + 4 + 32 + 8);
+            data.extend_from_slice(aii_microchain::FLUSH_TX_MAGIC);
+            #[allow(clippy::cast_possible_truncation)]
+            let sub_id_be4 = (sub_chain_id as u32).to_be_bytes();
+            data.extend_from_slice(&sub_id_be4);
             data.extend_from_slice(h.as_bytes());
             data.extend_from_slice(&n.to_be_bytes());
             let mut tx = TxLegacy {

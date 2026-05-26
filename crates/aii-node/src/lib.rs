@@ -19,7 +19,8 @@ use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, HeaderView, LogView, ReceiptView, RpcState, SlashView, SubmitTxError, TxView,
+    AccountView, HeaderView, LogView, ReceiptView, RpcState, SlashView, SubchainAnchorView,
+    SubmitTxError, TxView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -264,6 +265,105 @@ impl NodeState {
         }
         self.persist_block(block, hash);
         self.execute_block_txs(block);
+        self.scan_microchain_anchors(block, hash);
+    }
+
+    /// Walk every tx in `block` looking for sub-chain flush-anchor
+    /// calldata (`AII_FLUSH ‖ sub_chain_id_be4 ‖ sub_block_hash ‖
+    /// sub_block_number_be8`). Each match updates the
+    /// `ColumnFamily::MicroChain` registry with the new
+    /// [`aii_microchain::FlushAnchor`].
+    fn scan_microchain_anchors(&self, block: &Block, parent_block_hash: H256) {
+        let chain_id = self.spec.chain_id;
+        for tx in &block.body.transactions {
+            let payload = match tx {
+                Tx::Legacy(t) => aii_microchain::parse_flush_anchor(&t.data),
+                Tx::Eip1559(t) => aii_microchain::parse_flush_anchor(&t.data),
+                Tx::Eip4844(t) => aii_microchain::parse_flush_anchor(&t.data),
+            };
+            let Some(payload) = payload else { continue };
+            // Light sanity: sender == to, value == 0 (per the producer
+            // convention in `aii cli run-subchain`).
+            let to = match tx {
+                Tx::Legacy(t) => t.to,
+                Tx::Eip1559(t) => t.to,
+                Tx::Eip4844(t) => Some(t.to),
+            };
+            let Ok(sender) = tx.recover_signer(chain_id) else {
+                continue;
+            };
+            if Some(sender) != to {
+                continue;
+            }
+            let anchor = aii_microchain::FlushAnchor {
+                sub_block_hash: payload.sub_block_hash,
+                parent_block_hash,
+                sub_block_number: payload.sub_block_number,
+            };
+            self.persist_flush_anchor(payload.sub_chain_id, &anchor);
+            tracing::info!(
+                sub_chain_id = payload.sub_chain_id.0,
+                sub_block_number = payload.sub_block_number,
+                parent_block = block.header.number,
+                "recorded microchain flush anchor",
+            );
+        }
+    }
+
+    /// Persist a flush anchor for `id` to `ColumnFamily::MicroChain`
+    /// under key `b"anchor:" ‖ id_be4`. Overwrites the previous anchor
+    /// idempotently — last-flushed wins.
+    fn persist_flush_anchor(
+        &self,
+        id: aii_microchain::MicroChainId,
+        anchor: &aii_microchain::FlushAnchor,
+    ) {
+        let mut key = Vec::with_capacity(7 + 4);
+        key.extend_from_slice(b"anchor:");
+        key.extend_from_slice(&id.0.to_be_bytes());
+        // Value: sub_block_hash[32] ‖ parent_block_hash[32] ‖ sub_block_number_be8
+        let mut val = Vec::with_capacity(72);
+        val.extend_from_slice(anchor.sub_block_hash.as_bytes());
+        val.extend_from_slice(anchor.parent_block_hash.as_bytes());
+        val.extend_from_slice(&anchor.sub_block_number.to_be_bytes());
+        if let Err(e) = self.backend.put(ColumnFamily::MicroChain, &key, &val) {
+            tracing::error!(
+                id = id.0,
+                error = %e,
+                "persist_flush_anchor: write failed",
+            );
+        }
+    }
+
+    /// Read the most recent flush anchor for `id`, or `Ok(None)` if no
+    /// flush has been recorded for that sub-chain yet.
+    ///
+    /// # Errors
+    /// Propagates backend errors.
+    pub fn last_flush_anchor(
+        &self,
+        id: aii_microchain::MicroChainId,
+    ) -> Result<Option<aii_microchain::FlushAnchor>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut key = Vec::with_capacity(7 + 4);
+        key.extend_from_slice(b"anchor:");
+        key.extend_from_slice(&id.0.to_be_bytes());
+        let Some(v) = self.backend.get(ColumnFamily::MicroChain, &key)? else {
+            return Ok(None);
+        };
+        if v.len() != 72 {
+            return Ok(None);
+        }
+        let mut sub = [0u8; 32];
+        sub.copy_from_slice(&v[..32]);
+        let mut parent = [0u8; 32];
+        parent.copy_from_slice(&v[32..64]);
+        let mut num = [0u8; 8];
+        num.copy_from_slice(&v[64..72]);
+        Ok(Some(aii_microchain::FlushAnchor {
+            sub_block_hash: H256::new(sub),
+            parent_block_hash: H256::new(parent),
+            sub_block_number: u64::from_be_bytes(num),
+        }))
     }
 
     /// Persist header + body + tx-index entries for `block` to RocksDB in a
@@ -841,6 +941,18 @@ impl RpcState for NodeState {
         Some((tx_to_view(tx, chain_id), block_number))
     }
 
+    async fn subchain_anchor(&self, id: u32) -> Option<SubchainAnchorView> {
+        let anchor = self
+            .last_flush_anchor(aii_microchain::MicroChainId(id))
+            .ok()
+            .flatten()?;
+        Some(SubchainAnchorView {
+            sub_block_hash: format!("0x{}", hex::encode(anchor.sub_block_hash.as_bytes())),
+            parent_block_hash: format!("0x{}", hex::encode(anchor.parent_block_hash.as_bytes())),
+            sub_block_number: format!("0x{:x}", anchor.sub_block_number),
+        })
+    }
+
     async fn slashings(&self) -> Vec<SlashView> {
         self.list_slashings()
             .ok()
@@ -1192,6 +1304,20 @@ mod tests {
         assert_eq!(r[0].number, "0xa");
         assert_eq!(r[4].number, "0x6");
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn subchain_flush_anchor_persists_and_reads_back() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let id = aii_microchain::MicroChainId(7);
+        let anchor = aii_microchain::FlushAnchor {
+            sub_block_hash: H256::new([0x11; 32]),
+            parent_block_hash: H256::new([0x22; 32]),
+            sub_block_number: 99,
+        };
+        state.persist_flush_anchor(id, &anchor);
+        let back = state.last_flush_anchor(id).unwrap().unwrap();
+        assert_eq!(back, anchor);
     }
 
     #[test]

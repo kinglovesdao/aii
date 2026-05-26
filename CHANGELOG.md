@@ -5,6 +5,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.47] — 2026-05-26
+
+### Added — Microchain anchor decoder + RPC (roadmap D.2)
+
+Since v0.0.38 the sub-chain runner has emitted flush-anchor txs into
+the parent chain, but the parent treated them as ordinary self-
+transfers: their calldata was opaque, no registry record was kept,
+and explorers had no way to ask "what's the latest checkpoint for
+sub-chain N?". v0.0.47 closes that loop end-to-end:
+
+#### `aii-microchain`
+
+- New `FLUSH_TX_MAGIC = b"AII_FLUSH"` constant. Sub-chain flush txs
+  now carry the 53-byte calldata layout
+  `AII_FLUSH (9) ‖ sub_chain_id_be4 ‖ sub_block_hash[32] ‖
+  sub_block_number_be8`. The magic + fixed length make false-
+  positive matches against ordinary self-transfers effectively
+  impossible.
+- New `parse_flush_anchor(data: &[u8]) -> Option<FlushTxPayload>`
+  decoder. Safe to call on every tx; rejects wrong-magic / wrong-
+  length payloads.
+- New `FlushTxPayload { sub_chain_id, sub_block_hash,
+  sub_block_number }` struct.
+- New tests: `parse_flush_anchor_decodes_well_formed_payload`,
+  `parse_flush_anchor_rejects_missing_magic`,
+  `parse_flush_anchor_rejects_wrong_length`.
+
+#### `aii-cli`
+
+- `run_subchain` (the `aii subchain run` CLI) now prefixes flush
+  calldata with `FLUSH_TX_MAGIC` and embeds the 4-byte sub_chain_id
+  so a parent indexes anchors by chain id without ambiguity. Total
+  calldata grows from 40 → 53 bytes (still well under any practical
+  gas-limit-driven cap).
+
+#### `aii-node`
+
+- `NodeState::commit_block` now walks every tx in the new block via
+  `scan_microchain_anchors`. For each tx whose calldata decodes to
+  a `FlushTxPayload` AND whose sender == to (self-tx safety check),
+  the resulting `FlushAnchor` is persisted to `ColumnFamily::MicroChain`
+  under key `b"anchor:" ‖ sub_chain_id_be4`. Last-flushed wins —
+  one entry per sub-chain.
+- New `last_flush_anchor(MicroChainId) -> Result<Option<FlushAnchor>>`
+  reads the same record back.
+- `RpcState::subchain_anchor(id)` default returns `None`; NodeState
+  overrides to hex-encode the persisted `FlushAnchor` as a
+  `SubchainAnchorView`.
+- New test
+  `subchain_flush_anchor_persists_and_reads_back` round-trips a
+  synthesised `FlushAnchor` through the `MicroChain` CF.
+
+#### `aii-rpc`
+
+- New JSON-RPC method `aii_getSubchainAnchor(id: u32) -> Option<SubchainAnchorView>`.
+- New response type `SubchainAnchorView { sub_block_hash,
+  parent_block_hash, sub_block_number }` (all `0x…` hex).
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **Sub-chain runtime persistence (D.1) still missing.** Anchors are
+  now recorded on the parent — but `aii subchain run` itself still
+  loses its in-memory PoA state on restart. Persistent sub-chain
+  data-dirs are the obvious next sub-chain release.
+- **No non-PoA sub-chain engines (D.3).** Sub-chains still only run
+  the PoA engine (single operator authority). DPoS / BFT sub-chains
+  reuse the existing engines but need separate wiring.
+- **No anchor finality / re-flush handling.** If a parent block
+  containing an anchor gets re-orged out, the `MicroChain` CF entry
+  is not rolled back. Becomes relevant when fork choice (C.2) lands.
+
 ## [0.0.46] — 2026-05-26
 
 ### Added — Slashing record persistence + RPC (roadmap C.7 partial)
