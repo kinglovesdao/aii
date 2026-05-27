@@ -307,6 +307,51 @@ impl BftEngine {
             .map(|c| (c.height(), c.round(), c.phase()))
     }
 
+    /// Force-advance the coordinator for the next-to-commit height to
+    /// `target_round` (v0.0.71).
+    ///
+    /// Use this on startup after [`Self::from_recovered`] when the
+    /// host has loaded a persisted `{height, round}` snapshot — the
+    /// engine creates a fresh coordinator at the recovered height
+    /// then calls [`crate::coordinator::RoundCoordinator::fire_timeout`]
+    /// `target_round` times so the local round matches what the rest
+    /// of the validator set is on. Without this, a restarted
+    /// validator would come up at round 0 while live peers are at
+    /// round R, and their votes would not combine into a quorum
+    /// until the local engine itself had timed out R times — a
+    /// ~5..30 s liveness hole per restart.
+    ///
+    /// No-op when `target_round == 0`. Idempotent: calling twice for
+    /// the same height + round is observationally identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BftError::WrongHeight`] only when the coordinator is
+    /// already initialized for a different height — i.e. the caller
+    /// attempted to fast-forward after a vote has already arrived
+    /// for this round. The typical startup-time call site cannot hit
+    /// this branch because no votes have been ingested yet.
+    pub fn fast_forward_to_round(&self, target_round: u32) -> Result<(), BftError> {
+        let mut g = self.state.lock();
+        let next_height = g.head_number + 1;
+        // Drop any prior coordinator for an old height (defensive — the
+        // engine resets coordinator to None on commit, so this only
+        // matters if the host called this method twice without an
+        // intervening commit).
+        if let Some(existing) = g.coordinator.as_ref() {
+            if existing.height() != next_height {
+                return Err(BftError::WrongHeight);
+            }
+        }
+        let mut coord =
+            RoundCoordinator::new(next_height, g.seed, self.config.validator_set.clone());
+        for _ in 0..target_round {
+            coord.fire_timeout();
+        }
+        g.coordinator = Some(coord);
+        Ok(())
+    }
+
     /// Leader index for the active round (if any).
     #[must_use]
     pub fn current_leader_index(&self) -> Option<usize> {
@@ -1092,6 +1137,36 @@ mod tests {
         let next = cold.advance_single().unwrap();
         assert_eq!(next.block.header.number, 2);
         assert_eq!(next.block.header.parent_hash, recovered.hash());
+    }
+
+    /// v0.0.71 `fast_forward_to_round` lands the coordinator at the
+    /// supplied round (advancing through the expected count of
+    /// timeouts) and does not affect the chain head.
+    #[test]
+    fn fast_forward_to_round_lands_at_target() {
+        let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
+        engine.fast_forward_to_round(4).unwrap();
+        let (height, round, _phase) = engine
+            .current_round_state()
+            .expect("coordinator must exist after fast_forward");
+        assert_eq!(height, 1);
+        assert_eq!(round, 4);
+        // Head must not have moved — fast-forward is a coordinator-
+        // local operation.
+        let (_, head_n) = engine.head();
+        assert_eq!(head_n, 0);
+    }
+
+    /// `fast_forward_to_round(0)` is a no-op for the round number
+    /// but still creates the coordinator (so subsequent ticks see
+    /// "I'm at round 0 for this height").
+    #[test]
+    fn fast_forward_to_round_zero_creates_coordinator_at_round_zero() {
+        let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
+        engine.fast_forward_to_round(0).unwrap();
+        let (height, round, _phase) = engine.current_round_state().unwrap();
+        assert_eq!(height, 1);
+        assert_eq!(round, 0);
     }
 
     /// `from_recovered` against a genesis-only chain matches `new`.

@@ -412,11 +412,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 outbound_only = cli.bft_outbound_only,
                 "BFT gossip transport listening"
             );
+            // v0.0.71: restore in-flight BFT round state. If the
+            // local node previously persisted a `(height, round)`
+            // snapshot AND that snapshot is for the height we're
+            // about to coordinate (recovered_head + 1), fast-forward
+            // the coordinator to the saved round. This closes the
+            // "single-validator restart freezes consensus" gap: the
+            // restarted node lands at the same round as live peers,
+            // their votes combine for quorum immediately.
+            let bft_state_path = aii_node::bft_state::state_path(&cli.data_dir);
+            if let Ok(Some(snap)) = aii_node::bft_state::load(&bft_state_path) {
+                if snap.height == recovered_head_number + 1 && snap.round > 0 {
+                    if let Err(e) = engine.fast_forward_to_round(snap.round) {
+                        tracing::warn!(
+                            ?e,
+                            height = snap.height,
+                            target_round = snap.round,
+                            "BFT fast-forward to persisted round failed"
+                        );
+                    } else {
+                        tracing::info!(
+                            height = snap.height,
+                            round = snap.round,
+                            "restored BFT coordinator from persisted round state"
+                        );
+                    }
+                }
+            }
             let gossip = Arc::new(BftGossip::new(engine.clone(), transport));
             let engine_for_loop = engine.clone();
             let state_for_pool = node_state.clone();
             let max_txs_per_block =
                 (spec.initial_gas_limit / aii_consensus_bft::PLACEHOLDER_TX_GAS) as usize;
+            // Round-state persistence cadence — only write when the
+            // tracked tuple actually changes.
+            let bft_state_path_for_loop = bft_state_path;
+            let last_persisted_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let last_persisted_round = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
             // Drain the mempool into the engine's pending-txs queue
             // every tick. `extend_pending_txs` appends without
             // overwriting anything the proposer has not yet packed
@@ -458,6 +490,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             gas_used,
                             "BFT block finalised (multi)",
                         );
+                        // v0.0.71: on every committed block reset the
+                        // round snapshot to "(N+1, 0)" — the next
+                        // coordinator will be created at round 0 of
+                        // height N+1. Persist now so a crash before
+                        // any round timeout has fired still recovers
+                        // at the right height.
+                        let snap = aii_node::bft_state::BftStateSnapshot::new(n + 1, 0);
+                        if let Err(e) = aii_node::bft_state::save(&bft_state_path_for_loop, snap) {
+                            tracing::warn!(?e, "bft_state.json save (post-commit) failed");
+                        }
+                    }
+                    // v0.0.71: persist the active round whenever it
+                    // changes so a single-validator restart can
+                    // fast-forward back to it.
+                    if let Some((height, round, _phase)) = engine_for_loop.current_round_state() {
+                        let now = (height, round);
+                        if last_persisted_round.load(std::sync::atomic::Ordering::Relaxed)
+                            != round as u64
+                            || last_persisted_height.load(std::sync::atomic::Ordering::Relaxed)
+                                != height
+                        {
+                            let snap = aii_node::bft_state::BftStateSnapshot::new(now.0, now.1);
+                            if let Err(e) =
+                                aii_node::bft_state::save(&bft_state_path_for_loop, snap)
+                            {
+                                tracing::warn!(?e, "bft_state.json save (round change) failed");
+                            } else {
+                                last_persisted_height
+                                    .store(height, std::sync::atomic::Ordering::Relaxed);
+                                last_persisted_round
+                                    .store(round as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }

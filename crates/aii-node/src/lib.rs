@@ -10,6 +10,7 @@
 
 pub mod bft_bootstrap;
 pub mod bft_p2p;
+pub mod bft_state;
 pub mod dpos;
 pub mod governance;
 pub mod peer_cache;
