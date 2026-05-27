@@ -31,6 +31,10 @@ use tokio::net::UdpSocket;
 pub const TYPE_PING: u8 = 0x01;
 /// Pong.
 pub const TYPE_PONG: u8 = 0x02;
+/// FindNode (0x03) — ask peer to return the K closest nodes to `target`.
+pub const TYPE_FIND_NODE: u8 = 0x03;
+/// Neighbours (0x04) — reply listing up to K peer endpoints.
+pub const TYPE_NEIGHBOURS: u8 = 0x04;
 
 /// devp2p Discovery v4 protocol version.
 pub const DISCOVERY_VERSION: u32 = 4;
@@ -141,6 +145,26 @@ pub struct Pong {
     pub expiration: u64,
 }
 
+/// FindNode packet (type 0x03) — request the K nodes closest to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindNode {
+    /// 32-byte target node id (typically `keccak256(remote_pubkey)`).
+    pub target: H256,
+    /// Unix-seconds expiration.
+    pub expiration: u64,
+}
+
+/// Neighbours packet (type 0x04) — reply to a FindNode listing up to
+/// K candidate endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Neighbours {
+    /// Candidate endpoints. Empty list is valid (means "I know nothing
+    /// closer than myself").
+    pub nodes: Vec<Endpoint>,
+    /// Unix-seconds expiration.
+    pub expiration: u64,
+}
+
 /// Top-level packet enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
@@ -148,6 +172,10 @@ pub enum Packet {
     Ping(Ping),
     /// Pong (0x02).
     Pong(Pong),
+    /// FindNode (0x03).
+    FindNode(FindNode),
+    /// Neighbours (0x04).
+    Neighbours(Neighbours),
 }
 
 impl Packet {
@@ -157,6 +185,8 @@ impl Packet {
         match self {
             Self::Ping(_) => TYPE_PING,
             Self::Pong(_) => TYPE_PONG,
+            Self::FindNode(_) => TYPE_FIND_NODE,
+            Self::Neighbours(_) => TYPE_NEIGHBOURS,
         }
     }
 
@@ -195,6 +225,41 @@ impl Packet {
                 p.ping_hash.encode(&mut buf);
                 p.expiration.encode(&mut buf);
             }
+            Self::FindNode(p) => {
+                let payload = p.target.length() + p.expiration.length();
+                RlpHeader {
+                    list: true,
+                    payload_length: payload,
+                }
+                .encode(&mut buf);
+                p.target.encode(&mut buf);
+                p.expiration.encode(&mut buf);
+            }
+            Self::Neighbours(p) => {
+                let nodes_inner: usize = p
+                    .nodes
+                    .iter()
+                    .map(|n| {
+                        n.rlp_payload_length() + alloy_rlp::length_of_length(n.rlp_payload_length())
+                    })
+                    .sum();
+                let nodes_field = nodes_inner + alloy_rlp::length_of_length(nodes_inner);
+                let payload = nodes_field + p.expiration.length();
+                RlpHeader {
+                    list: true,
+                    payload_length: payload,
+                }
+                .encode(&mut buf);
+                RlpHeader {
+                    list: true,
+                    payload_length: nodes_inner,
+                }
+                .encode(&mut buf);
+                for n in &p.nodes {
+                    n.encode_to(&mut buf);
+                }
+                p.expiration.encode(&mut buf);
+            }
         }
         buf.to_vec()
     }
@@ -226,6 +291,24 @@ impl Packet {
                     ping_hash,
                     expiration,
                 }))
+            }
+            TYPE_FIND_NODE => {
+                let target = H256::decode(&mut data).map_err(DiscoveryError::Rlp)?;
+                let expiration = u64::decode(&mut data).map_err(DiscoveryError::Rlp)?;
+                Ok(Self::FindNode(FindNode { target, expiration }))
+            }
+            TYPE_NEIGHBOURS => {
+                let nodes_h = RlpHeader::decode(&mut data).map_err(DiscoveryError::Rlp)?;
+                if !nodes_h.list {
+                    return Err(DiscoveryError::Frame("expected nodes list"));
+                }
+                let mut nodes = Vec::new();
+                let start_len = data.len();
+                while start_len - data.len() < nodes_h.payload_length {
+                    nodes.push(Endpoint::decode_from(&mut data).map_err(DiscoveryError::Rlp)?);
+                }
+                let expiration = u64::decode(&mut data).map_err(DiscoveryError::Rlp)?;
+                Ok(Self::Neighbours(Neighbours { nodes, expiration }))
             }
             other => Err(DiscoveryError::UnknownPacketType(other)),
         }
@@ -513,6 +596,42 @@ mod tests {
     }
 
     #[test]
+    fn find_node_round_trip() {
+        let secret = fixed_secret(7);
+        let pkt = Packet::FindNode(FindNode {
+            target: H256::new([0xab; 32]),
+            expiration: 1_700_000_000,
+        });
+        let wire = encode_packet(&secret, &pkt).unwrap();
+        let decoded = decode_packet(&wire).unwrap();
+        assert_eq!(decoded.packet, pkt);
+    }
+
+    #[test]
+    fn neighbours_round_trip_with_multiple_nodes() {
+        let secret = fixed_secret(8);
+        let pkt = Packet::Neighbours(Neighbours {
+            nodes: vec![sample_endpoint(30303), sample_endpoint(30304)],
+            expiration: 1_700_000_000,
+        });
+        let wire = encode_packet(&secret, &pkt).unwrap();
+        let decoded = decode_packet(&wire).unwrap();
+        assert_eq!(decoded.packet, pkt);
+    }
+
+    #[test]
+    fn neighbours_round_trip_empty_list() {
+        let secret = fixed_secret(9);
+        let pkt = Packet::Neighbours(Neighbours {
+            nodes: vec![],
+            expiration: 1,
+        });
+        let wire = encode_packet(&secret, &pkt).unwrap();
+        let decoded = decode_packet(&wire).unwrap();
+        assert_eq!(decoded.packet, pkt);
+    }
+
+    #[test]
     fn unknown_type_byte_rejected() {
         let secret = fixed_secret(5);
         let pong = Packet::Pong(Pong {
@@ -586,7 +705,7 @@ mod tests {
         assert_eq!(from_b, b_addr);
         match decoded_pong.packet {
             Packet::Pong(p) => assert_eq!(p.ping_hash, ping_hash),
-            Packet::Ping(_) => panic!("expected Pong, got Ping"),
+            other => panic!("expected Pong, got {other:?}"),
         }
     }
 

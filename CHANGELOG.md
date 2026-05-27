@@ -5,6 +5,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.63] — 2026-05-26
+
+### Added — FindNode / Neighbours UDP packets (closes C.3 wire-up)
+
+The Discovery v4 wire was Ping/Pong-only since v0.0.17. The Kademlia
+routing table shipped in v0.0.56 had no UDP transport to feed it.
+v0.0.63 adds the remaining two packet types so the table can finally
+be populated end-to-end:
+
+#### `aii-net-p2p::discovery`
+
+- New packet types: `TYPE_FIND_NODE = 0x03`, `TYPE_NEIGHBOURS = 0x04`.
+- `Packet` enum gains `FindNode(FindNode)` + `Neighbours(Neighbours)`
+  variants.
+- `FindNode { target: H256, expiration: u64 }` requests the K closest
+  nodes to `target`.
+- `Neighbours { nodes: Vec<Endpoint>, expiration: u64 }` carries up
+  to K candidate endpoints. Empty list ("I know nothing closer than
+  myself") is valid.
+- Existing signed-packet pipeline (`encode_packet` + `decode_packet`)
+  handles the new types transparently; they go through the same
+  secp256k1 sign + keccak hash verify path.
+- 3 new round-trip tests: `find_node_round_trip`,
+  `neighbours_round_trip_with_multiple_nodes`,
+  `neighbours_round_trip_empty_list`.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No `UdpDiscovery::find_node()` driver method.** The packet types
+  are encodable / decodable; the request-response state machine
+  (send FindNode → wait for Neighbours, route into
+  `KademliaTable::insert`) is the next chore.
+- **No iterative-lookup `find_node_closest`.** Multi-round Kademlia
+  walks (ask N closest, then N closest of those, until convergence)
+  land in the same follow-up.
+- **No NAT-pierce / endpoint-prediction.** Each `Neighbours` reply
+  takes the included endpoints at face value — no validation that
+  the `udp_port` actually responds. Reachability checks add a
+  separate Ping after insertion.
+
 ## [0.0.62] — 2026-05-26
 
 ### Changed — Precompile opcodes are now Solidity-style selectors
