@@ -92,6 +92,14 @@ pub struct BftGossip<T: BftTransport> {
     engine: Arc<BftEngine>,
     transport: T,
     flags: Mutex<RoundFlags>,
+    /// v0.0.73: blocks the engine committed during `tick()` that the
+    /// host hasn't drained yet. The gossip auto-harvests after each
+    /// inbound message so that the engine's `head_hash` advances
+    /// inline with the inbox processing — otherwise a fast proposer's
+    /// next-height proposal arrives at a follower whose head is still
+    /// at N-1 and the reconstructed block hashes against the wrong
+    /// parent.
+    harvested_blocks: Mutex<Vec<aii_block::Block>>,
 }
 
 impl<T: BftTransport> BftGossip<T> {
@@ -101,6 +109,26 @@ impl<T: BftTransport> BftGossip<T> {
             engine,
             transport,
             flags: Mutex::new(RoundFlags::default()),
+            harvested_blocks: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take ownership of every block that the engine committed during
+    /// recent `tick()` calls (v0.0.73). Hosts call this from their
+    /// main loop to apply the blocks to their world-state storage.
+    /// Returns the blocks in commit order; the internal buffer is
+    /// emptied. Cheap when there's nothing to harvest.
+    pub fn drain_harvested(&self) -> Vec<aii_block::Block> {
+        std::mem::take(&mut *self.harvested_blocks.lock())
+    }
+
+    /// v0.0.73: harvest any block the engine has just committed and
+    /// stash it on the gossip buffer for the host to drain. Called
+    /// inside `tick()` after every inbound message so the engine's
+    /// `head_hash` is always up-to-date when the next message lands.
+    fn auto_harvest(&self) {
+        while let Some(block) = self.engine.try_harvest_committed() {
+            self.harvested_blocks.lock().push(block);
         }
     }
 
@@ -124,7 +152,12 @@ impl<T: BftTransport> BftGossip<T> {
     /// loops in tests).
     pub fn tick(&self) -> usize {
         let mut activity = 0;
-        // 1. Drain inbox.
+        // 1. Drain inbox — auto-harvest between messages so the
+        // engine's head_hash advances in lockstep with the inbox.
+        // Without this, a fast proposer's next-height proposal lands
+        // before the receiver has committed the previous block and
+        // the reconstructed parent_hash diverges → ProposalHashMismatch
+        // (v0.0.73).
         let mut inbox_drained = 0;
         while let Some(bytes) = self.transport.try_recv() {
             inbox_drained += 1;
@@ -132,6 +165,7 @@ impl<T: BftTransport> BftGossip<T> {
                 let _ = self.dispatch_inbound(msg);
                 activity += 1;
             }
+            self.auto_harvest();
         }
         if inbox_drained > 0 {
             tracing::debug!(count = inbox_drained, "gossip.tick: drained inbox");
@@ -154,6 +188,10 @@ impl<T: BftTransport> BftGossip<T> {
             tracing::debug!("gossip.tick: bootstrap_propose (I'd lead next height)");
             activity += self.bootstrap_propose();
         }
+        // Final harvest sweep in case the drive_phase above pushed us
+        // to Committed (rare, but possible if our own precommit was
+        // the quorum-forming vote and didn't traverse the inbox).
+        self.auto_harvest();
 
         activity
     }
@@ -600,11 +638,22 @@ mod tests {
         for _ in 0..50 {
             gossip_a.tick();
             gossip_b.tick();
+            // v0.0.73: gossip auto-harvests; the host drains via the
+            // gossip's buffer. Fall back to direct engine harvest in
+            // case the path ran twice (idempotent in v0.0.73).
             if committed_a.is_none() {
-                committed_a = e_a.try_harvest_committed();
+                committed_a = gossip_a
+                    .drain_harvested()
+                    .into_iter()
+                    .next()
+                    .or_else(|| e_a.try_harvest_committed());
             }
             if committed_b.is_none() {
-                committed_b = e_b.try_harvest_committed();
+                committed_b = gossip_b
+                    .drain_harvested()
+                    .into_iter()
+                    .next()
+                    .or_else(|| e_b.try_harvest_committed());
             }
             if committed_a.is_some() && committed_b.is_some() {
                 break;
@@ -656,14 +705,14 @@ mod tests {
         let gossip_b = BftGossip::new(e_b.clone(), t_b);
 
         // Tick until both engines have a head > 0 or we exhaust patience.
+        // v0.0.73: gossip auto-harvests; engine head advances inside
+        // tick() so we no longer need a separate try_harvest_committed
+        // call here.
         for _ in 0..50 {
             gossip_a.tick();
             gossip_b.tick();
-            // Harvest committed blocks via the engine's &self helper
-            // (the gossip layer doesn't auto-harvest; the host pulls
-            // committed blocks on its own cadence).
-            let _ = e_a.try_harvest_committed();
-            let _ = e_b.try_harvest_committed();
+            let _ = gossip_a.drain_harvested();
+            let _ = gossip_b.drain_harvested();
             if e_a.head().1 == 1 && e_b.head().1 == 1 {
                 break;
             }

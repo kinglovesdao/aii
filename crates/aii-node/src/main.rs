@@ -478,7 +478,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "equivocation evidence persisted via auto-trigger",
                         );
                     }
+                    // v0.0.73: gossip auto-harvests committed blocks
+                    // between inbox messages so the engine head stays
+                    // in lockstep with the inbox. Drain them here for
+                    // application to world-state + the post-commit
+                    // round-state snapshot. Belt-and-braces:
+                    // also call engine.try_harvest_committed() in
+                    // case a path outside gossip.tick produced a
+                    // commit (single-validator mode shares this loop
+                    // in some configurations).
+                    let mut harvested = gossip.drain_harvested();
                     if let Some(block) = engine_for_loop.try_harvest_committed() {
+                        harvested.push(block);
+                    }
+                    for block in harvested {
                         let n = block.header.number;
                         let tx_count = block.body.transactions.len();
                         let gas_used = block.header.gas_used;
