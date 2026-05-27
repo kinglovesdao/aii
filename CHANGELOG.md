@@ -5,6 +5,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.68] — 2026-05-26
+
+### Added — NAT-friendly BFT (outbound-only mode + 30 s idle reconnect)
+
+Validators sitting behind a home router (no NAT port forward),
+HTTP-only proxy chain (Mihomo / Clash, Cloudflare WARP, corporate
+VPN), or CGNAT'd ISP can now join the BFT set without exposing
+30311 to the public internet. The mechanism is BTC-style: bind the
+listener to a random loopback port, dial each peer via outbound
+TCP, and let every consensus message flow over the established
+outbound sockets in both directions.
+
+This closes the v0.0.65–v0.0.67 gap that forced the local 3rd node
+into observer-only mode: a node started with `--bft-outbound-only`
+needs nothing from its network except the ability to make outbound
+TCP to its peers. Once the peer is reachable the validator votes
+and proposes like any other; if the proxy / NAT drops the link,
+the new 30-second application-layer idle timeout closes the dead
+session within one block-time worth of silence and the dialer
+reconnects automatically. Net effect: "断网了一恢复就自动组网" —
+the local validator rejoins consensus on its own as soon as
+outbound TCP is back, without any operator action.
+
+#### `aii-node` (`aiid` binary)
+
+- New CLI flag `--bft-outbound-only` (default `false`). When set,
+  the BFT listener binds to `127.0.0.1:0` (kernel-assigned loopback
+  port, never exposed); all consensus traffic to `--peers` flows
+  over outbound TCP only. Compatible with `--encrypt-gossip` for a
+  Noise XX wrapped session.
+- New public constant `aii_node::bft_p2p::BFT_PEER_IDLE_TIMEOUT`
+  (= 30 s). Every BFT peer connection (plaintext or Noise) is now
+  killed when no inbound bytes arrive in this window, so the
+  dialer can immediately reconnect. Previously the read would
+  block forever, letting a half-dead session silently swallow
+  proposals and votes.
+- New ctors: `TcpBftTransport::new_outbound_only(peers)` and
+  `new_outbound_only_encrypted(peers)` for embedding the same
+  behavior into downstream binaries.
+
+#### Scope discipline
+
+Deferred to v0.0.69:
+
+- Adaptive round timeout (latency-aware scaling) — needs a latency
+  measurement infrastructure first.
+- BFT gossip relay (forward messages from peer A to peer C through
+  peer B) — needs hash-dedup data structure and care around
+  relay-driven equivocation reports.
+- Dynamic peer discovery / Kademlia-driven auto-network — full
+  "any port + any environment auto-network" is the v0.0.69 theme.
+- Hot-join validator (link to chain-stake registry instead of
+  genesis) — sits behind the v0.0.69 net layer.
+
 ## [0.0.67] — 2026-05-26
 
 ### Added — `--no-produce-blocks` + `--follow-seconds` observer mode

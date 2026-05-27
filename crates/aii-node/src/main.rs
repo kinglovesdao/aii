@@ -121,6 +121,16 @@ struct Cli {
     /// peers fails the handshake.
     #[arg(long, default_value = "false")]
     encrypt_gossip: bool,
+
+    /// BTC-style outbound-only BFT (v0.0.68). When set, the BFT
+    /// listener is bound to a random loopback port and only the
+    /// outbound TCP sockets to `--peers` carry consensus traffic.
+    /// Use this on validators that sit behind a home NAT or HTTP
+    /// proxy chain (Mihomo / Clash, Cloudflare WARP, corporate VPN)
+    /// where the public 30311 port is not reachable from the rest
+    /// of the validator set. Implies `--bft-listen 127.0.0.1:0`.
+    #[arg(long, default_value = "false")]
+    bft_outbound_only: bool,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -337,14 +347,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             // Multi-validator: stand up the TCP gossip transport,
             // then loop driving the gossip + harvest pair.
-            let transport = Arc::new(if cli.encrypt_gossip {
-                TcpBftTransport::new_encrypted(cli.bft_listen, cli.peers.clone()).await?
-            } else {
-                TcpBftTransport::new(cli.bft_listen, cli.peers.clone()).await?
+            let transport = Arc::new(match (cli.bft_outbound_only, cli.encrypt_gossip) {
+                (true, true) => {
+                    TcpBftTransport::new_outbound_only_encrypted(cli.peers.clone()).await?
+                }
+                (true, false) => TcpBftTransport::new_outbound_only(cli.peers.clone()).await?,
+                (false, true) => {
+                    TcpBftTransport::new_encrypted(cli.bft_listen, cli.peers.clone()).await?
+                }
+                (false, false) => TcpBftTransport::new(cli.bft_listen, cli.peers.clone()).await?,
             });
             tracing::info!(
                 listen = %transport.local_addr(),
                 peers = ?cli.peers,
+                outbound_only = cli.bft_outbound_only,
                 "BFT gossip transport listening"
             );
             let gossip = Arc::new(BftGossip::new(engine.clone(), transport));
