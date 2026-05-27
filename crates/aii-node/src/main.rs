@@ -22,6 +22,7 @@ use tracing_subscriber::EnvFilter;
     version,
     about = "AII node — chain bootstrap + RPC server + dev-mode block producer (v0.0.15)"
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Data directory (used for RocksDB storage). Created if it does not exist.
     #[arg(long, default_value = "/tmp/aiid")]
@@ -99,6 +100,13 @@ struct Cli {
     /// Skipped if the peer is at or behind the local head.
     #[arg(long)]
     bootnode: Option<String>,
+
+    /// Wrap the BFT gossip socket in a Noise XX handshake +
+    /// ChaCha20-Poly1305 AEAD transport. All validators in a peer
+    /// set must agree on this flag — mixing encrypted + plaintext
+    /// peers fails the handshake.
+    #[arg(long, default_value = "false")]
+    encrypt_gossip: bool,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -315,8 +323,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             // Multi-validator: stand up the TCP gossip transport,
             // then loop driving the gossip + harvest pair.
-            let transport =
-                Arc::new(TcpBftTransport::new(cli.bft_listen, cli.peers.clone()).await?);
+            let transport = Arc::new(if cli.encrypt_gossip {
+                TcpBftTransport::new_encrypted(cli.bft_listen, cli.peers.clone()).await?
+            } else {
+                TcpBftTransport::new(cli.bft_listen, cli.peers.clone()).await?
+            });
             tracing::info!(
                 listen = %transport.local_addr(),
                 peers = ?cli.peers,

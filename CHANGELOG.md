@@ -5,6 +5,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.64] — 2026-05-26
+
+### Added — Noise XX wired into TcpBftTransport (closes C.4 wire-up)
+
+The Noise primitive (v0.0.55) is now an opt-in mode on the main-
+chain BFT gossip socket. Starting `aiid --bft --encrypt-gossip
+--peers …` runs an XX handshake on every accept / dial; after the
+handshake completes, all BFT proposals + votes flow through a
+ChaCha20-Poly1305 AEAD-encrypted session. Plaintext gossip stays
+default for backward compat with existing testnets.
+
+#### `aii-node::bft_p2p`
+
+- New `TcpBftTransport::new_encrypted(bind, peers)`. Same shape as
+  `new`, but each accepted / dialed connection is upgraded to a
+  Noise XX session before broadcast traffic flows.
+- New private `run_peer_noise` — single-task design (owns
+  `TcpStream` + `EncryptedSession`) sidesteps Noise's non-`Sync`
+  `TransportState`. Outbound is polled non-blocking; inbound waits
+  20 ms before timing out so neither side starves the other. BFT
+  timing is in seconds, so the 20 ms cadence is invisible.
+- New integration test `two_encrypted_transports_exchange_payload`
+  proves the full handshake + encrypted broadcast over an in-process
+  loopback pair.
+
+#### `aiid` binary
+
+- New `--encrypt-gossip` CLI flag (default `false`). When set, the
+  BFT path dispatches to `new_encrypted` instead of `new`. All
+  validators in a peer set must agree on the flag — mixing
+  encrypted + plaintext peers fails the handshake immediately.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No static-key identity binding.** Each session uses a fresh
+  x25519 keypair — peer identity is still bound by the higher-layer
+  `Hello` message + BFT BLS signatures, not by the Noise static
+  key. A static-key + signed-handshake-pubkey commit lands in a
+  later release once the validator keystore exposes an x25519 KDF
+  path alongside the existing BLS + VRF keys.
+- **No mux yet.** One Noise session = one logical channel. BFT
+  gossip is the only consumer today; once Discovery v4 + a sync
+  protocol want to share the socket, yamux / mplex needs to slot
+  between Noise and the application.
+
 ## [0.0.63] — 2026-05-26
 
 ### Added — FindNode / Neighbours UDP packets (closes C.3 wire-up)

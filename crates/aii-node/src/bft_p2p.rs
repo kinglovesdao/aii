@@ -109,6 +109,74 @@ impl TcpBftTransport {
         })
     }
 
+    /// Like [`Self::new`] but every accepted / dialed connection is
+    /// wrapped in a Noise XX handshake (roadmap C.4 wire-up); after
+    /// the handshake completes, BFT bytes flow through an AEAD-
+    /// encrypted session (ChaCha20-Poly1305).
+    ///
+    /// The single-task design (one async task per peer, owning both
+    /// the stream and the `EncryptedSession`) sidesteps Noise's
+    /// non-`Sync` `TransportState`. Outbound messages are polled
+    /// non-blocking, then a 20 ms `select` window listens for
+    /// inbound. BFT timing budget is in seconds, so the 20 ms cadence
+    /// is invisible.
+    pub async fn new_encrypted(
+        bind_addr: SocketAddr,
+        peer_addrs: Vec<SocketAddr>,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        let (out_tx, _) = broadcast::channel::<Vec<u8>>(1024);
+        let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+
+        {
+            let out_tx = out_tx.clone();
+            let inbox = inbox.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let out_tx = out_tx.clone();
+                            let inbox = inbox.clone();
+                            tokio::spawn(async move {
+                                run_peer_noise(stream, false, out_tx, inbox).await;
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "bft noise listener accept failed");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for addr in peer_addrs {
+            let out_tx = out_tx.clone();
+            let inbox = inbox.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    match TcpStream::connect(addr).await {
+                        Ok(stream) => {
+                            run_peer_noise(stream, true, out_tx.clone(), inbox.clone()).await;
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }));
+        }
+
+        Ok(Self {
+            out_tx,
+            inbox,
+            local_addr,
+            _tasks: tasks,
+        })
+    }
+
     /// Address the listener bound to (useful when port 0 was requested).
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
@@ -126,6 +194,80 @@ impl BftTransport for TcpBftTransport {
 
     fn try_recv(&self) -> Option<Vec<u8>> {
         self.inbox.lock().ok()?.pop_front()
+    }
+}
+
+/// Single-task per-peer runner over a Noise-encrypted session.
+///
+/// Owns the `TcpStream` + `EncryptedSession` for the lifetime of the
+/// connection. Polls the outbound broadcast (non-blocking) then
+/// listens 20 ms for inbound. Exits cleanly on handshake failure,
+/// EOF, or framing error — the caller's dial loop will reconnect.
+async fn run_peer_noise(
+    mut stream: TcpStream,
+    is_initiator: bool,
+    out_tx: broadcast::Sender<Vec<u8>>,
+    inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+) {
+    let hs = if is_initiator {
+        match aii_net_p2p::noise::initiator() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "noise initiator init failed");
+                return;
+            }
+        }
+    } else {
+        match aii_net_p2p::noise::responder() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "noise responder init failed");
+                return;
+            }
+        }
+    };
+    let mut session = if is_initiator {
+        match aii_net_p2p::noise::handshake_initiator(hs, &mut stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "noise initiator handshake failed");
+                return;
+            }
+        }
+    } else {
+        match aii_net_p2p::noise::handshake_responder(hs, &mut stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "noise responder handshake failed");
+                return;
+            }
+        }
+    };
+    let mut out_rx = out_tx.subscribe();
+    loop {
+        // Non-blocking outbound poll: drain everything pending.
+        loop {
+            match out_rx.try_recv() {
+                Ok(payload) => {
+                    if session.send_msg(&mut stream, &payload).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return,
+            }
+        }
+        // Bounded inbound wait so we don't starve the outbound side.
+        match tokio::time::timeout(Duration::from_millis(20), session.recv_msg(&mut stream)).await {
+            Ok(Ok(payload)) => {
+                if let Ok(mut q) = inbox.lock() {
+                    q.push_back(payload);
+                }
+            }
+            Ok(Err(_)) => return,
+            Err(_) => {} // timeout — loop and re-poll outbound
+        }
     }
 }
 
@@ -255,5 +397,27 @@ mod tests {
             }
         }
         panic!("never received broadcast");
+    }
+
+    /// Two transports exchange a payload over a Noise XX handshake
+    /// (encrypted BFT gossip — v0.0.64). Same shape as the plaintext
+    /// test, just with `new_encrypted`.
+    #[tokio::test]
+    async fn two_encrypted_transports_exchange_payload() {
+        let a = TcpBftTransport::new_encrypted("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let a_addr = a.local_addr();
+        let b = TcpBftTransport::new_encrypted("127.0.0.1:0".parse().unwrap(), vec![a_addr])
+            .await
+            .unwrap();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.broadcast(vec![0xfe, 0xed, 0xfa, 0xce]);
+            if a.try_recv().is_some() {
+                return;
+            }
+        }
+        panic!("never received broadcast over Noise transport");
     }
 }
