@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod release;
+
 use aii_onboarding::{detect, recommend_tier, score, Tier};
 use aii_wallet::{EncryptedKeystore, LocalWallet, MnemonicPhrase, ScryptParams};
 use alloy_rlp::Encodable;

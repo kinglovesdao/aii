@@ -1,13 +1,17 @@
 //! `aii` — user-facing CLI for the AII protocol.
 
+use aii_cli::release::{sign_release, verify_release, ReleaseError};
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
     run_account_verify, run_chain_id, run_genesis_init, run_genesis_validate, run_get_block_header,
     run_random_seed_hex, run_recent_blocks, run_status, run_stress, run_subchain, run_tier,
     run_validator_keygen, run_validator_pubkey, CliError, ValidatorEntry, ValidatorPubkeys,
 };
+use aii_crypto::ed25519::{PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey};
 use clap::{Parser, Subcommand};
+use rand_core::OsRng;
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -65,6 +69,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: SubchainCmd,
     },
+    /// Release-signing tools (v0.0.74) — produce and verify
+    /// Ed25519-signed binary release manifests.
+    Release {
+        #[command(subcommand)]
+        sub: ReleaseCmd,
+    },
     /// Flood the node with signed self-transfers and report
     /// observed txs/block + throughput.
     Stress {
@@ -112,6 +122,53 @@ enum SubchainCmd {
         /// Total sub-chain blocks to produce before exiting.
         #[arg(long, default_value = "20")]
         duration_blocks: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseCmd {
+    /// Generate a fresh Ed25519 keypair. Prints the public key
+    /// (hex, no prefix) to stdout and writes the secret seed to
+    /// `--out` (or also to stdout when omitted).
+    Keygen {
+        /// File to write the secret seed to. Defaults to stdout.
+        /// Treat with the same care as any signing key.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Hash + sign a binary, producing a `release.json` manifest.
+    Sign {
+        /// Path to the binary being released.
+        #[arg(long)]
+        binary: std::path::PathBuf,
+        /// Semver-style version string for the manifest.
+        #[arg(long)]
+        version: String,
+        /// Hex-encoded 32-byte secret seed (with or without `0x`).
+        /// Read from `--secret-file` to avoid leaking to argv/ps.
+        #[arg(long, conflicts_with = "secret_file")]
+        secret: Option<String>,
+        /// File containing the hex-encoded secret seed.
+        #[arg(long)]
+        secret_file: Option<std::path::PathBuf>,
+        /// Unix-seconds timestamp. Defaults to "now".
+        #[arg(long)]
+        timestamp: Option<u64>,
+        /// Path to write the manifest JSON. Defaults to stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Verify a `release.json` against a binary + a pinned public key.
+    Verify {
+        /// Path to the release manifest JSON.
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        /// Path to the binary the manifest claims to cover.
+        #[arg(long)]
+        binary: std::path::PathBuf,
+        /// Hex-encoded 32-byte Ed25519 public key (with or without `0x`).
+        #[arg(long)]
+        pubkey: String,
     },
 }
 
@@ -290,6 +347,9 @@ async fn main() -> Result<(), CliError> {
                     );
                 }
             }
+        }
+        Cmd::Release { sub } => {
+            handle_release_cmd(sub, cli.json)?;
         }
         Cmd::Stress {
             chain_id,
@@ -484,6 +544,104 @@ async fn main() -> Result<(), CliError> {
                     g.validators.len(),
                     g.chain_spec.chain_id
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn release_err(e: &ReleaseError) -> CliError {
+    CliError::Client(format!("release: {e}"))
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_release_cmd(sub: ReleaseCmd, json_out: bool) -> Result<(), CliError> {
+    match sub {
+        ReleaseCmd::Keygen { out } => {
+            let mut rng = OsRng;
+            let sk = Ed25519SecretKey::generate(&mut rng);
+            let pk = sk.public();
+            let secret_hex = sk.to_hex();
+            let pubkey_hex = pk.to_hex();
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ed25519_secret_hex": secret_hex,
+                        "ed25519_pubkey_hex": pubkey_hex,
+                    })
+                );
+            } else if let Some(path) = out.as_ref() {
+                fs::write(path, &secret_hex).map_err(|e| CliError::Client(e.to_string()))?;
+                eprintln!("wrote secret seed to {}", path.display());
+                println!("{pubkey_hex}");
+            } else {
+                println!("ed25519_secret_hex: {secret_hex}");
+                println!("ed25519_pubkey_hex: {pubkey_hex}");
+            }
+        }
+        ReleaseCmd::Sign {
+            binary,
+            version,
+            secret,
+            secret_file,
+            timestamp,
+            out,
+        } => {
+            let secret_hex = match (secret, secret_file) {
+                (Some(s), None) => s,
+                (None, Some(f)) => fs::read_to_string(&f)
+                    .map_err(|e| CliError::Client(e.to_string()))?
+                    .trim()
+                    .to_string(),
+                (None, None) => {
+                    return Err(CliError::Client("need --secret or --secret-file".into()))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(CliError::Client(
+                        "--secret and --secret-file are mutually exclusive".into(),
+                    ))
+                }
+            };
+            let sk = Ed25519SecretKey::from_hex(&secret_hex)
+                .map_err(|e| CliError::Client(format!("secret: {e}")))?;
+            let ts = timestamp.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+            let manifest = sign_release(&sk, &binary, &version, ts).map_err(|e| release_err(&e))?;
+            let manifest_json = serde_json::to_string_pretty(&manifest)?;
+            if let Some(path) = out.as_ref() {
+                fs::write(path, &manifest_json).map_err(|e| CliError::Client(e.to_string()))?;
+                eprintln!("wrote manifest to {}", path.display());
+            } else {
+                println!("{manifest_json}");
+            }
+        }
+        ReleaseCmd::Verify {
+            manifest,
+            binary,
+            pubkey,
+        } => {
+            let pk = Ed25519PublicKey::from_hex(&pubkey)
+                .map_err(|e| CliError::Client(format!("pubkey: {e}")))?;
+            let manifest_json =
+                fs::read_to_string(&manifest).map_err(|e| CliError::Client(e.to_string()))?;
+            let m: aii_cli::release::ReleaseManifest = serde_json::from_str(&manifest_json)?;
+            verify_release(&pk, &m, &binary).map_err(|e| release_err(&e))?;
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "version": m.version,
+                        "timestamp_unix": m.timestamp_unix,
+                    })
+                );
+            } else {
+                println!("ok — {} signed at {}", m.version, m.timestamp_unix);
             }
         }
     }

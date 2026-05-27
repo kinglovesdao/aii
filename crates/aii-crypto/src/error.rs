@@ -16,6 +16,32 @@ pub enum CryptoError {
     /// Signature verification ran to completion and rejected the signature.
     #[error("signature verification failed")]
     BadSignature,
+
+    /// Hex decode failure on a key, signature, or hash field.
+    #[error("hex decode: {0}")]
+    Hex(String),
+
+    /// Input bytes had the wrong length for the target type.
+    #[error("bad length: expected {expected}, got {got}")]
+    BadLength {
+        /// Expected byte length.
+        expected: usize,
+        /// Actual byte length.
+        got: usize,
+    },
+
+    /// Ed25519-specific error from the `ed25519-dalek` backend (signature
+    /// invalid, malformed pubkey, …).
+    #[error("ed25519: {0}")]
+    Ed25519(String),
+}
+
+impl CryptoError {
+    /// Convenience constructor that boxes any `Display` impl into the
+    /// [`CryptoError::Ed25519`] variant.
+    pub fn ed25519<E: std::fmt::Display>(e: E) -> Self {
+        Self::Ed25519(e.to_string())
+    }
 }
 
 #[cfg(test)]
