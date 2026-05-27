@@ -5,6 +5,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.73] — 2026-05-27
+
+### Fixed — gossip auto-harvests committed blocks between inbox messages
+
+v0.0.72 fixed early-arrival precommit rejection but exposed a second
+race: when the proposer races ahead of its followers (commits block
+N at t=0, broadcasts proposal for N+1 at t=50ms), the follower's
+gossip tick can dispatch the next-height proposal BEFORE its main
+loop has called `try_harvest_committed` to advance the engine's
+`head_hash`. Reconstruction then computes the new block's parent
+hash against the *old* head, gets `ProposalHashMismatch`, and the
+chain stalls at exactly block N+1. Live-tested across JP/CN/local:
+chain produced 20 blocks in ~1 second then froze with the proposer
+500 ms ahead.
+
+The fix: `BftGossip::tick()` now calls a new
+`engine.try_harvest_committed()` between every dispatched inbox
+message. Harvested blocks are stashed on an internal
+`harvested_blocks: Mutex<Vec<Block>>` buffer; the host drains them
+via the new `BftGossip::drain_harvested()` and applies them to its
+world-state storage. The engine's `head_hash` advances in lockstep
+with the inbox so subsequent proposals reconstruct against the
+correct parent.
+
+#### `aii-consensus-bft::gossip`
+
+- New `BftGossip::harvested_blocks: Mutex<Vec<Block>>` field.
+- New `BftGossip::drain_harvested() -> Vec<Block>` public API for
+  hosts.
+- New private `BftGossip::auto_harvest()` helper that pulls every
+  committed block out of the engine and pushes it onto the buffer.
+- `tick()` calls `auto_harvest()` after each inbox message AND once
+  after the drive-phase work (belt-and-braces for the rare case
+  where the local engine's own precommit was the quorum-forming
+  vote and didn't traverse the inbox).
+- Two existing gossip tests updated to drain via the new API; one
+  retained the direct `try_harvest_committed` path as a fallback.
+
+#### `aii-node` (`aiid` binary)
+
+- The multi-validator BFT loop now drains via
+  `gossip.drain_harvested()` first, then falls back to
+  `engine.try_harvest_committed()` for non-gossip paths.
+- The post-commit `bft_state.json` snapshot loop is unchanged —
+  each harvested block still resets the persisted round state to
+  `(N+1, 0)` per the v0.0.71 contract.
+
+762 tests pass; clippy clean.
+
 ## [0.0.72] — 2026-05-27
 
 ### Fixed — BFT engine no longer rejects early-arrival prevotes/precommits
