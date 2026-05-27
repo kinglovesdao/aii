@@ -161,6 +161,11 @@ pub trait RpcState: Send + Sync + 'static {
         None
     }
 
+    /// Scan a block range for logs matching `filter`. Default empty.
+    async fn logs_in_range(&self, _filter: &LogFilter) -> Vec<LogEntryView> {
+        Vec::new()
+    }
+
     /// Return the RLP-encoded full `Block` (header + body) as `0x…`
     /// hex. Default returns `None`; persistent backends should override.
     async fn raw_block(&self, _query: &str) -> Option<String> {
@@ -314,6 +319,49 @@ pub trait EthRpc {
     /// was rejected pre-execution.
     #[method(name = "getTransactionReceipt")]
     async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<ReceiptView>>;
+
+    /// `eth_getLogs(filter)` — every log matching `filter` across the
+    /// `from_block..=to_block` range. Block-level logs_bloom is the
+    /// fast-path prefilter; matching blocks then walk their receipts
+    /// linearly. An empty `address` / `topics` matches everything.
+    #[method(name = "getLogs")]
+    async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<LogEntryView>>;
+}
+
+/// `eth_getLogs` request filter (subset of the Ethereum spec — block
+/// hash filtering and topic-position OR-arrays land in a follow-up).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogFilter {
+    /// Starting block number, inclusive. Hex `0x…` or decimal. `None`
+    /// defaults to block 0.
+    #[serde(default)]
+    pub from_block: Option<String>,
+    /// Ending block number, inclusive. `None` defaults to the head.
+    #[serde(default)]
+    pub to_block: Option<String>,
+    /// Optional address filter — `None` matches every contract.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Topic filter, exact-match positionally. Empty vec matches every
+    /// log; a topic of `null` is a wildcard in that position (not yet
+    /// supported — the value `"null"` is treated as a literal).
+    #[serde(default)]
+    pub topics: Vec<String>,
+}
+
+/// One log entry returned by `eth_getLogs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntryView {
+    /// Block number that contained the tx that emitted this log.
+    pub block_number: String,
+    /// Tx hash that emitted this log.
+    pub transaction_hash: String,
+    /// Address that emitted the log.
+    pub address: String,
+    /// Indexed topics.
+    pub topics: Vec<String>,
+    /// Non-indexed event data.
+    pub data: String,
 }
 
 #[rpc(server, namespace = "aii")]
@@ -572,6 +620,10 @@ impl<S: RpcState> EthRpcServer for EthRpcImpl<S> {
 
     async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<ReceiptView>> {
         Ok(self.state.receipt_by_tx_hash(&hash).await)
+    }
+
+    async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<LogEntryView>> {
+        Ok(self.state.logs_in_range(&filter).await)
     }
 }
 

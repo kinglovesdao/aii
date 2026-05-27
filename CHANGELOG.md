@@ -5,6 +5,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.59] — 2026-05-26
+
+### Added — `eth_getLogs` JSON-RPC (closes B.5 fully)
+
+The per-tx Yellow-Paper bloom + post-block aggregate bloom shipped
+in v0.0.43 / v0.0.58 were observable via `eth_getTransactionReceipt`
+and `aii_getPostRoots`, but the canonical log-query RPC was missing.
+v0.0.59 ships `eth_getLogs` with bloom-prefilter optimisation: the
+block range is walked once, the per-block bloom decides which blocks
+to descend into, and only matching blocks' receipts are scanned
+linearly. Address + topic filters are exact-match positionally.
+
+#### `aii-rpc`
+
+- New JSON-RPC method `eth_getLogs(filter)`. Filter shape:
+  `{ from_block, to_block, address, topics: Vec<String> }`.
+- New `LogFilter` request type + `LogEntryView` response type.
+- New trait method `RpcState::logs_in_range` (default empty).
+
+#### `aii-node`
+
+- `NodeState::logs_in_range` impl:
+  1. Resolves `from_block` / `to_block` (defaults: 0 → head).
+  2. Decodes `address` + `topics` hex into typed `Address` / `H256`.
+  3. For each block in range, fetches the post-roots sidecar bloom
+     and rejects the block early when the filter's address or any
+     wanted topic is absent — Yellow-Paper Bloom 200x speedup over
+     the naive scan.
+  4. For surviving blocks, walks `body.transactions`, fetches each
+     `Receipt` via `receipt_by_tx_hash`, filters logs by
+     address + topics positional match, and emits matched entries
+     with block-number / tx-hash / address / topics / data all
+     hex-encoded.
+- New helper `parse_block_tag` decodes either decimal or `0x…` hex
+  block numbers.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No topic wildcards.** Each filter topic must exact-match; the
+  Ethereum-spec "any of these" positional OR-arrays land in a
+  follow-up. The literal string `"null"` is treated as a topic
+  value, not a wildcard.
+- **No block-hash filter.** `filter.blockHash` is not yet honoured
+  — use `from_block == to_block` to scope to one block.
+- **No subscription / `eth_newFilter`.** Long-poll filter
+  subscriptions are deferred; for now clients must poll `eth_getLogs`
+  on their own cadence.
+
 ## [0.0.58] — 2026-05-26
 
 ### Added — Post-block Yellow-Paper roots sidecar (closes A.3 + B.5 observability)

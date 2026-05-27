@@ -25,9 +25,9 @@ use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType, EMPT
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, ActiveValidatorsView, ForkView, HeaderView, LogView, PostRootsView, ProposalView,
-    ReceiptView, RpcState, SlashView, StakeView, SubchainAnchorView, SubmitTxError, TxView,
-    ValidatorEntryView,
+    AccountView, ActiveValidatorsView, ForkView, HeaderView, LogEntryView, LogFilter, LogView,
+    PostRootsView, ProposalView, ReceiptView, RpcState, SlashView, StakeView, SubchainAnchorView,
+    SubmitTxError, TxView, ValidatorEntryView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -1039,6 +1039,15 @@ fn header_to_view(hash: H256, h: &Header) -> HeaderView {
     }
 }
 
+fn parse_block_tag(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    if let Some(stripped) = trimmed.strip_prefix("0x") {
+        u64::from_str_radix(stripped, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
 fn parse_hash_str(s: &str) -> Option<H256> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.len() != 64 {
@@ -1231,6 +1240,103 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn logs_in_range(&self, filter: &LogFilter) -> Vec<LogEntryView> {
+        let head = self.head.load(Ordering::Relaxed);
+        let from = filter
+            .from_block
+            .as_deref()
+            .map_or(Some(0), parse_block_tag)
+            .unwrap_or(0);
+        let to = filter
+            .to_block
+            .as_deref()
+            .map_or(Some(head), parse_block_tag)
+            .unwrap_or(head);
+        let to = to.min(head);
+        if from > to {
+            return Vec::new();
+        }
+        let want_addr: Option<Address> = filter.address.as_deref().and_then(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            if s.len() != 40 {
+                return None;
+            }
+            let mut bytes = [0u8; 20];
+            hex::decode_to_slice(s, &mut bytes).ok()?;
+            Some(Address::new(bytes))
+        });
+        let want_topics: Vec<H256> = filter
+            .topics
+            .iter()
+            .filter_map(|s| {
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                if s.len() != 64 {
+                    return None;
+                }
+                let mut bytes = [0u8; 32];
+                hex::decode_to_slice(s, &mut bytes).ok()?;
+                Some(H256::new(bytes))
+            })
+            .collect();
+        let mut out = Vec::new();
+        for n in from..=to {
+            let Some(s) = self.blocks.read().ok() else {
+                break;
+            };
+            let Some(block_hash) = s.by_number.get(&n).copied() else {
+                drop(s);
+                continue;
+            };
+            let body = s.body_by_hash.get(&block_hash).cloned();
+            drop(s);
+            // Bloom prefilter on the block-level bloom from post-roots.
+            if let Ok(Some(roots)) = self.post_roots(block_hash) {
+                let addr_miss = want_addr
+                    .as_ref()
+                    .is_some_and(|a| !roots.logs_bloom.contains(a.as_bytes()));
+                let topic_miss = want_topics
+                    .iter()
+                    .any(|t| !roots.logs_bloom.contains(t.as_bytes()));
+                if addr_miss || topic_miss {
+                    continue;
+                }
+            }
+            // Walk the block's receipts via tx_index.
+            let Some(body) = body else { continue };
+            for tx in &body.transactions {
+                let tx_hash = tx.hash();
+                let Ok(Some(receipt)) = self.receipt_by_tx_hash(tx_hash) else {
+                    continue;
+                };
+                for log in &receipt.logs {
+                    if let Some(addr) = want_addr {
+                        if log.address != addr {
+                            continue;
+                        }
+                    }
+                    let topics_ok = want_topics
+                        .iter()
+                        .all(|t| log.topics.iter().any(|lt| lt == t));
+                    if !topics_ok {
+                        continue;
+                    }
+                    out.push(LogEntryView {
+                        block_number: format!("0x{n:x}"),
+                        transaction_hash: format!("0x{}", hex::encode(tx_hash.as_bytes())),
+                        address: format!("0x{}", hex::encode(log.address.as_bytes())),
+                        topics: log
+                            .topics
+                            .iter()
+                            .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
+                            .collect(),
+                        data: format!("0x{}", hex::encode(&log.data)),
+                    });
+                }
+            }
+        }
+        out
     }
 
     async fn post_roots_for(&self, block_hash_hex: &str) -> Option<PostRootsView> {
