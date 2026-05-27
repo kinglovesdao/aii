@@ -12,13 +12,15 @@
 //! into the shared inbox `VecDeque`. The reader/writer tasks share
 //! the same `TcpStream` via two halves.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aii_consensus_bft::BftTransport;
+use aii_crypto::keccak256;
 use aii_net_p2p::{Message, AII_P2P_VERSION};
+use aii_types::H256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Notify};
@@ -42,6 +44,58 @@ pub const BFT_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// outbound-only transports on one host don't collide.
 const OUTBOUND_ONLY_BIND: &str = "127.0.0.1:0";
 
+/// Capacity of the gossip relay dedup ring (v0.0.69).
+///
+/// Holds the most-recent N message hashes seen on the wire or
+/// originated locally; any incoming message whose hash is already in
+/// the ring is dropped (already-seen). 4096 covers ~22 minutes of
+/// 3-validator BFT traffic at 3 s block time + 2 phases + room for
+/// timeout retries — well past the window any single message stays
+/// relevant.
+const GOSSIP_DEDUP_CAPACITY: usize = 4096;
+
+/// Hash-based dedup for gossip relay.
+///
+/// Bounded by [`GOSSIP_DEDUP_CAPACITY`]. Insertions return `true` if
+/// the hash was novel (caller should forward / consume) and `false`
+/// if it was already known (drop). Eviction is FIFO — oldest hash
+/// out when capacity is hit. Internal state is sync (uses
+/// `std::sync::Mutex`) because the hot path is keccak + HashSet ops
+/// which never await.
+#[derive(Debug)]
+struct GossipDedup {
+    set: HashSet<H256>,
+    queue: VecDeque<H256>,
+}
+
+impl GossipDedup {
+    fn new() -> Self {
+        Self {
+            set: HashSet::with_capacity(GOSSIP_DEDUP_CAPACITY),
+            queue: VecDeque::with_capacity(GOSSIP_DEDUP_CAPACITY),
+        }
+    }
+
+    /// Insert `h` if novel. Returns `true` iff the hash hadn't been
+    /// seen before — caller should treat the message as fresh.
+    fn observe(&mut self, h: H256) -> bool {
+        if !self.set.insert(h) {
+            return false;
+        }
+        if self.queue.len() >= GOSSIP_DEDUP_CAPACITY {
+            if let Some(old) = self.queue.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.queue.push_back(h);
+        true
+    }
+}
+
+fn hash_payload(payload: &[u8]) -> H256 {
+    keccak256(payload)
+}
+
 /// TCP-backed [`BftTransport`].
 ///
 /// Construction is async because we bind a listener immediately. After
@@ -56,6 +110,14 @@ pub struct TcpBftTransport {
     out_tx: broadcast::Sender<Vec<u8>>,
     /// Inbound queue, drained by `try_recv`.
     inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    /// Gossip relay dedup (v0.0.69). Shared across every peer task
+    /// AND the local broadcast path so:
+    /// - Locally-originated messages are pre-seeded into the ring,
+    ///   suppressing echoes when a relayer bounces them back.
+    /// - Each incoming message is checked exactly once; novel ones
+    ///   are pushed to `inbox` AND re-broadcast via `out_tx` for
+    ///   relay to other peers (cycles die at the next hop).
+    dedup: Arc<Mutex<GossipDedup>>,
     /// Address the listener bound to.
     local_addr: SocketAddr,
     /// Handles to the spawned acceptor + dialer tasks (kept so the
@@ -76,6 +138,7 @@ impl TcpBftTransport {
         let local_addr = listener.local_addr()?;
         let (out_tx, _) = broadcast::channel::<Vec<u8>>(1024);
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        let dedup = Arc::new(Mutex::new(GossipDedup::new()));
 
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
@@ -83,11 +146,12 @@ impl TcpBftTransport {
         {
             let out_tx = out_tx.clone();
             let inbox = inbox.clone();
+            let dedup = dedup.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
-                            spawn_peer_tasks(stream, &out_tx, &inbox);
+                            spawn_peer_tasks(stream, &out_tx, &inbox, &dedup);
                         }
                         Err(e) => {
                             tracing::warn!(?e, "bft listener accept failed");
@@ -102,14 +166,16 @@ impl TcpBftTransport {
         for addr in peer_addrs {
             let out_tx = out_tx.clone();
             let inbox = inbox.clone();
+            let dedup = dedup.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     match TcpStream::connect(addr).await {
                         Ok(stream) => {
                             let inbox = inbox.clone();
                             let out_tx = out_tx.clone();
+                            let dedup = dedup.clone();
                             // Block until this connection dies, then retry.
-                            run_peer(stream, out_tx, inbox).await;
+                            run_peer(stream, out_tx, inbox, dedup).await;
                         }
                         Err(_) => {
                             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -122,6 +188,7 @@ impl TcpBftTransport {
         Ok(Self {
             out_tx,
             inbox,
+            dedup,
             local_addr,
             _tasks: tasks,
         })
@@ -146,19 +213,22 @@ impl TcpBftTransport {
         let local_addr = listener.local_addr()?;
         let (out_tx, _) = broadcast::channel::<Vec<u8>>(1024);
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        let dedup = Arc::new(Mutex::new(GossipDedup::new()));
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
         {
             let out_tx = out_tx.clone();
             let inbox = inbox.clone();
+            let dedup = dedup.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
                             let out_tx = out_tx.clone();
                             let inbox = inbox.clone();
+                            let dedup = dedup.clone();
                             tokio::spawn(async move {
-                                run_peer_noise(stream, false, out_tx, inbox).await;
+                                run_peer_noise(stream, false, out_tx, inbox, dedup).await;
                             });
                         }
                         Err(e) => {
@@ -173,11 +243,19 @@ impl TcpBftTransport {
         for addr in peer_addrs {
             let out_tx = out_tx.clone();
             let inbox = inbox.clone();
+            let dedup = dedup.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     match TcpStream::connect(addr).await {
                         Ok(stream) => {
-                            run_peer_noise(stream, true, out_tx.clone(), inbox.clone()).await;
+                            run_peer_noise(
+                                stream,
+                                true,
+                                out_tx.clone(),
+                                inbox.clone(),
+                                dedup.clone(),
+                            )
+                            .await;
                         }
                         Err(_) => {
                             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -190,6 +268,7 @@ impl TcpBftTransport {
         Ok(Self {
             out_tx,
             inbox,
+            dedup,
             local_addr,
             _tasks: tasks,
         })
@@ -235,6 +314,15 @@ impl TcpBftTransport {
 
 impl BftTransport for TcpBftTransport {
     fn broadcast(&self, bytes: Vec<u8>) {
+        // Pre-seed the dedup ring with the hash of this outbound
+        // message (v0.0.69). When a relayer bounces the message back
+        // to us, the peer reader will find the hash already in the
+        // ring and silently drop the echo. Without this pre-seed,
+        // local BFT messages would loop A→B→A every relay hop.
+        let h = hash_payload(&bytes);
+        if let Ok(mut d) = self.dedup.lock() {
+            d.observe(h);
+        }
         // No subscribers (no peers connected yet) → send drops the value.
         // That's expected during startup; the driver will resend on the
         // next tick anyway.
@@ -257,6 +345,7 @@ async fn run_peer_noise(
     is_initiator: bool,
     out_tx: broadcast::Sender<Vec<u8>>,
     inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    dedup: Arc<Mutex<GossipDedup>>,
 ) {
     let hs = if is_initiator {
         match aii_net_p2p::noise::initiator() {
@@ -312,8 +401,17 @@ async fn run_peer_noise(
         match tokio::time::timeout(Duration::from_millis(20), session.recv_msg(&mut stream)).await {
             Ok(Ok(payload)) => {
                 last_recv = tokio::time::Instant::now();
-                if let Ok(mut q) = inbox.lock() {
-                    q.push_back(payload);
+                let h = hash_payload(&payload);
+                let novel = dedup.lock().map(|mut d| d.observe(h)).unwrap_or(true);
+                if novel {
+                    if let Ok(mut q) = inbox.lock() {
+                        q.push_back(payload.clone());
+                    }
+                    // v0.0.69 gossip relay — same flow as the
+                    // plaintext path: fan novel messages out so a
+                    // direct-link failure between two non-adjacent
+                    // peers can be bridged.
+                    let _ = out_tx.send(payload);
                 }
             }
             Ok(Err(_)) => return,
@@ -333,27 +431,35 @@ fn spawn_peer_tasks(
     stream: TcpStream,
     out_tx: &broadcast::Sender<Vec<u8>>,
     inbox: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+    dedup: &Arc<Mutex<GossipDedup>>,
 ) {
     let out_tx = out_tx.clone();
     let inbox = inbox.clone();
+    let dedup = dedup.clone();
     tokio::spawn(async move {
-        run_peer(stream, out_tx, inbox).await;
+        run_peer(stream, out_tx, inbox, dedup).await;
     });
 }
 
 /// Owns one TCP connection's read + write halves. Returns when either
 /// side fails or no inbound bytes arrive within
 /// [`BFT_PEER_IDLE_TIMEOUT`] (v0.0.68: NAT-friendly idle detection).
+///
+/// v0.0.69: every novel Bft payload is also fanned out via `out_tx`
+/// to relay to the other peers (gossip relay), letting A↔B↔C
+/// topologies survive any single direct-link failure.
 async fn run_peer(
     stream: TcpStream,
     out_tx: broadcast::Sender<Vec<u8>>,
     inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    dedup: Arc<Mutex<GossipDedup>>,
 ) {
     let (mut rx, mut tx) = stream.into_split();
     let mut out_rx = out_tx.subscribe();
     let dead = Arc::new(Notify::new());
     let dead_for_reader = dead.clone();
     let dead_for_writer = dead.clone();
+    let out_tx_for_reader = out_tx.clone();
 
     // Hello exchange (best-effort; ignore failures).
     let hello = Message::Hello {
@@ -366,8 +472,16 @@ async fn run_peer(
         loop {
             match tokio::time::timeout(BFT_PEER_IDLE_TIMEOUT, read_message(&mut rx)).await {
                 Ok(Ok(Message::Bft(payload))) => {
-                    if let Ok(mut q) = inbox.lock() {
-                        q.push_back(payload);
+                    let h = hash_payload(&payload);
+                    let novel = dedup.lock().map(|mut d| d.observe(h)).unwrap_or(true);
+                    if novel {
+                        if let Ok(mut q) = inbox.lock() {
+                            q.push_back(payload.clone());
+                        }
+                        // Relay to other peers. Echoes back to the
+                        // source connection are dropped by the
+                        // source-node's own dedup on next receipt.
+                        let _ = out_tx_for_reader.send(payload);
                     }
                 }
                 Ok(Ok(_)) => {
@@ -533,6 +647,82 @@ mod tests {
             }
         }
         panic!("outbound-only didn't round-trip both directions: a_got={a_got} b_got={b_got}");
+    }
+
+    /// Gossip relay (v0.0.69) — 3-node line A↔B↔C topology.
+    ///
+    /// A and C have NO direct connection; B is in the middle. When A
+    /// broadcasts a message, B relays it to C, which would otherwise
+    /// be unreachable. This is the fundamental BFT property we need
+    /// for behind-NAT validators in any topology.
+    #[tokio::test]
+    async fn gossip_relay_three_node_line_topology() {
+        // B has no peers configured — A and C will dial in.
+        let b = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let b_addr = b.local_addr();
+        // A dials B.
+        let a = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![b_addr])
+            .await
+            .unwrap();
+        // C dials B. A and C are NOT directly connected.
+        let c = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![b_addr])
+            .await
+            .unwrap();
+
+        // Allow handshakes to complete.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A broadcasts a unique payload. C should see it (relayed via B).
+        let payload = vec![0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
+        for _ in 0..40 {
+            a.broadcast(payload.clone());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(got) = c.try_recv() {
+                assert_eq!(got, payload, "C must receive A's payload via relay");
+                return;
+            }
+        }
+        panic!("C never received A's broadcast through B's relay");
+    }
+
+    /// Echo suppression: A broadcasts, B relays. A's reader on the
+    /// A↔B socket must drop the echo (originator dedup).
+    #[tokio::test]
+    async fn gossip_relay_suppresses_echo_to_originator() {
+        let a = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let a_addr = a.local_addr();
+        let b = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![a_addr])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let payload = vec![0xde, 0xad, 0xbe, 0xef];
+        a.broadcast(payload.clone());
+
+        // Give B time to receive + relay back.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // B sees the payload exactly once.
+        let mut b_count = 0;
+        while b.try_recv().is_some() {
+            b_count += 1;
+        }
+        assert_eq!(b_count, 1, "B must receive the payload exactly once");
+
+        // A must NOT receive its own echo: B's relay will fan back via
+        // the broadcast channel to its A↔B writer, sending it to A.
+        // A's reader hashes it, finds it in its own dedup (pre-seeded
+        // by `broadcast()`), and drops it.
+        let a_got = a.try_recv();
+        assert!(
+            a_got.is_none(),
+            "A must NOT see its own broadcast echo (got {a_got:?})"
+        );
     }
 
     /// Outbound-only over the Noise XX path — same shape, encrypted.

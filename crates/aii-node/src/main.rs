@@ -347,19 +347,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             // Multi-validator: stand up the TCP gossip transport,
             // then loop driving the gossip + harvest pair.
+            //
+            // v0.0.69: merge the persistent peer cache with `--peers`
+            // so a restart re-dials previously-known validators
+            // without operator config. Cache lives at
+            // `<data-dir>/peers.json` and is updated by the dialer
+            // (best-effort; not on the critical path).
+            let cache_path = aii_node::peer_cache::cache_path(&cli.data_dir);
+            let cached_peers = aii_node::peer_cache::load(&cache_path).unwrap_or_default();
+            let merged_peers = aii_node::peer_cache::merge(&cached_peers, &cli.peers);
+            if !cached_peers.is_empty() {
+                tracing::info!(
+                    cached = cached_peers.len(),
+                    cli_peers = cli.peers.len(),
+                    merged = merged_peers.len(),
+                    path = %cache_path.display(),
+                    "loaded persistent peer cache",
+                );
+            }
+            // Persist the merged set so subsequent restarts pick it
+            // up even before the dialer succeeds against any single
+            // peer. Errors are logged but not fatal.
+            if let Err(e) = aii_node::peer_cache::save(&cache_path, &merged_peers) {
+                tracing::warn!(?e, path = %cache_path.display(), "peer cache save failed");
+            }
             let transport = Arc::new(match (cli.bft_outbound_only, cli.encrypt_gossip) {
                 (true, true) => {
-                    TcpBftTransport::new_outbound_only_encrypted(cli.peers.clone()).await?
+                    TcpBftTransport::new_outbound_only_encrypted(merged_peers.clone()).await?
                 }
-                (true, false) => TcpBftTransport::new_outbound_only(cli.peers.clone()).await?,
+                (true, false) => TcpBftTransport::new_outbound_only(merged_peers.clone()).await?,
                 (false, true) => {
-                    TcpBftTransport::new_encrypted(cli.bft_listen, cli.peers.clone()).await?
+                    TcpBftTransport::new_encrypted(cli.bft_listen, merged_peers.clone()).await?
                 }
-                (false, false) => TcpBftTransport::new(cli.bft_listen, cli.peers.clone()).await?,
+                (false, false) => {
+                    TcpBftTransport::new(cli.bft_listen, merged_peers.clone()).await?
+                }
             });
             tracing::info!(
                 listen = %transport.local_addr(),
-                peers = ?cli.peers,
+                peers = ?merged_peers,
                 outbound_only = cli.bft_outbound_only,
                 "BFT gossip transport listening"
             );
