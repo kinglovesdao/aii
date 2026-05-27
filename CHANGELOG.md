@@ -5,6 +5,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.60] — 2026-05-26
+
+### Added — On-chain submit path for staking + governance (precompile)
+
+Until now the staking + governance primitives (v0.0.48 - v0.0.50) were
+library-call-only — operators could only invoke them from Rust, not
+from a wallet. v0.0.60 ships the missing on-chain call surface: a
+single fixed precompile address that decodes opcode-prefixed
+calldata and dispatches to the persistent stores. Any wallet that can
+sign an EIP-1559 / legacy transaction can now bond, unbond, withdraw,
+propose, and vote.
+
+#### `aii-node::precompile` (new module)
+
+- `PRECOMPILE_ADDR = 0x00…0099` (AII mainnet chain id padded to 20
+  bytes).
+- Five fixed-byte opcodes (`OP_BOND`, `OP_BEGIN_UNBOND`,
+  `OP_WITHDRAW`, `OP_PROPOSE`, `OP_VOTE`) — first 4 bytes of `tx.data`
+  select the operation.
+- `dispatch(table, gov, sender, value, data, block_height,
+  unbonding_period)` runs the operation and returns a typed
+  `PrecompileOutcome`. Errors carry context for the receipt.
+- 5 unit tests cover: bond round-trip; unbond → premature withdraw
+  → mature withdraw; propose; vote weight; unknown opcode rejected.
+
+#### `aii-node`
+
+- `execute_block_txs` checks `to == PRECOMPILE_ADDR` BEFORE handing
+  the tx to revm. Precompile path:
+  1. Dispatches against `StakeTable` + `Governance`,
+  2. Charges a flat 21 000 gas (no EVM execution),
+  3. Credits the gas fee to the block beneficiary,
+  4. Emits a receipt with `status = success_of(dispatch)`.
+- Public re-export: `aii_node::precompile_dispatch`,
+  `PrecompileOutcome`, `PRECOMPILE_ADDR`.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No Solidity ABI selectors.** Opcodes are fixed bytes
+  (`0x00000001`, `0x00000002`, …) — a Solidity contract calling
+  `keccak256("bond()")[..4]` won't match. The selector-compatibility
+  rewrite is a small follow-up — the wire layout stays the same but
+  the opcode constants get re-derived.
+- **Fee debit isn't real gas accounting.** We charge 21 000 gas
+  regardless of operation complexity. Proper metering needs a
+  per-opcode cost table.
+- **No event emission.** Precompile outcomes don't currently emit
+  Solidity-style `Transfer`/`Voted` events; they only set the
+  receipt `status` bit. Logs land together with the Yellow-Paper
+  apply-then-hash refactor.
+
 ## [0.0.59] — 2026-05-26
 
 ### Added — `eth_getLogs` JSON-RPC (closes B.5 fully)

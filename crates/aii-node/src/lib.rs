@@ -12,11 +12,13 @@ pub mod bft_bootstrap;
 pub mod bft_p2p;
 pub mod dpos;
 pub mod governance;
+pub mod precompile;
 pub mod staking;
 pub mod sync;
 
 pub use dpos::{elect_active_set, latest_validator_set, ValidatorEntry};
 pub use governance::{Governance, Proposal, ProposalStatus, Vote};
+pub use precompile::{dispatch as precompile_dispatch, PrecompileOutcome, PRECOMPILE_ADDR};
 pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
 
@@ -610,6 +612,50 @@ impl NodeState {
                     continue;
                 }
             };
+            // Precompile path: if `to == PRECOMPILE_ADDR` the tx is a
+            // staking / governance call. Dispatch against the
+            // persistent stores; charge a flat 21 000 gas. We
+            // intentionally skip revm — the precompile is pure AII
+            // state and doesn't run EVM bytecode.
+            if to == Some(precompile::PRECOMPILE_ADDR) {
+                let table = self.stake_table();
+                let gov = self.governance();
+                let outcome = precompile::dispatch(
+                    &table,
+                    &gov,
+                    sender,
+                    value,
+                    &data,
+                    block.header.number,
+                    self.spec.unbonding_period_blocks,
+                );
+                let success = outcome.is_ok();
+                if let Err(e) = &outcome {
+                    tracing::warn!(
+                        block = block.header.number,
+                        sender = ?sender,
+                        error = %e,
+                        "precompile dispatch failed",
+                    );
+                }
+                let gas_charged = 21_000u64;
+                cumulative_gas_used = cumulative_gas_used.saturating_add(gas_charged);
+                let fee = U256::from(gas_charged).saturating_mul(gas_price);
+                if !fee.is_zero() {
+                    self.credit(&block.header.beneficiary, fee);
+                }
+                receipts.push((
+                    tx_hash,
+                    Receipt {
+                        tx_type,
+                        status: success,
+                        cumulative_gas_used,
+                        logs_bloom: Bloom::ZERO,
+                        logs: vec![],
+                    },
+                ));
+                continue;
+            }
             // Snapshot the sender balance so we can compute the actual
             // fee debited by revm (sender_pre - sender_post - value).
             // revm charges `gas_used * gas_price` from the sender as
