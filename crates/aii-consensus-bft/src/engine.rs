@@ -165,6 +165,12 @@ struct BftEngineState {
     /// we can commit the full block when the cert forms and roll the
     /// seed forward via the proof's VRF output.
     proposal: Option<(Block, LeaderProof)>,
+    /// Equivocation detector — every observed remote vote feeds in.
+    /// Yielded `EquivocationEvidence` is parked on `pending_evidence`
+    /// for the host to drain via [`BftEngine::drain_evidence`].
+    detector: crate::slashing::EquivocationDetector,
+    /// Evidence not yet drained by the host.
+    pending_evidence: Vec<crate::slashing::EquivocationEvidence>,
 }
 
 impl BftEngine {
@@ -177,6 +183,8 @@ impl BftEngine {
             seed: config.initial_seed,
             coordinator: None,
             proposal: None,
+            detector: crate::slashing::EquivocationDetector::new(),
+            pending_evidence: Vec::new(),
         };
         Self {
             config,
@@ -480,9 +488,16 @@ impl BftEngine {
         Ok(())
     }
 
-    /// Ingest a peer's PRE-VOTE. Forwards to inner coordinator.
+    /// Ingest a peer's PRE-VOTE. Forwards to inner coordinator and
+    /// feeds the slashing detector — if the sender double-signs at
+    /// the same `(height, round)` for two different block hashes,
+    /// the evidence is parked on `pending_evidence` for the host to
+    /// drain.
     pub fn submit_remote_prevote(&self, vote: PrevoteVote) -> Result<(), BftError> {
         let mut g = self.state.lock();
+        if let Some(ev) = g.detector.record_prevote(vote.clone()) {
+            g.pending_evidence.push(ev);
+        }
         let coord = g
             .coordinator
             .as_mut()
@@ -491,15 +506,28 @@ impl BftEngine {
         Ok(())
     }
 
-    /// Ingest a peer's PRE-COMMIT. Forwards to inner coordinator.
+    /// Ingest a peer's PRE-COMMIT. Same dual-feed pattern as
+    /// [`submit_remote_prevote`].
     pub fn submit_remote_precommit(&self, vote: PrecommitVote) -> Result<(), BftError> {
         let mut g = self.state.lock();
+        if let Some(ev) = g.detector.record_precommit(vote.clone()) {
+            g.pending_evidence.push(ev);
+        }
         let coord = g
             .coordinator
             .as_mut()
             .ok_or(BftError::NoActiveCoordinator)?;
         coord.submit_precommit(vote)?;
         Ok(())
+    }
+
+    /// Drain every equivocation record the detector has observed
+    /// since the last call. Host (typically `NodeState`) calls this
+    /// on every gossip tick and persists the evidence via
+    /// `record_slashing` + `debit_slash_stake`.
+    pub fn drain_evidence(&self) -> Vec<crate::slashing::EquivocationEvidence> {
+        let mut g = self.state.lock();
+        std::mem::take(&mut g.pending_evidence)
     }
 
     /// External clock says the round timed out — advance the coordinator
@@ -1041,6 +1069,31 @@ mod tests {
             }
             other => panic!("expected NotLeader, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn drain_evidence_returns_double_prevote_evidence() {
+        // Validator 1 signs two PRE-VOTES at the same (height, round)
+        // for different block hashes — the detector must catch it
+        // and `drain_evidence` returns one Prevote evidence.
+        let (vs, keys) = multi_validator_setup(3);
+        let engine = engine_for(0, &vs, &keys, &genesis());
+        // Need a coordinator first — bootstrap by submitting a remote
+        // proposal so the coordinator is created at (1, 0).
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let leader_engine = engine_for(leader as u32, &vs, &keys, &genesis());
+        let (block, proof) = leader_engine.cast_proposal().unwrap();
+        engine.submit_remote_proposal(block, proof).unwrap();
+        // Now feed two different prevotes from validator 1 at (1, 0).
+        let vote_a = PrevoteVote::sign(&keys[1].0, H256::new([0xaa; 32]), 1, 0, 1);
+        let vote_b = PrevoteVote::sign(&keys[1].0, H256::new([0xbb; 32]), 1, 0, 1);
+        let _ = engine.submit_remote_prevote(vote_a);
+        let _ = engine.submit_remote_prevote(vote_b);
+        let evidence = engine.drain_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].validator_index(), 1);
+        // Drain is idempotent — a second call returns empty.
+        assert!(engine.drain_evidence().is_empty());
     }
 
     #[test]

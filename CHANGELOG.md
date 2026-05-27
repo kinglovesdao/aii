@@ -5,6 +5,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.61] — 2026-05-26
+
+### Added — Auto-triggered slashing on remote-vote equivocation
+
+Every `submit_remote_prevote` / `submit_remote_precommit` on the
+`BftEngine` now feeds the embedded `EquivocationDetector` before
+forwarding to the coordinator. When the detector spots a double-sign,
+the evidence is parked on the engine's `pending_evidence` queue; the
+`aiid` BFT loop drains it on every tick and auto-persists via
+`NodeState::record_slashing`. The `slash:` Meta-CF index from v0.0.46
+now fills without any operator action — same observability surface
+(`aii_listSlashings`), zero human intervention.
+
+#### `aii-consensus-bft`
+
+- `BftEngineState` gains two fields:
+  - `detector: EquivocationDetector` (per-engine, BLS-key-keyed).
+  - `pending_evidence: Vec<EquivocationEvidence>`.
+- `submit_remote_prevote` / `submit_remote_precommit` now feed the
+  detector first, then forward to the coordinator.
+- New `BftEngine::drain_evidence() -> Vec<EquivocationEvidence>`
+  takes-and-clears the parked queue.
+- New test `drain_evidence_returns_double_prevote_evidence` proves
+  the auto-feed path: two prevotes from the same validator at the
+  same `(height, round)` for different block hashes ⇒ one piece of
+  evidence emitted; second `drain_evidence()` returns empty.
+
+#### `aii-node`
+
+- The multi-validator BFT tick loop (`aiid::main`) now calls
+  `engine.drain_evidence()` on every iteration and routes each
+  record through `NodeState::record_slashing`. Logs a `warn!`
+  per detection.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **Auto-debit deferred.** The slash record is persisted, but
+  the offending validator's bond is not yet automatically debited.
+  Wiring needs a `validator_index → stake_address` map; the
+  natural place is to add a `stake_address` field to
+  `GenesisValidator` (and the DPoS-elected set), then call
+  `debit_slash_stake` here. Tracked under E.3 / C.6 follow-up.
+- **No cross-node evidence gossip.** Each node only slashes for
+  evidence it observed locally; if a peer's gossip stack dropped
+  a conflicting vote on one side of the wire, only the receiving
+  node records the slash. Cross-node evidence broadcast lands with
+  the libp2p / Noise transport integration (C.3 + C.4 wire-up).
+
 ## [0.0.60] — 2026-05-26
 
 ### Added — On-chain submit path for staking + governance (precompile)

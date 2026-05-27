@@ -342,6 +342,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         tracing::debug!(count = txs.len(), "staging mempool txs onto BFT engine",);
                         engine_for_loop.extend_pending_txs(txs);
                     }
+                    // Drain any equivocation evidence the BFT detector
+                    // surfaced from peer votes and auto-persist via
+                    // `record_slashing`. Stake debit needs a
+                    // validator-index → stake-address map (not yet
+                    // in `GenesisValidator`); auto-debit lands once
+                    // DPoS rotation publishes that mapping per epoch.
+                    for ev in engine_for_loop.drain_evidence() {
+                        state_for_loop.record_slashing(&ev);
+                        tracing::warn!(
+                            validator = ev.validator_index(),
+                            height = ev.height(),
+                            "equivocation evidence persisted via auto-trigger",
+                        );
+                    }
                     if let Some(block) = engine_for_loop.try_harvest_committed() {
                         let n = block.header.number;
                         let tx_count = block.body.transactions.len();
