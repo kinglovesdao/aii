@@ -5,6 +5,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.78] — 2026-05-27
+
+### Added — atomic install + execve self-restart
+
+Fifth and final foundational slice of the auto-update protocol —
+closes the loop from "verified binary cached on disk" to "node is
+running the new binary." A validator that has accepted a manifest
+via the v0.0.75 RPC and received the matching binary via the
+v0.0.77 gossip path can now finish the upgrade itself, without
+any operator-driven systemd dance.
+
+#### `aii-node::release_install` (new module, `cfg(unix)`)
+
+- `install_binary(staged, target) -> io::Result<PathBuf>` —
+  atomically replace `target` with the bytes from `staged`. Copy
+  to `<target>.new`, `chmod 0o755`, then `rename(2)` over the
+  running binary. On Linux `rename(2)` is allowed to replace a
+  currently-executing file because the kernel keeps the inode
+  alive for the running process via its open mmap, so the live
+  `aiid` keeps serving while the directory entry already points
+  at the new bytes.
+- `current_aiid_path() -> io::Result<PathBuf>` — wraps
+  `std::env::current_exe()`.
+- `exec_self() -> io::Error` — `Command::new(current_exe).args(…).exec()`
+  replaces the running process image with the new binary while
+  **preserving the PID**. Systemd does NOT respawn the unit —
+  the upgrade is invisible to the supervisor, which is exactly
+  what we want. On `execve` failure (rare: missing binary,
+  ENOMEM) the error is returned and the node continues serving
+  from the old image.
+- 6 unit tests cover the install path: replaces target, sets
+  exec bit, creates missing target, cleans up stale `.new`,
+  propagates missing-source errors, resolves a working
+  `current_exe`. The `exec_self` path is intentionally untested
+  in unit tests (would replace the test runner); the integration
+  tests below cover the file-mutating half.
+
+#### `aii-rpc`
+
+- New `aii_installRelease(version) -> InstallReleaseResult`
+  JSON-RPC method. Returns `{ scheduled, reason, restart_in_secs }`.
+  The install (file copy + chmod + rename) happens synchronously
+  inside the handler; the `execve` runs from a spawned task with
+  a short delay so the JSON-RPC reply flushes back to the caller
+  before the process is replaced.
+- New `RpcState::install_release` trait method with a "not
+  supported" default. `aii-node::NodeState` overrides on Unix.
+- New `InstallOutcome` (trait-layer) and `InstallReleaseResult`
+  (wire-layer) structs.
+- 2 RPC integration tests verify happy path (cached binary →
+  scheduled) and rejection (missing binary).
+
+#### `aii-node::NodeState`
+
+- New fields: `auto_install_releases: AtomicBool`,
+  `install_target_override: RwLock<Option<PathBuf>>`. Override
+  is test-only (`set_install_target_for_tests`) — redirects the
+  install target away from `/proc/self/exe` and suppresses the
+  `execve` spawn so integration tests can exercise install
+  without overwriting the test runner.
+- `RpcState::install_release` impl performs the full path:
+  resolve data dir, verify staged binary exists, resolve target
+  (override or `current_exe`), call `install_binary`, spawn
+  `execve` task (skipped in test mode).
+- `record_release_announcement` and `import_release_binary`
+  both invoke a new `maybe_auto_install_release` helper after
+  their happy path. When auto-install is on AND a manifest is
+  known AND its binary is cached locally, the install fires
+  automatically — regardless of which arrived first (gossip
+  ordering doesn't matter).
+- 3 lib-level integration tests: explicit install swaps the
+  override target; install rejects missing binary; auto-install
+  fires the moment both (manifest, binary) are in hand via the
+  announce → import sequence.
+
+#### `aii-node` CLI
+
+- New `--auto-install-releases` flag. Off by default — in-place
+  restarts are disruptive and most operators want to schedule
+  the swap manually via `aii_installRelease` once they've
+  reviewed the manifest. On a validator with `--update-peers`
+  set, enabling this flag turns the validator into a fully
+  hands-off auto-updating node.
+
+### End-to-end auto-update flow (v0.0.74 → v0.0.78)
+
+The whole chain now exists:
+
+1. **Sign** (v0.0.74): `aii release sign --binary aiid --version V --secret SK`
+   produces an Ed25519-signed manifest.
+2. **Announce** (v0.0.75): the operator hits any one node with
+   `aii_announceRelease(manifest)`. That node verifies the
+   signature against the pinned project pubkey.
+3. **Gossip + fetch** (v0.0.77): the accepting node re-broadcasts
+   to its `--update-peers` and pushes the binary to peers that
+   lack it. Every receiver re-verifies signature + SHA-256.
+4. **Install + restart** (v0.0.78): each node with
+   `--auto-install-releases` set atomically swaps the running
+   binary and `execve`s into the new image. Systemd PID stays
+   the same; the supervisor sees no restart.
+
+A new release reaches the entire validator set in seconds, and
+the trust boundary at every hop is "valid Ed25519 signature from
+the pinned project pubkey + matching SHA-256."
+
+### Scope discipline
+
+Out of scope for v0.0.78, explicitly:
+
+- **Rollback / two-slot install.** If the new binary crashes on
+  start, systemd will respawn it, and the broken binary stays
+  installed. A future slice keeps `<previous-version>` cached
+  and ships a watchdog that rolls back after N failed starts.
+- **Periodic re-poll for late joiners.** A node that misses the
+  manifest gossip wave (e.g., was offline) currently has no way
+  to discover a release was made. A future slice adds a periodic
+  `aii_latestRelease` pull against the update-peer list.
+- **Pubkey rotation.** The release-signing pubkey is still
+  compiled in. Operator-driven rotation lands separately,
+  alongside the secret-management policy.
+
 ## [0.0.77] — 2026-05-27
 
 ### Added — release auto-gossip + auto-fetch

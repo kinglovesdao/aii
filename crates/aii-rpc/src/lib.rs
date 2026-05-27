@@ -279,6 +279,41 @@ pub trait RpcState: Send + Sync + 'static {
     async fn update_peers_for_release(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Atomically install a previously-imported release binary
+    /// over the running `aiid` and schedule an `execve` self-
+    /// restart (v0.0.78). The install (file copy + chmod +
+    /// rename) happens synchronously inside this call; the
+    /// `execve` runs in a spawned task after a short delay so
+    /// the JSON-RPC reply flushes back to the caller before the
+    /// process is replaced. Default implementation returns
+    /// "not supported".
+    async fn install_release(&self, _version: &str) -> InstallOutcome {
+        InstallOutcome {
+            scheduled: false,
+            reason: "node does not support in-place install".into(),
+            restart_in_secs: 0,
+        }
+    }
+}
+
+/// Result type carried back from [`RpcState::install_release`].
+///
+/// `scheduled = true` means the binary was successfully copied
+/// into place and a self-restart will fire in `restart_in_secs`
+/// seconds. `scheduled = false` means the install was rejected
+/// (binary missing, version mismatch, I/O error, etc.) with the
+/// reason in `reason`.
+#[derive(Debug, Clone)]
+pub struct InstallOutcome {
+    /// Whether the binary was installed and a restart scheduled.
+    pub scheduled: bool,
+    /// Human-readable reason — empty on success, error detail
+    /// when `scheduled` is `false`.
+    pub reason: String,
+    /// Seconds the host will wait before `execve`-ing the new
+    /// binary. `0` when `scheduled` is `false`.
+    pub restart_in_secs: u64,
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -576,6 +611,16 @@ pub trait AiiRpc {
         version: String,
         hex_bytes: String,
     ) -> RpcResult<ImportReleaseResult>;
+
+    /// `aii_installRelease(version)` — atomically install the
+    /// release binary cached at `<data-dir>/releases/<version>`
+    /// over the running `aiid` and schedule an `execve` self-
+    /// restart so the node comes back online on the new binary
+    /// (v0.0.78). The install itself happens synchronously; the
+    /// restart fires from a spawned task a few seconds later so
+    /// the JSON-RPC reply makes it back to the caller.
+    #[method(name = "installRelease")]
+    async fn install_release(&self, version: String) -> RpcResult<InstallReleaseResult>;
 }
 
 /// Wire shape for the release manifest exchanged over JSON-RPC.
@@ -634,6 +679,36 @@ pub struct ImportReleaseResult {
     pub accepted: bool,
     /// Human-readable reason for `accepted=false`. Empty on success.
     pub reason: String,
+}
+
+/// Response envelope for [`AiiRpc::install_release`].
+///
+/// `scheduled = true` means the binary at
+/// `<data-dir>/releases/<version>` has been copied over the
+/// running `aiid` and a self-`execve` will fire in
+/// `restart_in_secs` seconds. `scheduled = false` means the
+/// install was rejected (binary missing, version mismatch,
+/// I/O error, not supported on this build) with the reason
+/// in [`Self::reason`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallReleaseResult {
+    /// Whether the binary was installed and a restart scheduled.
+    pub scheduled: bool,
+    /// Human-readable reason — empty on success, error detail on rejection.
+    pub reason: String,
+    /// Seconds the host will wait before `execve`-ing the new
+    /// binary. `0` when `scheduled` is `false`.
+    pub restart_in_secs: u64,
+}
+
+impl From<InstallOutcome> for InstallReleaseResult {
+    fn from(o: InstallOutcome) -> Self {
+        Self {
+            scheduled: o.scheduled,
+            reason: o.reason,
+            restart_in_secs: o.restart_in_secs,
+        }
+    }
 }
 
 /// JSON-RPC view of the post-block Yellow-Paper roots.
@@ -1043,6 +1118,11 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
         let (accepted, reason) = self.state.import_release_binary(&version, bytes).await;
         Ok(ImportReleaseResult { accepted, reason })
     }
+
+    async fn install_release(&self, version: String) -> RpcResult<InstallReleaseResult> {
+        let outcome = self.state.install_release(&version).await;
+        Ok(outcome.into())
+    }
 }
 
 fn parse_address(s: &str) -> RpcResult<Address> {
@@ -1352,6 +1432,25 @@ mod tests {
                 .insert(version.to_string(), bytes);
             (true, String::new())
         }
+        // v0.0.78: in-test install simulates success when the
+        // binary is cached, otherwise rejects. No real file I/O
+        // or execve — the fixture just records the call.
+        async fn install_release(&self, version: &str) -> InstallOutcome {
+            let has = self.binaries.lock().unwrap().contains_key(version);
+            if has {
+                InstallOutcome {
+                    scheduled: true,
+                    reason: String::new(),
+                    restart_in_secs: 2,
+                }
+            } else {
+                InstallOutcome {
+                    scheduled: false,
+                    reason: format!("no cached binary for {version}"),
+                    restart_in_secs: 0,
+                }
+            }
+        }
     }
 
     fn release_fixture() -> Arc<ReleaseTestState> {
@@ -1627,5 +1726,50 @@ mod tests {
 
         handle_a.stop().unwrap();
         handle_b.stop().unwrap();
+    }
+
+    /// v0.0.78 — aii_installRelease happy path: with the binary
+    /// pre-loaded in the fixture's cache, the RPC returns
+    /// `scheduled = true` and a non-zero restart_in_secs.
+    #[tokio::test]
+    async fn aii_install_release_returns_scheduled_when_binary_present() {
+        let fixture = release_fixture();
+        fixture
+            .binaries
+            .lock()
+            .unwrap()
+            .insert("0.0.78".to_string(), b"binary".to_vec());
+        let (addr, handle) = serve("127.0.0.1:0".parse().unwrap(), fixture)
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let c = HttpClientBuilder::default().build(url).unwrap();
+        let r: InstallReleaseResult = c
+            .request("aii_installRelease", rpc_params!["0.0.78"])
+            .await
+            .unwrap();
+        assert!(
+            r.scheduled,
+            "install must succeed when binary present: {r:?}"
+        );
+        assert!(r.restart_in_secs > 0);
+        assert!(r.reason.is_empty());
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.78 — aii_installRelease without the binary in cache
+    /// returns `scheduled = false` with an explanatory reason.
+    #[tokio::test]
+    async fn aii_install_release_rejects_missing_binary() {
+        let (url, h) = spawn_release().await;
+        let c = HttpClientBuilder::default().build(url).unwrap();
+        let r: InstallReleaseResult = c
+            .request("aii_installRelease", rpc_params!["0.0.99"])
+            .await
+            .unwrap();
+        assert!(!r.scheduled);
+        assert!(!r.reason.is_empty());
+        assert_eq!(r.restart_in_secs, 0);
+        h.stop().unwrap();
     }
 }
