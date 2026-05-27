@@ -5,6 +5,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.66] — 2026-05-26
+
+### Added — One-click PC installer suite + git branch consolidation
+
+**`master` and `main` are now unified.** Before this release the GitHub
+default branch (`main`) still pointed at the 3 stale planning-doc
+commits from before any code shipped; all v0.0.40 → v0.0.65 work
+lived only on `master`. v0.0.66 merges `main` into `master` with
+`--allow-unrelated-histories` (keeping master's actual code at every
+conflict), then pushes the merge tip to both branches so a fresh
+visitor to `github.com/kinglovesdao/aii` sees the live code.
+
+**One-click desktop / server installer suite.** Anyone with a single
+shell command can now stand up a validator (or RPC observer) and
+join the live testnet in under 60 seconds on Linux, 5 minutes on
+macOS, 10 minutes on Windows. Bundles ship with the live testnet
+genesis pre-loaded.
+
+#### `release-bundle/` (new top-level)
+
+- `staging/install-linux.sh` — root-required installer that:
+  1. drops `aiid` / `aii` / `aii-mcp` into `/usr/local/bin/` (uses
+     pre-built bundled binaries when present, falls back to `cargo
+     build --release` against the local checkout or a fresh clone),
+  2. installs the bundled testnet genesis to `/var/lib/aiid/genesis.json`,
+  3. generates a fresh validator keystore via `aii validator keygen`
+     (skipped with `--observer`),
+  4. writes `/etc/systemd/system/aiid.service` with the right
+     `ExecStart` for validator or observer mode,
+  5. starts the service + verifies it's active.
+- `staging/install-macos.sh` — builds from source via `cargo`,
+  registers a launchd LaunchDaemon at
+  `/Library/LaunchDaemons/org.aii.aiid.plist`.
+- `staging/install-windows.ps1` — PowerShell installer (run as
+  Admin), builds from source via `cargo`, registers `aiid` as a
+  Windows Service via `sc.exe`.
+- `staging/config/testnet-genesis.json` — pulled live from the JP
+  testnet node; ensures bundled installs join the same chain.
+- `staging/README.md` — 5-minute orientation: bundle contents, env
+  var overrides, validator vs observer, RPC examples, port table.
+- `staging/MANIFEST.json` — machine-readable build manifest:
+  version, binary sizes, full `eth_*` / `aii_*` method list, chain
+  id 9999, default bootnode.
+
+#### Repo structure
+
+- `release-bundle/.gitignore` skips `staging/bin/` + `staging-src/`
+  + `*.tar.gz` + `*.zip` so pre-built artifacts (12 MB Linux
+  tarball + 8 KB source-build zip) stay local — they're built
+  reproducibly from `staging/` by anyone with `cargo` + `tar`.
+- `master` and `main` now share a tip (`28cbb80` merge commit).
+  `git push` against either branch will fast-forward the other.
+
+#### Branch hygiene
+
+27 `feat/aii-*` development branches (one per crate from the
+original TDD pipeline) all confirmed already-merged into master,
+then deleted locally. The full development history lives in the
+master commit log.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No cross-compiled Windows + macOS pre-built binaries.** Both
+  installers build from source via the local Rust toolchain. The
+  alternative — shipping `aiid.exe` and Mach-O binaries — needs
+  either a CI matrix with macOS + Windows runners, or local
+  cross-compile via `cross` (Docker-based). Either lands when
+  GitHub Actions release workflow exists.
+- **No code signing.** Windows users see SmartScreen warnings;
+  macOS users need to right-click → Open or `xattr -d
+  com.apple.quarantine`. Apple Developer + Windows EV cert are
+  not in scope until a project foundation exists.
+- **No package-manager publication.** `brew tap` / `apt`
+  repository / `winget` manifest all land alongside CI when the
+  release pipeline gets formalised.
+
 ## [0.0.65] — 2026-05-26
 
 ### Added — `BlockExecutor` trait + engine apply-then-hash hook

@@ -1,0 +1,5 @@
+# Pre-built artifacts — not tracked (too large + arch-specific)
+staging/bin/
+staging-src/
+*.tar.gz
+*.zip

@@ -1,0 +1,59 @@
+{
+  "version": "0.0.65",
+  "build_date": "2026-05-26",
+  "binaries": {
+    "aiid": {
+      "target": "x86_64-unknown-linux-gnu",
+      "size_bytes": 15878152,
+      "min_glibc": "2.34"
+    },
+    "aii": {
+      "target": "x86_64-unknown-linux-gnu",
+      "size_bytes": 5725888,
+      "min_glibc": "2.34"
+    },
+    "aii-mcp": {
+      "target": "x86_64-unknown-linux-gnu",
+      "size_bytes": 4252248,
+      "min_glibc": "2.34"
+    }
+  },
+  "genesis": {
+    "chain_id": 9999,
+    "network": "aii-testnet",
+    "bootnode": "http://8.211.135.234:8545"
+  },
+  "rpc_methods": {
+    "eth_*": [
+      "eth_chainId",
+      "eth_blockNumber",
+      "eth_gasPrice",
+      "eth_getBalance",
+      "eth_sendRawTransaction",
+      "eth_getTransactionReceipt",
+      "eth_getLogs"
+    ],
+    "aii_*": [
+      "aii_status",
+      "aii_getAccount",
+      "aii_getBlockHeader",
+      "aii_recentBlocks",
+      "aii_getBlockTransactions",
+      "aii_getTransaction",
+      "aii_getRawBlock",
+      "aii_listSlashings",
+      "aii_getSubchainAnchor",
+      "aii_getStake",
+      "aii_totalStake",
+      "aii_listStakers",
+      "aii_getActiveValidators",
+      "aii_listProposals",
+      "aii_getProposal",
+      "aii_listForks",
+      "aii_getPostRoots"
+    ]
+  },
+  "source": "https://github.com/kinglovesdao/aii",
+  "explorer": "https://allfund.xyz/#/explorer",
+  "license": "MIT"
+}
