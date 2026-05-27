@@ -35,13 +35,40 @@
 
 use std::path::Path;
 
-use aii_crypto::ed25519::{PublicKey, SecretKey, Signature};
+use crate::ed25519::{PublicKey, SecretKey, Signature};
+use crate::CryptoError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Domain-separation tag prepended to the signed payload.
 pub const DOMAIN_TAG: &[u8] = b"aii-release-v1\0";
+
+/// Hex of the official AII Network release-signing public key.
+///
+/// (v0.0.75) The matching secret seed is held off-chain by the
+/// release manager — every node ships with this public half
+/// compiled in so [`pinned_release_pubkey`] can be used as the
+/// default trust anchor for `aii release verify` and for the
+/// `aii_announceRelease` JSON-RPC endpoint.
+///
+/// Rotating this constant is a backwards-incompatible change:
+/// nodes still on the old pinned key will reject manifests signed
+/// by the new one. A future release will add an on-chain rotation
+/// path; for now any rotation requires a workspace-wide bump.
+pub const RELEASE_SIGNING_PUBKEY_HEX: &str =
+    "f845c1bbf443bbf3e18f1a97599c34d39cac4a03fb22c80110f37491c92c0669";
+
+/// Parse [`RELEASE_SIGNING_PUBKEY_HEX`] into a usable [`PublicKey`].
+///
+/// # Panics
+///
+/// Panics if the compiled-in constant is malformed — that's a
+/// build-time error, so we want it to surface loudly.
+#[must_use]
+pub fn pinned_release_pubkey() -> PublicKey {
+    PublicKey::from_hex(RELEASE_SIGNING_PUBKEY_HEX).expect("pinned release pubkey must parse")
+}
 
 /// On-disk representation of a signed binary release.
 ///
@@ -78,7 +105,7 @@ pub enum ReleaseError {
 
     /// Crypto-layer failure (bad key, bad signature, …).
     #[error("crypto: {0}")]
-    Crypto(#[from] aii_crypto::CryptoError),
+    Crypto(#[from] CryptoError),
 
     /// The hash recorded in the manifest does not match the bytes of
     /// the binary the caller supplied.

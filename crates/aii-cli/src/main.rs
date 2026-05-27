@@ -158,7 +158,10 @@ enum ReleaseCmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
-    /// Verify a `release.json` against a binary + a pinned public key.
+    /// Verify a `release.json` against a binary. Defaults to the
+    /// compiled-in pinned release-signing pubkey
+    /// (`RELEASE_SIGNING_PUBKEY_HEX`); pass `--pubkey` to verify
+    /// against a different key (testing, key rotation drills, etc.).
     Verify {
         /// Path to the release manifest JSON.
         #[arg(long)]
@@ -166,9 +169,10 @@ enum ReleaseCmd {
         /// Path to the binary the manifest claims to cover.
         #[arg(long)]
         binary: std::path::PathBuf,
-        /// Hex-encoded 32-byte Ed25519 public key (with or without `0x`).
+        /// Hex-encoded 32-byte Ed25519 public key. Omit to use the
+        /// pinned project release-signing pubkey.
         #[arg(long)]
-        pubkey: String,
+        pubkey: Option<String>,
     },
 }
 
@@ -625,8 +629,11 @@ fn handle_release_cmd(sub: ReleaseCmd, json_out: bool) -> Result<(), CliError> {
             binary,
             pubkey,
         } => {
-            let pk = Ed25519PublicKey::from_hex(&pubkey)
-                .map_err(|e| CliError::Client(format!("pubkey: {e}")))?;
+            let pk = match pubkey {
+                Some(hex) => Ed25519PublicKey::from_hex(&hex)
+                    .map_err(|e| CliError::Client(format!("pubkey: {e}")))?,
+                None => aii_cli::release::pinned_release_pubkey(),
+            };
             let manifest_json =
                 fs::read_to_string(&manifest).map_err(|e| CliError::Client(e.to_string()))?;
             let m: aii_cli::release::ReleaseManifest = serde_json::from_str(&manifest_json)?;
@@ -638,10 +645,16 @@ fn handle_release_cmd(sub: ReleaseCmd, json_out: bool) -> Result<(), CliError> {
                         "ok": true,
                         "version": m.version,
                         "timestamp_unix": m.timestamp_unix,
+                        "pubkey": pk.to_hex(),
                     })
                 );
             } else {
-                println!("ok — {} signed at {}", m.version, m.timestamp_unix);
+                println!(
+                    "ok — {} signed at {} (key {})",
+                    m.version,
+                    m.timestamp_unix,
+                    &pk.to_hex()[..16]
+                );
             }
         }
     }

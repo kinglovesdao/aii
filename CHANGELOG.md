@@ -5,6 +5,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.75] — 2026-05-27
+
+### Added — pinned release pubkey + `aii_announceRelease` / `aii_latestRelease` RPC
+
+Second slice of the auto-update protocol. v0.0.74 shipped the
+manifest sign/verify primitives behind a `--pubkey HEX` CLI
+argument; v0.0.75 ships the pubkey **pinned in the binary** and
+exposes the announcement+query wire over JSON-RPC so peers can
+gossip release availability.
+
+#### `aii-crypto::release` (moved from `aii-cli`)
+
+- Module moved from `aii-cli::release` into `aii-crypto::release`
+  so `aii-rpc` and `aii-node` can depend on it. `aii-cli` re-
+  exports `aii_crypto::release` under its old name for backward
+  compatibility — every prior call site keeps working.
+- New `pub const RELEASE_SIGNING_PUBKEY_HEX: &str = "f845…0669"`
+  pinning the AII Network release-signing public key. The matching
+  secret seed is held off-chain by the release manager.
+- New `pinned_release_pubkey() -> PublicKey` helper.
+
+#### `aii-cli::release`
+
+- `aii release verify --manifest M --binary B` now omits
+  `--pubkey` and defaults to the pinned key. Pass `--pubkey HEX`
+  to override (testing, key rotation drills).
+- Verify output prints the first 16 hex chars of the pubkey it
+  used so operators can confirm which trust anchor was in force.
+
+#### `aii-rpc`
+
+- New `AiiRpc::announce_release(manifest)` method. Server-side
+  the receiver verifies the Ed25519 signature against
+  `pinned_release_pubkey()` *before* handing the manifest off to
+  `RpcState::record_release_announcement` for persistence;
+  signature failures return `{ accepted: false, reason: ... }`
+  with no state mutation.
+- New `AiiRpc::latest_release()` method returning the most
+  recently accepted manifest, or `null`.
+- New `ReleaseManifestView` (wire-shape mirror of
+  `aii_crypto::release::ReleaseManifest`) + `AnnounceReleaseResult`.
+- New `RpcState::record_release_announcement` + `latest_release`
+  trait methods (default no-ops). `NodeState` overrides both to
+  persist into a new `latest_release: RwLock<Option<...>>` field.
+- 3 RPC unit tests:
+  - `aii_announce_release_rejects_unsigned_manifest`
+  - `aii_announce_release_accepts_pinned_pubkey_signature`
+  - `aii_latest_release_fresh_node_returns_null`
+
+#### `aii-node::NodeState`
+
+- New `latest_release: RwLock<Option<ReleaseManifest>>` field.
+- `record_release_announcement` accepts strictly-newer manifests
+  (compared on `(timestamp_unix, version)` lexically), rejects
+  duplicates / backdated re-signs.
+- `latest_release` returns the cloned manifest or `None`.
+
+777 tests pass, clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.76+:
+
+- Peer binary fetch — `aii_getReleaseBinary(version) -> bytes` so
+  a node that received an announcement can pull the binary from a
+  peer that already has it.
+- Atomic install — write to `<data-dir>/releases/<ver>.new`,
+  verify sha256, rename, swap symlink, re-exec.
+- Cross-node gossip relay — when `announce_release` accepts, the
+  receiver forwards the same manifest to its peers (BTC-style
+  flood with hash-dedup).
+
 ## [0.0.74] — 2026-05-27
 
 ### Added — signed release-manifest primitives

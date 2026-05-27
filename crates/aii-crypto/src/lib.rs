@@ -29,6 +29,7 @@ pub mod bls;
 pub mod ed25519;
 pub mod error;
 pub mod keccak;
+pub mod release;
 pub mod secp;
 pub mod vrf;
 
