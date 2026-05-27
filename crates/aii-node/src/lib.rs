@@ -15,6 +15,8 @@ pub mod dpos;
 pub mod governance;
 pub mod peer_cache;
 pub mod precompile;
+#[cfg(unix)]
+pub mod release_install;
 pub mod release_store;
 pub mod staking;
 pub mod sync;
@@ -88,7 +90,7 @@ use aii_types::{Address, H256, U256};
 use alloy_rlp::{Decodable, Encodable};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Meta-CF key holding the canonical chain head as a big-endian u64.
@@ -189,6 +191,22 @@ pub struct NodeState {
     /// at startup. Empty means "this node accepts announcements
     /// but never re-broadcasts" — useful for leaf clients.
     update_peers: RwLock<Vec<String>>,
+    /// When `true`, accepting a release manifest whose binary is
+    /// already in `<data-dir>/releases/<version>` triggers an
+    /// atomic install + execve self-restart (v0.0.78). Operator
+    /// opt-in via `aiid --auto-install-releases`; default `false`
+    /// because in-place restarts are disruptive and most
+    /// production operators want to schedule the swap.
+    auto_install_releases: AtomicBool,
+    /// Test-only override (v0.0.78): when `Some`,
+    /// [`RpcState::install_release`] uses this path as the
+    /// install target instead of `/proc/self/exe`, and skips
+    /// the `execve` self-restart spawn. Required because
+    /// otherwise integration tests that exercise install would
+    /// actually swap the test-runner binary and `exec` it,
+    /// which is catastrophic for `cargo test`. Production
+    /// always leaves this `None`.
+    install_target_override: RwLock<Option<std::path::PathBuf>>,
 }
 
 /// Headers + bodies keyed by hash and number, plus an insertion-order
@@ -225,6 +243,8 @@ impl NodeState {
             latest_release: RwLock::new(None),
             data_dir: RwLock::new(None),
             update_peers: RwLock::new(Vec::new()),
+            auto_install_releases: AtomicBool::new(false),
+            install_target_override: RwLock::new(None),
         })
     }
 
@@ -327,6 +347,8 @@ impl NodeState {
             latest_release: RwLock::new(None),
             data_dir: RwLock::new(None),
             update_peers: RwLock::new(Vec::new()),
+            auto_install_releases: AtomicBool::new(false),
+            install_target_override: RwLock::new(None),
         }))
     }
 
@@ -1092,6 +1114,81 @@ impl NodeState {
             .unwrap_or_default()
     }
 
+    /// Toggle automatic in-place upgrade on release acceptance
+    /// (v0.0.78).
+    ///
+    /// When `true`, [`RpcState::record_release_announcement`]
+    /// schedules an atomic install + execve self-restart as soon
+    /// as the version's binary lands in
+    /// `<data-dir>/releases/<version>`. Operator opt-in via
+    /// `aiid --auto-install-releases`.
+    pub fn set_auto_install_releases(&self, on: bool) {
+        self.auto_install_releases.store(on, Ordering::Relaxed);
+    }
+
+    /// Read the auto-install flag. Default `false` on a node that
+    /// hasn't called [`Self::set_auto_install_releases`].
+    #[must_use]
+    pub fn auto_install_releases(&self) -> bool {
+        self.auto_install_releases.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: redirect the v0.0.78 install target away from
+    /// `/proc/self/exe` to `path`, and suppress the `execve`
+    /// self-restart task. Used by `aii-node` integration tests
+    /// so they can exercise install without overwriting the
+    /// test runner. Calling this in production is a footgun —
+    /// the manual restart path is gone, so an in-place upgrade
+    /// would write the new binary to `path` and never restart.
+    #[doc(hidden)]
+    pub fn set_install_target_for_tests(&self, path: std::path::PathBuf) {
+        if let Ok(mut g) = self.install_target_override.write() {
+            *g = Some(path);
+        }
+    }
+
+    /// Trigger the v0.0.78 auto-install path iff the conditions
+    /// are met: auto-install is on, `data_dir` is known, the
+    /// binary for `version` is cached locally, and the locally-
+    /// known latest manifest matches `version`. Returns silently
+    /// when any condition fails — fail-closed by design, since
+    /// the operator opted in.
+    ///
+    /// Invoked from `record_release_announcement` and
+    /// `import_release_binary` so the auto-install fires the
+    /// moment both (manifest, binary) are in hand, regardless of
+    /// which arrived first.
+    #[cfg(unix)]
+    async fn maybe_auto_install_release(&self, version: &str) {
+        if !self.auto_install_releases() {
+            return;
+        }
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        if !crate::release_store::binary_path(&dir, version).exists() {
+            return;
+        }
+        let manifest = self.latest_release.read().ok().and_then(|g| g.clone());
+        let Some(m) = manifest else {
+            return;
+        };
+        if m.version != version {
+            return;
+        }
+        tracing::info!(
+            version = version,
+            "auto-install conditions met; invoking install_release",
+        );
+        let outcome = <Self as aii_rpc::RpcState>::install_release(self, version).await;
+        tracing::info!(
+            scheduled = outcome.scheduled,
+            reason = %outcome.reason,
+            restart_in_secs = outcome.restart_in_secs,
+            "auto-install result",
+        );
+    }
+
     /// Read the full [`Block`] at height `n`, reconstructed from the
     /// in-memory `by_number → hash → header / body` indices.
     ///
@@ -1739,6 +1836,8 @@ impl RpcState for NodeState {
                     bytes = bytes.len(),
                     "imported release binary",
                 );
+                #[cfg(unix)]
+                self.maybe_auto_install_release(version).await;
                 (true, String::new())
             }
             Err(e) => (false, format!("{e}")),
@@ -1749,27 +1848,39 @@ impl RpcState for NodeState {
         &self,
         manifest: aii_crypto::release::ReleaseManifest,
     ) -> bool {
-        let Ok(mut guard) = self.latest_release.write() else {
-            return false;
-        };
-        // Only accept a strictly newer manifest. Compare on
-        // (timestamp_unix, version-string) — timestamp first so a
-        // backdated re-sign of the same version cannot displace the
-        // live one.
-        if let Some(current) = guard.as_ref() {
-            let strictly_newer = manifest.timestamp_unix > current.timestamp_unix
-                || (manifest.timestamp_unix == current.timestamp_unix
-                    && manifest.version > current.version);
-            if !strictly_newer {
+        let version_for_auto_install = {
+            let Ok(mut guard) = self.latest_release.write() else {
                 return false;
+            };
+            // Only accept a strictly newer manifest. Compare on
+            // (timestamp_unix, version-string) — timestamp first so a
+            // backdated re-sign of the same version cannot displace the
+            // live one.
+            if let Some(current) = guard.as_ref() {
+                let strictly_newer = manifest.timestamp_unix > current.timestamp_unix
+                    || (manifest.timestamp_unix == current.timestamp_unix
+                        && manifest.version > current.version);
+                if !strictly_newer {
+                    return false;
+                }
             }
-        }
-        tracing::info!(
-            version = %manifest.version,
-            ts = manifest.timestamp_unix,
-            "accepted release announcement",
-        );
-        *guard = Some(manifest);
+            tracing::info!(
+                version = %manifest.version,
+                ts = manifest.timestamp_unix,
+                "accepted release announcement",
+            );
+            let v = manifest.version.clone();
+            *guard = Some(manifest);
+            v
+        };
+        // Auto-install path (v0.0.78): if the binary for the
+        // newly-accepted version already lives in our cache (e.g.
+        // because gossip pushed it before the manifest landed),
+        // fire the install + execve here. Lock guard above is
+        // dropped first so install_release can re-read state.
+        #[cfg(unix)]
+        self.maybe_auto_install_release(&version_for_auto_install)
+            .await;
         true
     }
 
@@ -1779,6 +1890,78 @@ impl RpcState for NodeState {
 
     async fn update_peers_for_release(&self) -> Vec<String> {
         self.update_peers()
+    }
+
+    #[cfg(unix)]
+    async fn install_release(&self, version: &str) -> aii_rpc::InstallOutcome {
+        const RESTART_DELAY_SECS: u64 = 2;
+
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: "node has no data_dir configured (set_data_dir not called)".into(),
+                restart_in_secs: 0,
+            };
+        };
+        let staged = crate::release_store::binary_path(&dir, version);
+        if !staged.exists() {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: format!(
+                    "no cached binary for version {version} at {} — run aii_importReleaseBinary first",
+                    staged.display()
+                ),
+                restart_in_secs: 0,
+            };
+        }
+        // Test-only path: when the override is set, install to
+        // the override and skip execve so the test runner stays
+        // alive.
+        let override_target = self
+            .install_target_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone());
+        let target = if let Some(p) = override_target.clone() {
+            p
+        } else {
+            match crate::release_install::current_aiid_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    return aii_rpc::InstallOutcome {
+                        scheduled: false,
+                        reason: format!("cannot resolve current_exe: {e}"),
+                        restart_in_secs: 0,
+                    };
+                }
+            }
+        };
+        if let Err(e) = crate::release_install::install_binary(&staged, &target) {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: format!("install failed: {e}"),
+                restart_in_secs: 0,
+            };
+        }
+        tracing::info!(
+            version = version,
+            target = %target.display(),
+            restart_in_secs = RESTART_DELAY_SECS,
+            test_mode = override_target.is_some(),
+            "release installed; self-restart scheduled",
+        );
+        if override_target.is_none() {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                let err = crate::release_install::exec_self();
+                tracing::error!(error = %err, "execve self failed; node continues on old binary");
+            });
+        }
+        aii_rpc::InstallOutcome {
+            scheduled: true,
+            reason: String::new(),
+            restart_in_secs: RESTART_DELAY_SECS,
+        }
     }
 }
 
@@ -2416,5 +2599,138 @@ mod tests {
                 "body must restore for block {n}"
             );
         }
+    }
+
+    /// v0.0.78 install path: when both the manifest and binary are
+    /// present, and an install-target override is set (test mode),
+    /// install_release performs the atomic file swap and returns
+    /// `scheduled: true` WITHOUT spawning the `execve` self-task.
+    /// The override file ends up holding the staged bytes; the
+    /// previous override-file contents are discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_release_swaps_override_target_and_skips_exec() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"OLD CONTENTS").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Sign a manifest with the project pinned secret so
+        // record_release_announcement accepts it.
+        let payload = b"v0.0.78 atomic install body";
+        let mut tmpf = tempfile::NamedTempFile::new().unwrap();
+        tmpf.write_all(payload).unwrap();
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let manifest = sign_release(&sk, tmpf.path(), "0.0.78", 1_900_000_078).unwrap();
+        let accepted =
+            aii_rpc::RpcState::record_release_announcement(&*state, manifest.clone()).await;
+        assert!(accepted, "manifest should be accepted on a fresh node");
+
+        // Pre-stage the binary in the release store as if a prior
+        // aii_importReleaseBinary had landed it.
+        crate::release_store::store_verified_binary(
+            &data_dir,
+            "0.0.78",
+            &manifest.sha256_hex,
+            payload,
+        )
+        .unwrap();
+
+        // Trigger install. Test mode: override path is used, no execve fires.
+        let outcome = aii_rpc::RpcState::install_release(&*state, "0.0.78").await;
+        assert!(outcome.scheduled, "install should succeed: {outcome:?}");
+        assert!(outcome.restart_in_secs > 0);
+
+        // Override target now holds the staged binary contents.
+        let installed = std::fs::read(&target).unwrap();
+        assert_eq!(
+            installed, payload,
+            "install_release must atomically replace the target"
+        );
+
+        // Stale .new file should not exist after a clean install.
+        let staging_path = target.with_extension("new");
+        assert!(
+            !staging_path.exists(),
+            ".new staging file must be consumed by rename"
+        );
+    }
+
+    /// install_release fails-soft when the binary for the requested
+    /// version is not present in the release store. Nothing is
+    /// written to the target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_release_rejects_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"UNCHANGED").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir);
+        state.set_install_target_for_tests(target.clone());
+
+        let outcome = aii_rpc::RpcState::install_release(&*state, "0.0.99").await;
+        assert!(!outcome.scheduled);
+        assert!(outcome.reason.contains("no cached binary"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"UNCHANGED");
+    }
+
+    /// v0.0.78 auto-install path: when --auto-install-releases is
+    /// on, a successful manifest accept followed by a binary import
+    /// fires install_release without an explicit RPC call. The
+    /// target file ends up holding the imported bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_install_fires_when_manifest_and_binary_both_present() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"PREVIOUS").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir);
+        state.set_install_target_for_tests(target.clone());
+        state.set_auto_install_releases(true);
+        assert!(state.auto_install_releases());
+
+        let payload = b"v0.0.78 auto-install body";
+        let mut tmpf = tempfile::NamedTempFile::new().unwrap();
+        tmpf.write_all(payload).unwrap();
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let manifest = sign_release(&sk, tmpf.path(), "0.0.78", 1_900_000_079).unwrap();
+
+        // Step 1: announce. Binary not yet present, auto-install skips silently.
+        let ok = aii_rpc::RpcState::record_release_announcement(&*state, manifest.clone()).await;
+        assert!(ok);
+        // Target still untouched.
+        assert_eq!(std::fs::read(&target).unwrap(), b"PREVIOUS");
+
+        // Step 2: import binary. NOW both conditions hold, auto-install fires.
+        let (imp_ok, reason) =
+            aii_rpc::RpcState::import_release_binary(&*state, "0.0.78", payload.to_vec()).await;
+        assert!(imp_ok, "binary import should accept: {reason}");
+
+        // Target replaced.
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
     }
 }

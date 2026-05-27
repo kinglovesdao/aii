@@ -139,6 +139,16 @@ struct Cli {
     /// announcements but never re-broadcasts).
     #[arg(long, default_value = "", value_parser)]
     update_peers: String,
+
+    /// v0.0.78 opt-in: when set, accepting a signed release
+    /// manifest whose binary is already cached at
+    /// `<data-dir>/releases/<version>` triggers an atomic install
+    /// over the running `aiid` plus an `execve` self-restart.
+    /// Default `false` — in-place restarts are disruptive and
+    /// most operators want to schedule the swap manually via
+    /// `aii_installRelease` once they've reviewed the manifest.
+    #[arg(long, default_value = "false")]
+    auto_install_releases: bool,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -276,6 +286,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing::info!(peers = ?peers, "release-gossip peers configured");
         }
         node_state.set_update_peers(peers);
+    }
+    // v0.0.78: opt-in atomic install + execve self-restart on
+    // release accept. Off by default.
+    node_state.set_auto_install_releases(cli.auto_install_releases);
+    if cli.auto_install_releases {
+        tracing::info!("auto-install of accepted releases is ENABLED");
     }
 
     // Cold-join sync: catch up to the bootnode's head before opening
