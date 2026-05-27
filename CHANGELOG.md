@@ -5,6 +5,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.67] — 2026-05-26
+
+### Added — `--no-produce-blocks` + `--follow-seconds` observer mode
+
+A node started with `--bootnode URL --follow-seconds N --no-produce-blocks`
+now polls the bootnode every N seconds, applies every newly-finalised
+block locally via the existing `bootstrap_sync_from_peer` path, and
+serves RPC against the live chain — *without* forking its own
+DevMode chain. This closes the v0.0.66 gap where any local node had
+to either (1) be a full BFT validator (needs inbound network
+reachability) or (2) accidentally fork by running the DevMode
+producer.
+
+This is what unblocks deploying a 3rd node on a NAT'd / proxied
+machine: the local node joins the same `chain_id 9999` testnet that
+JP + CN are running, just as an observer that follows their tip.
+
+#### `aii-node` (`aiid` binary)
+
+- `--produce-blocks` now accepts an explicit boolean value
+  (`--produce-blocks=false` / `--no-produce-blocks` both work). The
+  old "flag toggle" parsing rejected `--produce-blocks false`; this
+  release fixes the clap config.
+- New CLI flag `--follow-seconds N` (default 0 = disabled). When
+  > 0 AND `--bootnode` is set, a background tokio task drains new
+  blocks from the bootnode every N seconds and commits them locally.
+  Implicitly requires the local producer to be off (otherwise the
+  two would fight over `commit_block` invariants).
+- Follow tick logs as `INFO aiid: follow tick: applied new blocks
+  from bootnode head=N blocks_added=K`.
+
+#### Scope discipline
+
+Not in this release:
+
+- **No light-client proof verification.** The follow loop trusts the
+  bootnode's `aii_getRawBlock` response — same trust model as the
+  one-shot bootstrap from v0.0.44. Cryptographic verification (BFT
+  certificate + leader VRF proof against the local validator set)
+  is the next iteration.
+- **No mempool gossip for observer nodes.** A `--follow-seconds`
+  observer receives blocks but doesn't pull or push txs; clients
+  submitting `eth_sendRawTransaction` to an observer's RPC will be
+  accepted into the local mempool but never make it into a block
+  because the local producer is off. Observers are for *reading*
+  the chain — submit txs to a validator's RPC instead.
+
 ## [0.0.66] — 2026-05-26
 
 ### Added — One-click PC installer suite + git branch consolidation

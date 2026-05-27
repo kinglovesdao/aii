@@ -37,10 +37,24 @@ struct Cli {
     testnet: bool,
 
     /// Run the BFT dev-mode block producer (one node, no peers, no votes).
-    /// In v0.0.15 this is the only way to advance the head. Disable for
-    /// pure RPC-server-only operation.
-    #[arg(long, default_value = "true")]
+    /// In v0.0.15 this is the only way to advance the head. Disable with
+    /// `--no-produce-blocks` for pure RPC / observer operation.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
     produce_blocks: bool,
+
+    /// Run the node as a follow-only observer: every `follow_seconds`
+    /// it calls `aii_getRawBlock` on the bootnode and applies every
+    /// new block locally. Requires `--bootnode`. Implies
+    /// `--no-produce-blocks` so the local node never forks the chain.
+    /// `0` disables (default).
+    #[arg(long, default_value = "0")]
+    follow_seconds: u64,
 
     /// Block-production interval in seconds (when `--produce-blocks` is on).
     #[arg(long, default_value = "3")]
@@ -488,6 +502,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // Optional follow loop — applies new blocks from the bootnode on
+    // every tick. Skipped when no bootnode is configured or
+    // follow_seconds is 0. Implicitly requires `--no-produce-blocks`
+    // (otherwise the local DevMode/BFT producer would fork the chain
+    // off the bootnode's head).
+    let follow_handle = if cli.follow_seconds > 0 && cli.bootnode.is_some() {
+        let url = cli.bootnode.clone().unwrap();
+        let interval = Duration::from_secs(cli.follow_seconds);
+        let state = Arc::clone(&node_state);
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match aii_node::bootstrap_sync_from_peer(&state, &url).await {
+                    Ok(n) if n > 0 => tracing::info!(
+                        head = state.head_block_number_sync(),
+                        blocks_added = n,
+                        "follow tick: applied new blocks from bootnode",
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "follow tick: bootnode poll failed"),
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let (bound, handle) = aii_rpc::serve(cli.rpc, node_state).await?;
     tracing::info!(addr = %bound, "rpc server listening");
 
@@ -496,6 +537,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     handle.stop()?;
     handle.stopped().await;
     if let Some(h) = producer_handle {
+        h.abort();
+    }
+    if let Some(h) = follow_handle {
         h.abort();
     }
     Ok(())
