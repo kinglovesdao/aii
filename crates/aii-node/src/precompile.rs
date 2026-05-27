@@ -9,20 +9,21 @@
 //!
 //! ## Wire layout
 //!
-//! The first 4 bytes of `data` are a big-endian opcode:
+//! The first 4 bytes of `data` are a Solidity-style function
+//! selector `= keccak256(signature)[..4]`:
 //!
-//! | Opcode | Operation | Arguments |
-//! |--------|-----------|-----------|
-//! | `0x00000001` | `bond` | (value is the bonded amount; from `tx.value`) |
-//! | `0x00000002` | `begin_unbond` | (no args; tx.value must be 0) |
-//! | `0x00000003` | `withdraw` | (no args) |
-//! | `0x00000004` | `propose` | `voting_ends_at_be8 ‖ title_len_be4 ‖ title_utf8` |
-//! | `0x00000005` | `vote` | `proposal_id_be8 ‖ support_byte (0/1)` |
+//! | Selector | Signature | Arguments |
+//! |----------|-----------|-----------|
+//! | `0x64c9ec6f` | `bond()` | (value is the bonded amount; from `tx.value`) |
+//! | `0x3f172cef` | `beginUnbond()` | (no args; tx.value must be 0) |
+//! | `0x3ccfd60b` | `withdraw()` | (no args) |
+//! | `0x37038a1d` | `propose(uint64,string)` | `voting_ends_at_be8 ‖ title_len_be4 ‖ title_utf8` |
+//! | `0xc7f21560` | `vote(uint64,bool)` | `proposal_id_be8 ‖ support_byte (0/1)` |
 //!
-//! Unknown / malformed opcodes return `Err` and the tx receipt
-//! records `status = false`. Real Solidity ABI selectors (e.g.
-//! `keccak256("bond()")[..4]`) are a follow-up — using fixed-byte
-//! opcodes keeps this release small and selector-free.
+//! A unit test (`selectors_match_keccak_signatures`) asserts the
+//! constants stay aligned with the canonical Solidity signature
+//! hashes. Unknown selectors return `Err`; the tx receipt records
+//! `status = false`.
 
 use crate::staking::StakeTable;
 use crate::Governance;
@@ -35,16 +36,17 @@ pub const PRECOMPILE_ADDR: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99,
 ]);
 
-/// Per-operation 4-byte opcode prefix.
-pub const OP_BOND: [u8; 4] = [0, 0, 0, 1];
-/// Begin unbond opcode.
-pub const OP_BEGIN_UNBOND: [u8; 4] = [0, 0, 0, 2];
-/// Withdraw opcode.
-pub const OP_WITHDRAW: [u8; 4] = [0, 0, 0, 3];
-/// Propose opcode.
-pub const OP_PROPOSE: [u8; 4] = [0, 0, 0, 4];
-/// Vote opcode.
-pub const OP_VOTE: [u8; 4] = [0, 0, 0, 5];
+/// Solidity-style function selector: `keccak256("bond()")[..4]`
+/// (`0x64c9ec6f`).
+pub const OP_BOND: [u8; 4] = [0x64, 0xc9, 0xec, 0x6f];
+/// `keccak256("beginUnbond()")[..4]` (`0x3f172cef`).
+pub const OP_BEGIN_UNBOND: [u8; 4] = [0x3f, 0x17, 0x2c, 0xef];
+/// `keccak256("withdraw()")[..4]` (`0x3ccfd60b`).
+pub const OP_WITHDRAW: [u8; 4] = [0x3c, 0xcf, 0xd6, 0x0b];
+/// `keccak256("propose(uint64,string)")[..4]` (`0x37038a1d`).
+pub const OP_PROPOSE: [u8; 4] = [0x37, 0x03, 0x8a, 0x1d];
+/// `keccak256("vote(uint64,bool)")[..4]` (`0xc7f21560`).
+pub const OP_VOTE: [u8; 4] = [0xc7, 0xf2, 0x15, 0x60];
 
 /// Outcome of executing one precompile call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +277,22 @@ mod tests {
         data.push(1);
         let out = dispatch(&table, &gov, alice, U256::ZERO, &data, 5, 100).unwrap();
         assert_eq!(out, PrecompileOutcome::Voted { id, support: true });
+    }
+
+    #[test]
+    fn selectors_match_keccak_signatures() {
+        use aii_crypto::keccak::keccak256;
+        fn sel(sig: &str) -> [u8; 4] {
+            let h = keccak256(sig.as_bytes());
+            let mut out = [0u8; 4];
+            out.copy_from_slice(&h.as_bytes()[..4]);
+            out
+        }
+        assert_eq!(OP_BOND, sel("bond()"));
+        assert_eq!(OP_BEGIN_UNBOND, sel("beginUnbond()"));
+        assert_eq!(OP_WITHDRAW, sel("withdraw()"));
+        assert_eq!(OP_PROPOSE, sel("propose(uint64,string)"));
+        assert_eq!(OP_VOTE, sel("vote(uint64,bool)"));
     }
 
     #[test]

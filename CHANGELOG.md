@@ -5,6 +5,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.62] — 2026-05-26
+
+### Changed — Precompile opcodes are now Solidity-style selectors
+
+The v0.0.60 precompile used custom 4-byte opcodes (`0x00000001` …
+`0x00000005`). Wallets that already speak Solidity (MetaMask, ethers,
+etc.) construct calldata with `keccak256(signature)[..4]`. v0.0.62
+re-derives every selector from a canonical signature so an existing
+Solidity ABI works against the AII precompile without translation.
+
+#### `aii-node::precompile`
+
+- `OP_BOND = keccak256("bond()")[..4] = 0x64c9ec6f`.
+- `OP_BEGIN_UNBOND = keccak256("beginUnbond()")[..4] = 0x3f172cef`.
+- `OP_WITHDRAW = keccak256("withdraw()")[..4] = 0x3ccfd60b`.
+- `OP_PROPOSE = keccak256("propose(uint64,string)")[..4] = 0x37038a1d`.
+- `OP_VOTE = keccak256("vote(uint64,bool)")[..4] = 0xc7f21560`.
+- New unit test `selectors_match_keccak_signatures` recomputes each
+  selector from the signature string and asserts equality. The
+  constants stay enforceable as the canonical wire form.
+
+This is a **breaking wire-format change** for anyone who hand-crafted
+v0.0.60-style calldata. Argument layouts after the selector are
+unchanged (string lengths, BE u64s, support byte).
+
+#### Scope discipline
+
+Not in this release:
+
+- **Argument encoding is still custom, not Solidity ABI.** Selectors
+  are Solidity-compatible; the payload after them is AII-defined
+  (length-prefixed string, BE u64). Real ABI encoding (`abi.encode`
+  via `ethers`) needs a separate translation pass and is the next
+  iteration.
+
 ## [0.0.61] — 2026-05-26
 
 ### Added — Auto-triggered slashing on remote-vote equivocation
