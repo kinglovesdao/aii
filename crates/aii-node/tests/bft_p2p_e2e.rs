@@ -80,6 +80,7 @@ async fn two_validators_finalise_block_over_tcp() {
             gas_limit: 30_000_000,
             base_fee_per_gas: U256::from(1_000_000_000u64),
             slot_seconds: 3,
+            executor: None,
         };
         Arc::new(BftEngine::new(cfg, &g))
     };

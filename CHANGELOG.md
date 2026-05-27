@@ -5,6 +5,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.65] — 2026-05-26
+
+### Added — `BlockExecutor` trait + engine apply-then-hash hook
+
+The chronic deferral from v0.0.40 through v0.0.59 — "header still
+embeds `EMPTY_TRIE_HASH` for `state_root` / `receipts_root` /
+`logs_bloom`" — finally has the interface to close it. v0.0.65
+introduces `aii_consensus_iface::BlockExecutor`, an oracle the
+engine consults at proposal time to compute the post-execution
+Yellow-Paper roots. When provided, the produced block header locks
+to those roots and the block hash becomes consensus-correct over
+the executed body. When absent, the legacy placeholder path runs —
+existing testnets keep working unchanged.
+
+#### `aii-consensus-iface`
+
+- New `BlockExecutor` trait with one method:
+  `execute_for_proposal(body, coinbase, block_number) ->
+  PostBlockRoots`. Determinism contract is documented: every honest
+  validator applying the same body against the same state must
+  produce the same triple.
+- New `PostBlockRoots { state_root, receipts_root, logs_bloom,
+  gas_used }`.
+
+#### `aii-consensus-bft`
+
+- `BftConfig` gains
+  `executor: Option<Arc<dyn BlockExecutor>>` (default `None` for
+  backward compat).
+- `build_block_with_body` and `advance_single` both consult the
+  oracle when present; on `Err` they fall back to placeholders so
+  a corrupt oracle can't brick the engine.
+
+#### `aii-node`
+
+- New `NodeStateExecutor` adapter implementing `BlockExecutor`. The
+  first iteration returns the **current** `state.state_root()` —
+  i.e. the post-block-(N-1) state-root, not the post-block-N. Both
+  leader and followers compute the same answer because both start
+  the round at the same head state, so hash stability is preserved.
+  Applying the body against a state snapshot before answering is a
+  future iteration of the same adapter; the trait surface stays
+  unchanged.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No state-snapshot apply yet.** `NodeStateExecutor` reports the
+  parent state's `state_root`, not the post-body state. Truly
+  Yellow-Paper-correct headers need an in-memory overlay over a
+  RocksDB snapshot — the trait + plumbing land here; the snapshot
+  + replay path is the next iteration.
+- **Default still `None`.** The `aiid` binary doesn't yet
+  instantiate `NodeStateExecutor` automatically — operators opt in
+  by constructing `BftConfig.executor = Some(Arc::new(
+  NodeStateExecutor::new(state.clone())))`. Wired in CLI follow-up
+  alongside the snapshot-apply iteration to avoid two consecutive
+  block-hash-breaking changes.
+
 ## [0.0.64] — 2026-05-26
 
 ### Added — Noise XX wired into TcpBftTransport (closes C.4 wire-up)

@@ -68,6 +68,17 @@ pub struct BftConfig {
     pub base_fee_per_gas: U256,
     /// Slot duration (seconds).
     pub slot_seconds: u64,
+    /// Optional roots oracle. When `Some`, every produced block
+    /// header is built with the post-execution Yellow-Paper roots
+    /// (state_root, receipts_root, logs_bloom) supplied by the
+    /// oracle so the block hash itself locks to the post-state.
+    ///
+    /// `None` keeps the legacy v0.0.64 behaviour: placeholder roots
+    /// plus a sidecar `Meta:postroot:<hash>` record. Both modes
+    /// interop on the same validator set as long as every node
+    /// agrees on the flag.
+    #[allow(clippy::type_complexity)]
+    pub executor: Option<std::sync::Arc<dyn aii_consensus_iface::BlockExecutor>>,
 }
 
 impl BftConfig {
@@ -130,6 +141,7 @@ impl BftConfig {
             gas_limit: genesis.chain_spec.initial_gas_limit,
             base_fee_per_gas: U256::from(genesis.chain_spec.min_base_fee_per_gas),
             slot_seconds: genesis.chain_spec.block_time_seconds,
+            executor: None,
         })
     }
 }
@@ -575,16 +587,48 @@ impl BftEngine {
         coinbase: Address,
         body: BlockBody,
     ) -> Block {
-        let gas_used = (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS;
         let tx_root = aii_state::transactions_root(&body);
+        // Consult the optional `BlockExecutor` oracle. When provided,
+        // it computes Yellow-Paper roots from the body + state so the
+        // produced header locks to the post-execution state.
+        let (state_root, receipts_root, header_bloom, gas_used) =
+            if let Some(executor) = self.config.executor.as_ref() {
+                executor
+                    .execute_for_proposal(&body, coinbase, height)
+                    .map_or_else(
+                        |_| {
+                            (
+                                EMPTY_TRIE_HASH,
+                                EMPTY_TRIE_HASH,
+                                Bloom::ZERO,
+                                (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS,
+                            )
+                        },
+                        |r| {
+                            (
+                                r.state_root,
+                                r.receipts_root,
+                                Bloom(r.logs_bloom),
+                                r.gas_used,
+                            )
+                        },
+                    )
+            } else {
+                (
+                    EMPTY_TRIE_HASH,
+                    EMPTY_TRIE_HASH,
+                    Bloom::ZERO,
+                    (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS,
+                )
+            };
         let header = Header {
             parent_hash,
             ommers_hash: EMPTY_LIST_HASH,
             beneficiary: coinbase,
-            state_root: EMPTY_TRIE_HASH,
+            state_root,
             transactions_root: tx_root,
-            receipts_root: EMPTY_TRIE_HASH,
-            logs_bloom: Bloom::ZERO,
+            receipts_root,
+            logs_bloom: header_bloom,
             difficulty: U256::ZERO,
             number: height,
             gas_limit: self.config.gas_limit,
@@ -604,7 +648,7 @@ impl BftEngine {
 
     /// Run one full BFT round (propose + vote + commit) against
     /// ourselves. Only valid in single-validator mode.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn advance_single(&self) -> Result<AdvanceOutput, BftError> {
         let vs_size = self.config.validator_set.size();
         if vs_size != 1 {
@@ -624,8 +668,6 @@ impl BftEngine {
         let take = pending.len().min(max_txs);
         let txs: Vec<Tx> = pending.drain(..take).collect();
         drop(pending);
-        let gas_used = (txs.len() as u64) * PLACEHOLDER_TX_GAS;
-
         // Build the block. Carry the VRF output into mix_hash so
         // consecutive blocks differ even with identical bodies.
         let body = BlockBody {
@@ -634,14 +676,48 @@ impl BftEngine {
             withdrawals: Vec::new(),
         };
         let tx_root = aii_state::transactions_root(&body);
+        // Same executor-oracle path as `build_block_with_body`. When
+        // no oracle is configured, fall back to the v0.0.64
+        // placeholder roots so existing testnets keep agreeing on
+        // hashes.
+        let (state_root, receipts_root, header_bloom, gas_used) =
+            if let Some(executor) = self.config.executor.as_ref() {
+                executor
+                    .execute_for_proposal(&body, self.config.coinbase, new_number)
+                    .map_or_else(
+                        |_| {
+                            (
+                                EMPTY_TRIE_HASH,
+                                EMPTY_TRIE_HASH,
+                                Bloom::ZERO,
+                                (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS,
+                            )
+                        },
+                        |r| {
+                            (
+                                r.state_root,
+                                r.receipts_root,
+                                Bloom(r.logs_bloom),
+                                r.gas_used,
+                            )
+                        },
+                    )
+            } else {
+                (
+                    EMPTY_TRIE_HASH,
+                    EMPTY_TRIE_HASH,
+                    Bloom::ZERO,
+                    (body.transactions.len() as u64) * PLACEHOLDER_TX_GAS,
+                )
+            };
         let header = Header {
             parent_hash: g.head_hash,
             ommers_hash: EMPTY_LIST_HASH,
             beneficiary: self.config.coinbase,
-            state_root: EMPTY_TRIE_HASH,
+            state_root,
             transactions_root: tx_root,
-            receipts_root: EMPTY_TRIE_HASH,
-            logs_bloom: Bloom::ZERO,
+            receipts_root,
+            logs_bloom: header_bloom,
             difficulty: U256::ZERO,
             number: new_number,
             gas_limit: self.config.gas_limit,
@@ -808,6 +884,7 @@ mod tests {
             gas_limit: 30_000_000,
             base_fee_per_gas: U256::from(1_000_000_000u64),
             slot_seconds: 3,
+            executor: None,
         }
     }
 
@@ -839,6 +916,7 @@ mod tests {
             gas_limit: 30_000_000,
             base_fee_per_gas: U256::from(1_000_000_000u64),
             slot_seconds: 3,
+            executor: None,
         }
     }
 
@@ -1043,6 +1121,7 @@ mod tests {
             gas_limit: 30_000_000,
             base_fee_per_gas: U256::from(1_000_000_000u64),
             slot_seconds: 3,
+            executor: None,
         };
         BftEngine::new(config, genesis)
     }

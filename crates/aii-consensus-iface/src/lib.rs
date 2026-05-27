@@ -129,6 +129,50 @@ pub trait Validation: Send + Sync {
     fn validate_block(&self, block: &Block) -> Result<(), ConsensusError>;
 }
 
+/// Yellow-Paper roots an engine asks for before finalising a header.
+///
+/// The [`BlockExecutor`] oracle computes them so the produced header
+/// can lock to the post-execution state — the block hash itself
+/// becomes consensus-correct over the executed body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostBlockRoots {
+    /// World-state MPT root after applying every tx in the block.
+    pub state_root: aii_types::H256,
+    /// Receipts MPT root over the block's per-tx receipts.
+    pub receipts_root: aii_types::H256,
+    /// Aggregate 256-byte logs bloom from every receipt's logs.
+    pub logs_bloom: [u8; 256],
+    /// Sum of `gas_used` across every tx in the block.
+    pub gas_used: u64,
+}
+
+/// Oracle that, given a proposed body, computes the post-execution
+/// Yellow-Paper roots so the engine can build a header that locks to
+/// them.
+///
+/// Implementations must be deterministic: every honest validator
+/// applying the same body against the same state must produce the
+/// same `PostBlockRoots`. The canonical implementation lives in
+/// `aii-node::NodeState`; lightweight fallbacks (returning placeholder
+/// roots) are used in tests + during the transitional period before
+/// the engine fully adopts apply-then-hash.
+pub trait BlockExecutor: Send + Sync {
+    /// Compute the post-execution roots that should land in the
+    /// header.
+    ///
+    /// # Errors
+    /// Implementations may return [`ConsensusError`] if the body
+    /// fails to apply (e.g. a tx references a non-existent
+    /// precompile, or a state-snapshot operation fails). The engine
+    /// treats this as a fatal proposal-time error.
+    fn execute_for_proposal(
+        &self,
+        body: &aii_block::BlockBody,
+        coinbase: aii_types::Address,
+        block_number: u64,
+    ) -> Result<PostBlockRoots, ConsensusError>;
+}
+
 /// Errors returned by consensus engines.
 #[derive(Debug, Error)]
 pub enum ConsensusError {

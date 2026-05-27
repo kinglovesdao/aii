@@ -22,6 +22,54 @@ pub use precompile::{dispatch as precompile_dispatch, PrecompileOutcome, PRECOMP
 pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
 
+/// `BlockExecutor` adapter built on top of a live [`NodeState`].
+///
+/// Today's impl is the half-step "consult-current-state" mode.
+/// The engine asks for post-execution roots **before** consensus,
+/// but the oracle returns the current `state_root` (i.e. the
+/// post-block-(N-1) state, not the post-block-N state). Hash
+/// stability still wins — both leader and followers compute the
+/// same answer because every node starts the round at the same
+/// head state.
+///
+/// A future iteration applies the body against a state snapshot
+/// before answering, so the header truly locks to the post-block-N
+/// state. The trait surface stays unchanged.
+pub struct NodeStateExecutor {
+    state: Arc<NodeState>,
+}
+
+impl NodeStateExecutor {
+    /// Wrap a node-state handle.
+    #[must_use]
+    pub const fn new(state: Arc<NodeState>) -> Self {
+        Self { state }
+    }
+}
+
+impl aii_consensus_iface::BlockExecutor for NodeStateExecutor {
+    fn execute_for_proposal(
+        &self,
+        body: &BlockBody,
+        _coinbase: Address,
+        _block_number: u64,
+    ) -> Result<aii_consensus_iface::PostBlockRoots, aii_consensus_iface::ConsensusError> {
+        let state_root = self
+            .state
+            .state()
+            .state_root()
+            .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+        // Pre-execution receipts_root = empty (no receipts have been
+        // computed for this body yet). Same for the bloom.
+        Ok(aii_consensus_iface::PostBlockRoots {
+            state_root,
+            receipts_root: aii_block::EMPTY_TRIE_HASH,
+            logs_bloom: [0u8; 256],
+            gas_used: (body.transactions.len() as u64) * 21_000,
+        })
+    }
+}
+
 use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType, EMPTY_TRIE_HASH};
 use aii_config::ChainSpec;
