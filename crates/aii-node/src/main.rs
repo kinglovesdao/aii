@@ -298,8 +298,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(parse_address)
             .transpose()?
             .unwrap_or(Address::ZERO);
-        let (engine, genesis) =
-            bft_bootstrap::boot_bft_engine(genesis_path, keystore_path, coinbase)?;
+        // v0.0.70: if persistent storage already has blocks, resume
+        // the BFT engine at recovered_head + 1 rather than re-starting
+        // from genesis (which silently overwrote the existing chain
+        // in v0.0.67–v0.0.69).
+        let recovered_head_block = node_state.head_block();
+        let recovered_head_number = recovered_head_block.as_ref().map_or(0, |b| b.header.number);
+        let (engine, genesis) = if let Some(ref head_block) = recovered_head_block {
+            if head_block.header.number > 0 {
+                tracing::info!(
+                    resume_height = head_block.header.number + 1,
+                    "resuming BFT engine from recovered head"
+                );
+                bft_bootstrap::boot_bft_engine_with_recovered_head(
+                    genesis_path,
+                    keystore_path,
+                    coinbase,
+                    head_block,
+                )?
+            } else {
+                bft_bootstrap::boot_bft_engine(genesis_path, keystore_path, coinbase)?
+            }
+        } else {
+            bft_bootstrap::boot_bft_engine(genesis_path, keystore_path, coinbase)?
+        };
         apply_genesis_alloc(&node_state, &genesis)?;
         let engine = Arc::new(engine);
         let is_single = engine.is_single_validator();
@@ -307,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             single_validator = is_single,
             validators = genesis.validators.len(),
             coinbase = ?coinbase,
+            recovered_head = recovered_head_number,
             "BftEngine ready"
         );
         let state_for_loop = node_state.clone();

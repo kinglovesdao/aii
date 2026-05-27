@@ -5,6 +5,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.70] — 2026-05-26
+
+### Added — chain continuity across restart (BFT engine resumes from recovered head)
+
+Fixes the silent corruption in v0.0.67–v0.0.69 where any `aiid`
+restart caused the BFT engine to ignore the persisted chain and
+start producing block 1 again, overwriting whatever RocksDB had
+already stored. This was harmless when all validators sync-restarted
+together (the new chain replaces the old) but catastrophic if a
+single operator restarted to upgrade a binary — the chain reset and
+all other validators stalled trying to vote at a height the
+restarted node didn't recognise.
+
+The fix:
+
+- New `BftEngine::from_recovered(config, head_block)` constructor.
+  Resumes the engine at `head_block.header.number + 1` round 0 with
+  `seed` derived from `head_block.header.mix_hash` (the VRF output
+  the producer carries forward across heights since v0.0.34).
+- New `bft_bootstrap::boot_bft_engine_with_recovered_head` helper
+  on top of it.
+- New `NodeState::block_by_number` + `head_block` accessors so the
+  startup path can pull the full recovered block out of the
+  in-memory index that `recover()` rebuilds.
+- `aiid` startup now checks `node_state.head_block()`; if non-`None`
+  and `number > 0`, routes through `from_recovered` instead of
+  `boot_bft_engine` (which always restarts at genesis). Logs a
+  `resuming BFT engine from recovered head` line + a new
+  `recovered_head=N` field on the `BftEngine ready` line.
+
+#### Tests
+
+Two unit tests in `aii-consensus-bft`:
+
+- `from_recovered_resumes_at_head_plus_one` — produces block 1 from
+  a fresh engine, builds a *second* engine via `from_recovered` on
+  that block, and confirms the second engine's next-advance block
+  has `number=2` and `parent_hash` matching the recovered block's
+  hash.
+- `from_recovered_with_genesis_block_matches_new` — `from_recovered`
+  against a genesis-only chain is observationally identical to
+  `new`.
+
+#### Scope discipline
+
+Deferred to v0.0.71:
+
+- Persisting round / locked_value / step so a single-validator
+  restart doesn't freeze BFT consensus while it catches up to the
+  other validators' current round. This is the next user-visible
+  fix (single-node restart still triggers a global stall for ~30 s
+  in v0.0.70).
+
+Deferred to v0.0.72:
+
+- Signed binary auto-update protocol — Ed25519 release-signing key
+  + on-chain release announce + peer-fetch with sha256 verify +
+  atomic install + self-restart. Each piece is a unit risk;
+  better as its own dedicated release once BFT continuity is
+  proven stable on the testnet.
+
 ## [0.0.69] — 2026-05-26
 
 ### Added — persistent peer cache + BFT gossip relay
