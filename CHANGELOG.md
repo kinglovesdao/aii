@@ -5,6 +5,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.71] — 2026-05-27
+
+### Added — persistent BFT round state (single-validator restart no longer freezes consensus)
+
+Closes the second half of the chain-continuity story started in
+v0.0.70. Previously, when a single validator restarted (binary
+upgrade, OS reboot, crash recovery), the rest of the validator set
+sat at round R while the restarted node came up at round 0 — their
+votes never combined into a quorum and the chain froze until every
+validator restarted together. v0.0.71 persists the `(height, round)`
+of the active coordinator to disk on every change; on startup the
+restored node fast-forwards through `round` timeouts before
+listening for new votes, landing at the same round as the live set.
+
+#### `aii-consensus-bft`
+
+- New `BftEngine::fast_forward_to_round(target_round)`. Creates a
+  fresh coordinator at the next-to-commit height and calls
+  `RoundCoordinator::fire_timeout` `target_round` times. Idempotent
+  for `round == 0`. Errors with `BftError::WrongHeight` if a
+  coordinator for a different height is already active (defensive —
+  the typical startup-time call site cannot trigger it).
+- 2 new unit tests (`fast_forward_to_round_lands_at_target`,
+  `fast_forward_to_round_zero_creates_coordinator_at_round_zero`).
+
+#### `aii-node::bft_state`
+
+- New module persisting `BftStateSnapshot{height, round}` to
+  `<data-dir>/bft_state.json` (atomic temp + rename).
+- `load` returns `Ok(None)` for missing or malformed files — we
+  prefer round-0 startup over a crash on corrupted snapshot.
+- 4 unit tests covering load/save/round-trip/atomicity/garbage
+  tolerance.
+
+#### `aii-node` (`aiid` binary)
+
+- Startup path now reads `bft_state.json`. When the snapshot's
+  `height` matches `recovered_head + 1` and `round > 0`, calls
+  `engine.fast_forward_to_round(snap.round)` and logs
+  `restored BFT coordinator from persisted round state`.
+- Tick loop persists the current `(height, round)` every time the
+  tracked tuple changes. On each successful block commit, the
+  snapshot resets to `(N+1, 0)` so a crash before any round
+  timeout fires still recovers at the right height.
+
+#### Scope discipline
+
+Deferred to v0.0.72:
+
+- Persisting the `locked_value` / `polc` / vote tallies (BFT safety
+  state). Without this, a restarted validator could theoretically
+  vote for an incompatible block after losing its lock — fine on a
+  development testnet, must-fix before mainnet. Doing it cleanly
+  needs a serializer for the BLS/VRF certificate machinery, which
+  warrants its own release.
+- Signed binary auto-update protocol (was previously v0.0.72; still
+  the slot after lock-state persistence).
+
 ## [0.0.70] — 2026-05-26
 
 ### Added — chain continuity across restart (BFT engine resumes from recovered head)
