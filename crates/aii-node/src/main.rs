@@ -259,6 +259,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         NodeState::new(spec.clone(), Arc::clone(&backend))
     };
+    // v0.0.76: tell the state where to put release-binary cache files.
+    node_state.set_data_dir(cli.data_dir.clone());
 
     // Cold-join sync: catch up to the bootnode's head before opening
     // RPC. Skips when no bootnode is set or when the peer is at/below

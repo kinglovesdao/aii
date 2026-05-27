@@ -5,6 +5,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.76] — 2026-05-27
+
+### Added — release-binary store + `aii_getReleaseBinary` / `aii_importReleaseBinary` RPC
+
+Third slice of the auto-update protocol. v0.0.75 let peers gossip
+the *signed manifest*; v0.0.76 lets them gossip the *binary itself*.
+Verification stays first-class: a node will only serve a binary
+whose SHA-256 matches the manifest it has already verified.
+
+#### `aii-node::release_store`
+
+- New module owning `<data-dir>/releases/<version>` cache layout.
+- `store_verified_binary(dir, version, expected_sha256, bytes)`
+  recomputes SHA-256 of the bytes and only writes (atomically, via
+  `.tmp` + `rename(2)`) on a hash match. `HashMismatch` is
+  returned without ever creating the target file on mismatch.
+- `load_binary(dir, version)` returns `Ok(None)` on missing file.
+- 6 unit tests (round-trip, hash-mismatch-no-file-leak, malformed
+  hash, missing-returns-none, atomic-tmp-cleanup, accepts-`0x`
+  prefix).
+
+#### `aii-node::NodeState`
+
+- New `data_dir: RwLock<Option<PathBuf>>` field + public
+  `set_data_dir(PathBuf)` setter. `aiid` main calls it once at
+  startup so the release-store helpers can resolve paths without
+  changing the existing `NodeState::new` / `recover` signatures.
+- `RpcState::release_binary_bytes` reads from the store.
+- `RpcState::import_release_binary` cross-checks the announced
+  version against the locally-known latest manifest (refuses
+  unverified bytes), then delegates to `store_verified_binary`.
+
+#### `aii-rpc`
+
+- New `AiiRpc::get_release_binary(version) -> Option<String>` —
+  returns the binary as `0x`-prefixed hex, or `null`.
+- New `AiiRpc::import_release_binary(version, hex_bytes) -> ImportReleaseResult`
+  — accepts an externally-supplied binary, verifies its SHA-256
+  against the local manifest, and persists on success.
+- New `ImportReleaseResult { accepted, reason }` envelope.
+- New `RpcState::release_binary_bytes` and `import_release_binary`
+  trait methods (default no-ops; NodeState overrides).
+- 2 new RPC end-to-end tests:
+  - `aii_get_release_binary_missing_returns_null`
+  - `aii_import_release_binary_round_trip`
+
+785 tests pass, clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.77+:
+
+- Cross-node gossip relay of announcements — when a node accepts
+  `announce_release`, push the same manifest to its peers.
+- Auto-fetch — when a node knows the latest manifest but hasn't
+  got the binary, pull from a peer via `get_release_binary` +
+  `import_release_binary` chain.
+- Atomic install + self-restart — write the new binary over
+  `aiid-current`, signal systemd / re-exec, hand off to v0.0.78+.
+
 ## [0.0.75] — 2026-05-27
 
 ### Added — pinned release pubkey + `aii_announceRelease` / `aii_latestRelease` RPC
