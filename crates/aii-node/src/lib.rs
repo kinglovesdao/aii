@@ -12,6 +12,7 @@ pub mod bft_bootstrap;
 pub mod bft_p2p;
 pub mod dpos;
 pub mod governance;
+pub mod peer_cache;
 pub mod precompile;
 pub mod staking;
 pub mod sync;

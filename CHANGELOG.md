@@ -5,6 +5,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.69] — 2026-05-26
+
+### Added — persistent peer cache + BFT gossip relay
+
+Two changes that together make the BFT network self-healing in any
+topology — a validator that has talked to the network even once can
+restart and rejoin without operator intervention; and a validator
+whose direct link to another validator dies can keep voting as long
+as *any* third validator can bridge them. This is the core of the
+"无封锁可能 / 断网了恢复立即自动组网" requirement: the network is
+robust to any single link failure and to arbitrary restarts.
+
+#### `aii-node::peer_cache`
+
+- New module persisting the dialer's last-known-good peer set to
+  `<data-dir>/peers.json` (text format, one `SocketAddr` per line).
+- On startup, `aiid` merges `--peers` with the cache and dials the
+  union; the cache is rewritten atomically (`peers.json.tmp` +
+  `rename(2)`) so a crash mid-write can never strand a half-file.
+- 6 unit tests cover round-trip, missing-file tolerance, comment +
+  garbage tolerance, dedup/sort, atomicity, merge ordering.
+
+#### `aii-node::bft_p2p` — gossip relay
+
+- New `GossipDedup` hash ring (4096-slot FIFO of keccak256
+  payloads). Every locally-originated `broadcast()` pre-seeds the
+  ring so echoes bouncing back from relayers are dropped; every
+  inbound BFT payload is checked once, and only novel payloads are
+  pushed to `inbox` AND fanned out via `out_tx` for relay.
+- `run_peer` and `run_peer_noise` both apply the same dedup-then-
+  relay path. The change is wire-compatible: no protocol bumps, no
+  new message types — relay is invisible to peers running v0.0.68
+  but cooperating peers form a self-bridging mesh.
+- Two new tests:
+  - `gossip_relay_three_node_line_topology` — proves A↔B↔C with no
+    direct A-C link still delivers A's broadcast to C.
+  - `gossip_relay_suppresses_echo_to_originator` — proves A's own
+    `broadcast()` doesn't bounce back into A's inbox after relayer
+    forwarding.
+
+#### Scope discipline
+
+Deferred to v0.0.70:
+
+- Multi-endpoint bootnode list (each validator advertises
+  `host:port1, host:port2, host:443`; dial parallel, first success
+  wins). Needs a peer-announce protocol change.
+- Peer-reflected public-IP discovery (app-layer STUN). Pairs with
+  multi-endpoint announce.
+- QUIC + Noise transport. Pairs with the multi-endpoint work.
+
 ## [0.0.68] — 2026-05-26
 
 ### Added — NAT-friendly BFT (outbound-only mode + 30 s idle reconnect)
