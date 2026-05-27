@@ -5,6 +5,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.74] — 2026-05-27
+
+### Added — signed release-manifest primitives
+
+Foundation slice for the authenticated auto-update protocol the user
+asked for during the cross-pacific testnet bring-up: any node receiving
+a peer-distributed binary update must be able to verify the binary
+hasn't been tampered with AND that the release was authorised by the
+holder of the project's release-signing key.
+
+This release ships only the cryptographic primitives + CLI; wire-level
+gossip of releases, peer binary fetch, and atomic in-place install land
+in later versions on top of this foundation.
+
+#### `aii-crypto::ed25519`
+
+- New module wrapping `ed25519-dalek` 2.x. Exposes `SecretKey`,
+  `PublicKey`, `Signature` with hex round-trip, `SecretKey::generate`,
+  `sign(msg)`, `verify(msg, sig)`. Independent from the BLS validator
+  keys (`bls.rs`) and the VRF leader-election keys (`vrf.rs`) — release
+  signing is an operator-trust signal, not a chain consensus signal.
+- New error variants: `CryptoError::Hex`, `CryptoError::BadLength`,
+  `CryptoError::Ed25519` (+ `CryptoError::ed25519` constructor).
+- 6 unit tests covering sign/verify round-trip, tamper detection, wrong
+  public key, hex round-trip with and without `0x` prefix, bad-length
+  rejection.
+
+#### `aii-cli::release`
+
+- New `ReleaseManifest { version, sha256_hex, timestamp_unix,
+  ed25519_sig_hex }` serde struct.
+- New `canonical_payload(version, sha256, ts)` helper. The signed
+  bytes carry a `"aii-release-v1\0"` domain-separation tag so the
+  same Ed25519 key cannot be misused to forge a confounder signature
+  on unrelated payloads (validator votes, etc.).
+- `sign_release(secret, binary_path, version, timestamp)` — hashes
+  the binary, assembles the manifest, signs the canonical payload.
+- `verify_release(pubkey, manifest, binary_path)` — re-hashes the
+  binary, checks against the manifest's `sha256_hex`, verifies the
+  signature against the canonical payload, returns the verified
+  binary bytes on success.
+- 6 unit tests covering happy path, tampered binary (`HashMismatch`),
+  forged version, forged timestamp, wrong pubkey, JSON round-trip.
+
+#### `aii-cli` binary — `aii release {keygen, sign, verify}`
+
+- `aii release keygen` — generates a fresh Ed25519 keypair; secret
+  seed written to `--out` (or printed alongside the public key);
+  public key always printed (so it can be pinned in CI / docs).
+- `aii release sign --binary BIN --version VER --secret HEX --out
+  release.json` — produces the signed manifest. `--secret-file` lets
+  the seed live on disk instead of in argv. `--timestamp` defaults to
+  the current Unix time.
+- `aii release verify --manifest release.json --binary BIN --pubkey
+  HEX` — full chain of checks; exits 0 on success with `ok — VERSION
+  signed at TIMESTAMP`, otherwise reports `binary hash mismatch:
+  manifest says X, computed Y` or the signature failure path.
+
+774 tests pass; clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.75+:
+
+- Pinned public-key constant compiled into the node binary so a
+  remote verify needs no explicit `--pubkey` argument.
+- `aii_announceRelease` JSON-RPC method so a node can gossip a
+  manifest to its peers; receivers verify locally with the pinned
+  key.
+- `aii_getReleaseBinary` JSON-RPC method so a peer that's missing
+  the binary for a verified manifest can pull the bytes from a node
+  that already has them.
+- Atomic install + self-restart on a verified new release.
+
 ## [0.0.73] — 2026-05-27
 
 ### Fixed — gossip auto-harvests committed blocks between inbox messages
