@@ -184,6 +184,11 @@ pub struct NodeState {
     /// state release-store ops fail-soft (RPC returns
     /// `accepted: false`) rather than panicking.
     data_dir: RwLock<Option<std::path::PathBuf>>,
+    /// HTTP-RPC URLs of peer nodes used for cross-node release
+    /// propagation (v0.0.77). Populated from `aiid --update-peers`
+    /// at startup. Empty means "this node accepts announcements
+    /// but never re-broadcasts" — useful for leaf clients.
+    update_peers: RwLock<Vec<String>>,
 }
 
 /// Headers + bodies keyed by hash and number, plus an insertion-order
@@ -219,6 +224,7 @@ impl NodeState {
             tx_pool: TxPool::new(100_000),
             latest_release: RwLock::new(None),
             data_dir: RwLock::new(None),
+            update_peers: RwLock::new(Vec::new()),
         })
     }
 
@@ -320,6 +326,7 @@ impl NodeState {
             tx_pool: TxPool::new(100_000),
             latest_release: RwLock::new(None),
             data_dir: RwLock::new(None),
+            update_peers: RwLock::new(Vec::new()),
         }))
     }
 
@@ -1062,6 +1069,29 @@ impl NodeState {
         }
     }
 
+    /// Record the list of peer HTTP-RPC URLs used for v0.0.77
+    /// release-manifest propagation + binary auto-fetch.
+    ///
+    /// `aiid --update-peers HTTP1,HTTP2,…` calls this once at
+    /// startup. Passing an empty `Vec` disables outbound
+    /// propagation (the node still accepts announcements but
+    /// doesn't re-broadcast).
+    pub fn set_update_peers(&self, peers: Vec<String>) {
+        if let Ok(mut g) = self.update_peers.write() {
+            *g = peers;
+        }
+    }
+
+    /// Read the current update-peer list. Returns an empty vec on
+    /// a node that hasn't called [`Self::set_update_peers`].
+    #[must_use]
+    pub fn update_peers(&self) -> Vec<String> {
+        self.update_peers
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     /// Read the full [`Block`] at height `n`, reconstructed from the
     /// in-memory `by_number → hash → header / body` indices.
     ///
@@ -1745,6 +1775,10 @@ impl RpcState for NodeState {
 
     async fn latest_release(&self) -> Option<aii_crypto::release::ReleaseManifest> {
         self.latest_release.read().ok()?.clone()
+    }
+
+    async fn update_peers_for_release(&self) -> Vec<String> {
+        self.update_peers()
     }
 }
 

@@ -12,6 +12,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod release_gossip;
+
 use aii_types::{Address, U256};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
@@ -268,6 +270,14 @@ pub trait RpcState: Send + Sync + 'static {
             false,
             "node does not participate in release binary store".into(),
         )
+    }
+
+    /// Peer HTTP-RPC URLs the v0.0.77 release-propagation task
+    /// targets after accepting a new manifest. Default empty;
+    /// `aii-node::NodeState` overrides to return the operator-
+    /// supplied `--update-peers` list.
+    async fn update_peers_for_release(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -970,8 +980,27 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
         }
         // 3. Hand off to the host. Implementations decide whether
         // this is "newer" than what they have and persist it.
-        let stored = self.state.record_release_announcement(m).await;
+        let stored = self.state.record_release_announcement(m.clone()).await;
         if stored {
+            // v0.0.77: fire-and-forget propagation to peers. The
+            // host's `update_peers_for_release` returns the
+            // operator-configured `--update-peers` list. Each peer
+            // will re-verify the signature against its own pinned
+            // pubkey, so this hop carries no extra trust.
+            let peers = self.state.update_peers_for_release().await;
+            if !peers.is_empty() {
+                let state = self.state.clone();
+                let manifest = m;
+                tokio::spawn(async move {
+                    let outcome =
+                        crate::release_gossip::propagate_release(state, manifest, peers).await;
+                    tracing::info!(
+                        peers = outcome.peers.len(),
+                        any_imported = outcome.peers.iter().any(|p| p.binary_imported),
+                        "release propagation done"
+                    );
+                });
+            }
             Ok(AnnounceReleaseResult {
                 accepted: true,
                 reason: String::new(),
@@ -1259,6 +1288,8 @@ mod tests {
         latest: std::sync::Mutex<Option<aii_crypto::release::ReleaseManifest>>,
         /// version → bytes cache for the v0.0.76 import / get tests.
         binaries: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        /// Peer URLs exposed via `update_peers_for_release` (v0.0.77).
+        update_peers: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1297,6 +1328,9 @@ mod tests {
         async fn release_binary_bytes(&self, version: &str) -> Option<Vec<u8>> {
             self.binaries.lock().unwrap().get(version).cloned()
         }
+        async fn update_peers_for_release(&self) -> Vec<String> {
+            self.update_peers.lock().unwrap().clone()
+        }
         async fn import_release_binary(&self, version: &str, bytes: Vec<u8>) -> (bool, String) {
             // Verify bytes hash matches the manifest's claimed sha256.
             let snapshot = self.latest.lock().unwrap().clone();
@@ -1327,6 +1361,7 @@ mod tests {
             head: 0,
             latest: std::sync::Mutex::new(None),
             binaries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            update_peers: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1517,5 +1552,80 @@ mod tests {
         assert!(!r2.accepted, "same-timestamp re-announce must reject");
 
         h.stop().unwrap();
+    }
+
+    /// v0.0.77 — two-node integration: A's `update_peers` points
+    /// at B. After A accepts an announcement, A's announce handler
+    /// spawns a propagate task that calls B's `aii_announceRelease`
+    /// and (if B is missing the binary) B's `aii_importReleaseBinary`.
+    /// At the end of the test, B's `latest` and `binaries` slots are
+    /// both populated. Multi-thread runtime so the spawned propagate
+    /// task can drive its HTTP call while the test loop polls B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn release_gossip_two_node_propagate() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+
+        // Spin up node B with a blank state — A will gossip to it.
+        let state_b = release_fixture();
+        let (addr_b, handle_b) = serve("127.0.0.1:0".parse().unwrap(), state_b.clone())
+            .await
+            .unwrap();
+        let url_b = format!("http://{addr_b}");
+
+        // Node A — list B as its update peer.
+        let state_a = release_fixture();
+        *state_a.update_peers.lock().unwrap() = vec![url_b.clone()];
+        let (addr_a, handle_a) = serve("127.0.0.1:0".parse().unwrap(), state_a.clone())
+            .await
+            .unwrap();
+        let url_a = format!("http://{addr_a}");
+
+        // Sign a fresh release manifest using the pinned key.
+        let payload = b"v0.0.77 propagated release body";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(payload).unwrap();
+        let manifest = sign_release(&sk, tmp.path(), "0.0.77", 1_900_000_002).unwrap();
+        // Pre-load A's binary cache so the propagate task can serve
+        // it to B via getReleaseBinary.
+        state_a
+            .binaries
+            .lock()
+            .unwrap()
+            .insert("0.0.77".to_string(), payload.to_vec());
+
+        // Announce to A — this should trigger background propagation to B.
+        let client_a = HttpClientBuilder::default().build(&url_a).unwrap();
+        let view: ReleaseManifestView = manifest.into();
+        let r: AnnounceReleaseResult = client_a
+            .request("aii_announceRelease", rpc_params![view.clone()])
+            .await
+            .unwrap();
+        assert!(r.accepted, "A must accept the announcement");
+
+        // The propagate task runs in the background — give it up to
+        // 2 s to call B and import the binary.
+        let mut got = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let b_latest = state_b.latest.lock().unwrap().clone();
+            let b_bin = state_b.binaries.lock().unwrap().get("0.0.77").cloned();
+            if b_latest.is_some() && b_bin.as_deref() == Some(payload.as_ref()) {
+                got = true;
+                break;
+            }
+        }
+        assert!(
+            got,
+            "B should have received both the manifest and the binary from A"
+        );
+
+        handle_a.stop().unwrap();
+        handle_b.stop().unwrap();
     }
 }

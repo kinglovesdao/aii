@@ -131,6 +131,14 @@ struct Cli {
     /// of the validator set. Implies `--bft-listen 127.0.0.1:0`.
     #[arg(long, default_value = "false")]
     bft_outbound_only: bool,
+
+    /// Comma-separated HTTP-RPC URLs of peer nodes used for
+    /// v0.0.77 release-manifest gossip + binary auto-fetch.
+    /// Example: `--update-peers http://node-b:8545,http://node-c:8545`.
+    /// Empty disables outbound propagation (the node still accepts
+    /// announcements but never re-broadcasts).
+    #[arg(long, default_value = "", value_parser)]
+    update_peers: String,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -261,6 +269,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     // v0.0.76: tell the state where to put release-binary cache files.
     node_state.set_data_dir(cli.data_dir.clone());
+    // v0.0.77: populate the release-gossip peer list.
+    {
+        let peers = aii_rpc::release_gossip::parse_update_peers(&cli.update_peers);
+        if !peers.is_empty() {
+            tracing::info!(peers = ?peers, "release-gossip peers configured");
+        }
+        node_state.set_update_peers(peers);
+    }
 
     // Cold-join sync: catch up to the bootnode's head before opening
     // RPC. Skips when no bootnode is set or when the peer is at/below

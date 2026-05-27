@@ -5,6 +5,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.77] — 2026-05-27
+
+### Added — release auto-gossip + auto-fetch
+
+Fourth slice of the auto-update protocol — closes the
+"manifest+binary is on one node, how do the others get it?" loop.
+After a node accepts a new manifest via `aii_announceRelease`, it
+now spawns a background task that:
+
+1. **Re-broadcasts** the manifest to every `--update-peers` URL
+   via `aii_announceRelease`. Receivers re-verify the signature
+   against their own pinned pubkey, so the hop carries no extra
+   trust. Duplicate manifests are rejected at the receiver
+   (`record_release_announcement` requires strictly-newer
+   `(timestamp, version)`), so the flood terminates within one
+   hop per peer link.
+2. **Bidirectional binary transfer**:
+   - If the local node *has* the binary, it pushes it to peers
+     that don't (`aii_importReleaseBinary`).
+   - If the local node *doesn't* have the binary, it pulls from
+     the first peer that does (`aii_getReleaseBinary`).
+   Either direction re-verifies SHA-256 against the manifest
+   before persisting.
+
+#### `aii-rpc::release_gossip`
+
+- New module owning the propagation logic.
+- `propagate_release(state, manifest, peers) -> PropagateOutcome`
+  — fire-and-forget; never panics, returns a per-peer breakdown.
+- `parse_update_peers(s) -> Vec<String>` — comma-split, normalise
+  to `http://host:port`. 3 unit tests.
+
+#### `aii-rpc`
+
+- New `RpcState::update_peers_for_release` trait method (default
+  empty); `NodeState` overrides to return the operator-supplied
+  `--update-peers` list.
+- `AiiRpcImpl::announce_release` now spawns `propagate_release`
+  on the success path when the host has any update peers
+  configured.
+- 1 new 2-node integration test (`release_gossip_two_node_propagate`)
+  that boots two RPC servers, points node A's `update_peers` at
+  node B, announces a signed manifest to A, and asserts B ends
+  up with both the manifest and the binary.
+
+#### `aii-node` (`aiid` binary)
+
+- New CLI flag `--update-peers HTTP1,HTTP2,…` (default empty).
+- `NodeState::set_update_peers` / `update_peers` setters/getters.
+- Main initialises the peer list early in `main()`, right after
+  `set_data_dir`.
+
+789 tests pass, clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.78+:
+
+- Atomic install — copy `<data-dir>/releases/<version>` over the
+  in-flight `aiid` binary, swap symlink, re-exec.
+- Self-restart via `execve` so systemd doesn't need to be poked.
+- Periodic re-poll loop for nodes that came online late and
+  missed the original gossip wave.
+
 ## [0.0.76] — 2026-05-27
 
 ### Added — release-binary store + `aii_getReleaseBinary` / `aii_importReleaseBinary` RPC
