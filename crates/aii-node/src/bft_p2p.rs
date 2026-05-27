@@ -21,8 +21,26 @@ use aii_consensus_bft::BftTransport;
 use aii_net_p2p::{Message, AII_P2P_VERSION};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
+
+/// Idle read timeout for BFT peer connections.
+///
+/// If no inbound bytes arrive within this window the session is
+/// presumed dead (NAT proxy silently dropped it, ISP reset it, peer
+/// crashed, …) and the dialer reconnects. BFT-PoS at 3 s block time
+/// sends ≥1 message per slot, so 30 s without any traffic is
+/// unambiguous evidence the link is gone.
+///
+/// Added in v0.0.68 for NAT-friendly BFT; previously the read just
+/// blocked forever, which let stale connections silently swallow votes
+/// after Mihomo / NAT keepalive expiry.
+pub const BFT_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Loopback bind address used by [`TcpBftTransport::new_outbound_only`]
+/// and its Noise variant. Picks a kernel-assigned port so multiple
+/// outbound-only transports on one host don't collide.
+const OUTBOUND_ONLY_BIND: &str = "127.0.0.1:0";
 
 /// TCP-backed [`BftTransport`].
 ///
@@ -177,6 +195,37 @@ impl TcpBftTransport {
         })
     }
 
+    /// BTC-style outbound-only constructor (v0.0.68).
+    ///
+    /// Binds the listener to `127.0.0.1:0` so no public BFT port is
+    /// exposed; dial each entry in `peer_addrs` and conduct **all**
+    /// BFT traffic over the resulting outbound TCP sockets. Works for
+    /// validators behind home NAT or HTTP-only proxy chains (Mihomo /
+    /// Clash, Cloudflare WARP, corporate VPN) where the public port
+    /// 30311 is not reachable from the rest of the validator set.
+    ///
+    /// The transport is symmetric: once an outbound TCP is up the
+    /// remote validator can write votes/proposals back through the
+    /// same socket, so no relay is required for the two-validator and
+    /// three-validator cases. Larger validator sets still benefit
+    /// from relay (deferred to v0.0.69).
+    pub async fn new_outbound_only(peer_addrs: Vec<SocketAddr>) -> std::io::Result<Self> {
+        let bind_addr: SocketAddr = OUTBOUND_ONLY_BIND
+            .parse()
+            .expect("OUTBOUND_ONLY_BIND is a valid SocketAddr");
+        Self::new(bind_addr, peer_addrs).await
+    }
+
+    /// Like [`Self::new_outbound_only`] but every connection is Noise
+    /// XX encrypted. Use this for any validator that wants both NAT-
+    /// friendliness *and* on-the-wire confidentiality.
+    pub async fn new_outbound_only_encrypted(peer_addrs: Vec<SocketAddr>) -> std::io::Result<Self> {
+        let bind_addr: SocketAddr = OUTBOUND_ONLY_BIND
+            .parse()
+            .expect("OUTBOUND_ONLY_BIND is a valid SocketAddr");
+        Self::new_encrypted(bind_addr, peer_addrs).await
+    }
+
     /// Address the listener bound to (useful when port 0 was requested).
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
@@ -244,6 +293,7 @@ async fn run_peer_noise(
         }
     };
     let mut out_rx = out_tx.subscribe();
+    let mut last_recv = tokio::time::Instant::now();
     loop {
         // Non-blocking outbound poll: drain everything pending.
         loop {
@@ -261,12 +311,20 @@ async fn run_peer_noise(
         // Bounded inbound wait so we don't starve the outbound side.
         match tokio::time::timeout(Duration::from_millis(20), session.recv_msg(&mut stream)).await {
             Ok(Ok(payload)) => {
+                last_recv = tokio::time::Instant::now();
                 if let Ok(mut q) = inbox.lock() {
                     q.push_back(payload);
                 }
             }
             Ok(Err(_)) => return,
-            Err(_) => {} // timeout — loop and re-poll outbound
+            Err(_) => {
+                // Inner 20 ms poll timed out — loop and re-poll outbound.
+                // If nothing has arrived in BFT_PEER_IDLE_TIMEOUT total,
+                // the link is presumed dead (v0.0.68 NAT-friendly).
+                if last_recv.elapsed() >= BFT_PEER_IDLE_TIMEOUT {
+                    return;
+                }
+            }
         }
     }
 }
@@ -284,7 +342,8 @@ fn spawn_peer_tasks(
 }
 
 /// Owns one TCP connection's read + write halves. Returns when either
-/// side fails.
+/// side fails or no inbound bytes arrive within
+/// [`BFT_PEER_IDLE_TIMEOUT`] (v0.0.68: NAT-friendly idle detection).
 async fn run_peer(
     stream: TcpStream,
     out_tx: broadcast::Sender<Vec<u8>>,
@@ -292,6 +351,9 @@ async fn run_peer(
 ) {
     let (mut rx, mut tx) = stream.into_split();
     let mut out_rx = out_tx.subscribe();
+    let dead = Arc::new(Notify::new());
+    let dead_for_reader = dead.clone();
+    let dead_for_writer = dead.clone();
 
     // Hello exchange (best-effort; ignore failures).
     let hello = Message::Hello {
@@ -302,31 +364,37 @@ async fn run_peer(
 
     let reader = tokio::spawn(async move {
         loop {
-            match read_message(&mut rx).await {
-                Ok(Message::Bft(payload)) => {
+            match tokio::time::timeout(BFT_PEER_IDLE_TIMEOUT, read_message(&mut rx)).await {
+                Ok(Ok(Message::Bft(payload))) => {
                     if let Ok(mut q) = inbox.lock() {
                         q.push_back(payload);
                     }
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     // Ignore Hello/Ping/Pong/Disconnect at this layer.
                 }
-                Err(_) => break,
+                Ok(Err(_)) | Err(_) => break,
             }
         }
+        // Wake the writer so it exits its `recv().await` and the dialer
+        // can reconnect.
+        dead_for_reader.notify_waiters();
     });
 
     let writer = tokio::spawn(async move {
         loop {
-            match out_rx.recv().await {
-                Ok(bytes) => {
-                    let m = Message::Bft(bytes);
-                    if write_message(&mut tx, &m).await.is_err() {
-                        break;
+            tokio::select! {
+                () = dead_for_writer.notified() => break,
+                msg = out_rx.recv() => match msg {
+                    Ok(bytes) => {
+                        let m = Message::Bft(bytes);
+                        if write_message(&mut tx, &m).await.is_err() {
+                            break;
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(_) => break,
             }
         }
     });
@@ -419,5 +487,75 @@ mod tests {
             }
         }
         panic!("never received broadcast over Noise transport");
+    }
+
+    /// Outbound-only mode (v0.0.68) — B dials A using
+    /// `new_outbound_only`. B does not bind a public port; once the
+    /// outbound TCP is established, both directions of BFT traffic
+    /// flow over the same socket. A acts as the "listener-side"
+    /// validator (real testnet role); B as the NAT-bound validator.
+    ///
+    /// Asserts both directions: A→B and B→A.
+    #[tokio::test]
+    async fn outbound_only_round_trip_both_directions() {
+        let a = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let a_addr = a.local_addr();
+        let b = TcpBftTransport::new_outbound_only(vec![a_addr])
+            .await
+            .unwrap();
+        // B's listener should bind to loopback only.
+        assert_eq!(
+            b.local_addr().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "outbound-only transport must bind loopback"
+        );
+
+        let mut a_got = false;
+        let mut b_got = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !a_got {
+                b.broadcast(vec![0xb1, 0xb2, 0xb3]);
+                if a.try_recv().is_some() {
+                    a_got = true;
+                }
+            }
+            if !b_got {
+                a.broadcast(vec![0xa1, 0xa2, 0xa3]);
+                if b.try_recv().is_some() {
+                    b_got = true;
+                }
+            }
+            if a_got && b_got {
+                return;
+            }
+        }
+        panic!("outbound-only didn't round-trip both directions: a_got={a_got} b_got={b_got}");
+    }
+
+    /// Outbound-only over the Noise XX path — same shape, encrypted.
+    #[tokio::test]
+    async fn outbound_only_encrypted_round_trip() {
+        let a = TcpBftTransport::new_encrypted("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let a_addr = a.local_addr();
+        let b = TcpBftTransport::new_outbound_only_encrypted(vec![a_addr])
+            .await
+            .unwrap();
+        assert_eq!(
+            b.local_addr().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.broadcast(vec![0xc0, 0xff, 0xee]);
+            if a.try_recv().is_some() {
+                return;
+            }
+        }
+        panic!("outbound-only encrypted didn't deliver");
     }
 }
