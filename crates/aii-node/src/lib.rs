@@ -1032,6 +1032,31 @@ impl NodeState {
         self.head.load(Ordering::Relaxed)
     }
 
+    /// Read the full [`Block`] at height `n`, reconstructed from the
+    /// in-memory `by_number → hash → header / body` indices.
+    ///
+    /// Added in v0.0.70 so the startup path can pass the recovered
+    /// head block into [`aii_consensus_bft::BftEngine::from_recovered`]
+    /// — letting the BFT engine resume at `n+1` instead of starting
+    /// over from genesis.
+    #[must_use]
+    pub fn block_by_number(&self, n: u64) -> Option<Block> {
+        let guard = self.blocks.read().ok()?;
+        let hash = guard.by_number.get(&n).copied()?;
+        let header = guard.by_hash.get(&hash).cloned()?;
+        let body = guard.body_by_hash.get(&hash).cloned().unwrap_or_default();
+        Some(Block { header, body })
+    }
+
+    /// Convenience wrapper: full [`Block`] at the current head.
+    /// Returns `None` if the chain is empty or the head index is
+    /// inconsistent.
+    #[must_use]
+    pub fn head_block(&self) -> Option<Block> {
+        let n = self.head_block_number_sync();
+        self.block_by_number(n)
+    }
+
     /// Test-only: peek the in-memory `number → hash` map. Used by the
     /// cold-join sync test to verify byte-identical block
     /// reconstruction across producer/consumer pairs.

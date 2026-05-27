@@ -205,6 +205,49 @@ impl BftEngine {
         }
     }
 
+    /// Resume from a recovered chain head (v0.0.70).
+    ///
+    /// Use this when the node is restarting and has read the
+    /// last-committed block out of persistent storage. The engine
+    /// continues at `head.number + 1` round 0 rather than restarting
+    /// from genesis.
+    ///
+    /// The seed for the next leader election is derived from the
+    /// recovered block's `mix_hash` (which the producer set to the
+    /// proposing validator's VRF output, per the v0.0.34+ wire
+    /// format). For `head.number == 0` (genesis recovery), the seed
+    /// falls back to `config.initial_seed` — matching [`Self::new`].
+    ///
+    /// In-memory round / locked / vote state is NOT persisted yet —
+    /// after a single-validator restart the BFT engine still needs
+    /// ~⅔-stake worth of peers to be co-restarting before liveness
+    /// resumes. That fix is task v0.0.71-A. v0.0.70 only restores
+    /// chain CONTINUITY (head height) on restart, not BFT
+    /// in-flight state.
+    #[must_use]
+    pub fn from_recovered(config: BftConfig, head: &Block) -> Self {
+        let seed = if head.header.number == 0 {
+            config.initial_seed
+        } else {
+            *head.header.mix_hash.as_bytes()
+        };
+        let state = BftEngineState {
+            head_hash: head.hash(),
+            head_number: head.header.number,
+            head_timestamp: head.header.timestamp,
+            seed,
+            coordinator: None,
+            proposal: None,
+            detector: crate::slashing::EquivocationDetector::new(),
+            pending_evidence: Vec::new(),
+        };
+        Self {
+            config,
+            state: Arc::new(Mutex::new(state)),
+            pending_txs: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Stage transactions to include in the next produced block,
     /// **replacing** any previously-staged batch. Use this when you
     /// know the caller fully owns the staging window (typically in
@@ -1026,6 +1069,42 @@ mod tests {
         let h_trait = <BftEngine as Engine>::head(&engine);
         let (h_internal, _) = engine.head();
         assert_eq!(h_trait, h_internal);
+    }
+
+    /// v0.0.70 `from_recovered` resumes at the recovered block's
+    /// height + 1 rather than restarting from genesis.
+    #[test]
+    fn from_recovered_resumes_at_head_plus_one() {
+        // Produce block 1 from a fresh engine to get a "recovered" block.
+        let g = genesis();
+        let warm = BftEngine::new(single_validator_config(), &g);
+        let out = warm.advance_single().unwrap();
+        let recovered = out.block;
+        assert_eq!(recovered.header.number, 1);
+
+        // Construct a new engine via from_recovered using that block.
+        let cold = BftEngine::from_recovered(single_validator_config(), &recovered);
+        let (head_hash, head_number) = cold.head();
+        assert_eq!(head_number, 1);
+        assert_eq!(head_hash, recovered.hash());
+
+        // Next advance produces block 2 (not block 1 again).
+        let next = cold.advance_single().unwrap();
+        assert_eq!(next.block.header.number, 2);
+        assert_eq!(next.block.header.parent_hash, recovered.hash());
+    }
+
+    /// `from_recovered` against a genesis-only chain matches `new`.
+    #[test]
+    fn from_recovered_with_genesis_block_matches_new() {
+        let g = genesis();
+        let from_new = BftEngine::new(single_validator_config(), &g);
+        let from_recv = BftEngine::from_recovered(single_validator_config(), &g);
+        assert_eq!(from_new.head(), from_recv.head());
+        // And both can produce block 1.
+        let _ = from_new.advance_single().unwrap();
+        let out_recv = from_recv.advance_single().unwrap();
+        assert_eq!(out_recv.block.header.number, 1);
     }
 
     #[test]
