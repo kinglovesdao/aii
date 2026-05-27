@@ -15,6 +15,7 @@ pub mod dpos;
 pub mod governance;
 pub mod peer_cache;
 pub mod precompile;
+pub mod release_store;
 pub mod staking;
 pub mod sync;
 
@@ -176,6 +177,13 @@ pub struct NodeState {
     /// Latest signed release manifest accepted via the v0.0.75
     /// `aii_announceRelease` RPC. `None` on a fresh node.
     latest_release: RwLock<Option<aii_crypto::release::ReleaseManifest>>,
+    /// Directory the node was launched with. Used by v0.0.76
+    /// release-binary store helpers to resolve
+    /// `<data-dir>/releases/<version>`. `None` until the host
+    /// (`aiid` main) calls [`NodeState::set_data_dir`]; in that
+    /// state release-store ops fail-soft (RPC returns
+    /// `accepted: false`) rather than panicking.
+    data_dir: RwLock<Option<std::path::PathBuf>>,
 }
 
 /// Headers + bodies keyed by hash and number, plus an insertion-order
@@ -210,6 +218,7 @@ impl NodeState {
             blocks: RwLock::new(BlockStore::default()),
             tx_pool: TxPool::new(100_000),
             latest_release: RwLock::new(None),
+            data_dir: RwLock::new(None),
         })
     }
 
@@ -310,6 +319,7 @@ impl NodeState {
             }),
             tx_pool: TxPool::new(100_000),
             latest_release: RwLock::new(None),
+            data_dir: RwLock::new(None),
         }))
     }
 
@@ -1038,6 +1048,20 @@ impl NodeState {
         self.head.load(Ordering::Relaxed)
     }
 
+    /// Record the runtime data directory (v0.0.76).
+    ///
+    /// Called by `aiid` early in `main()` so the
+    /// release-binary-store helpers can resolve
+    /// `<data-dir>/releases/<version>` paths. Calling this on a
+    /// node that already has a data-dir set overwrites the
+    /// previous value (idempotent for the common "set once at
+    /// startup" call site).
+    pub fn set_data_dir(&self, dir: std::path::PathBuf) {
+        if let Ok(mut g) = self.data_dir.write() {
+            *g = Some(dir);
+        }
+    }
+
     /// Read the full [`Block`] at height `n`, reconstructed from the
     /// in-memory `by_number → hash → header / body` indices.
     ///
@@ -1640,6 +1664,55 @@ impl RpcState for NodeState {
             storage_root: format!("0x{}", hex::encode(acc.storage_root.as_bytes())),
             code_hash: format!("0x{}", hex::encode(acc.code_hash.as_bytes())),
         })
+    }
+
+    async fn release_binary_bytes(&self, version: &str) -> Option<Vec<u8>> {
+        let dir = self.data_dir.read().ok()?.clone()?;
+        crate::release_store::load_binary(&dir, version)
+            .ok()
+            .flatten()
+    }
+
+    async fn import_release_binary(&self, version: &str, bytes: Vec<u8>) -> (bool, String) {
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return (
+                false,
+                "node has no data_dir configured (set_data_dir not called)".into(),
+            );
+        };
+        // Cross-check against the locally-known latest manifest.
+        // We refuse to store a binary whose version doesn't match a
+        // manifest we've already verified — otherwise a peer could
+        // dump arbitrary bytes into our cache.
+        let manifest = self.latest_release.read().ok().and_then(|g| g.clone());
+        let Some(m) = manifest else {
+            return (
+                false,
+                "no verified manifest known for any version yet".into(),
+            );
+        };
+        if m.version != version {
+            return (
+                false,
+                format!(
+                    "version mismatch: latest known manifest is {} but import is for {}",
+                    m.version, version
+                ),
+            );
+        }
+        // Hand off to the store, which re-verifies sha256 before writing.
+        match crate::release_store::store_verified_binary(&dir, version, &m.sha256_hex, &bytes) {
+            Ok(path) => {
+                tracing::info!(
+                    version = version,
+                    path = %path.display(),
+                    bytes = bytes.len(),
+                    "imported release binary",
+                );
+                (true, String::new())
+            }
+            Err(e) => (false, format!("{e}")),
+        }
     }
 
     async fn record_release_announcement(

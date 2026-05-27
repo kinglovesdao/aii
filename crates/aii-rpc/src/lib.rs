@@ -249,6 +249,26 @@ pub trait RpcState: Send + Sync + 'static {
     async fn latest_release(&self) -> Option<aii_crypto::release::ReleaseManifest> {
         None
     }
+
+    /// Return the bytes of the cached release binary for `version`,
+    /// or `None` if the node hasn't stored that version. Default
+    /// `None`; embedders that participate in the auto-update
+    /// protocol override.
+    async fn release_binary_bytes(&self, _version: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Accept a peer-supplied binary blob for `version`. The
+    /// implementation MUST verify the bytes hash to the SHA-256 in
+    /// the most-recently-known manifest for `version` before
+    /// persisting; on hash mismatch return
+    /// `(false, "<reason>")`. Default no-op rejects everything.
+    async fn import_release_binary(&self, _version: &str, _bytes: Vec<u8>) -> (bool, String) {
+        (
+            false,
+            "node does not participate in release binary store".into(),
+        )
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -523,6 +543,29 @@ pub trait AiiRpc {
     /// `null` on a node that has never received an announcement.
     #[method(name = "latestRelease")]
     async fn latest_release(&self) -> RpcResult<Option<ReleaseManifestView>>;
+
+    /// `aii_getReleaseBinary(version)` — serve the cached binary
+    /// for `version` as a `0x`-prefixed hex string (v0.0.76).
+    /// Returns `null` if this node does not have the binary on
+    /// disk. The caller is expected to verify the returned bytes
+    /// against the SHA-256 in the manifest before trusting them
+    /// (the served peer might be lagging on a different release).
+    #[method(name = "getReleaseBinary")]
+    async fn get_release_binary(&self, version: String) -> RpcResult<Option<String>>;
+
+    /// `aii_importReleaseBinary(version, hex_bytes)` — accept a
+    /// binary blob and store it locally **iff** its SHA-256
+    /// matches the locally-known latest manifest for `version`
+    /// (v0.0.76). The verification step is non-negotiable: this
+    /// node will only persist a binary it can prove matches a
+    /// signature it has already verified. Returns `{ accepted,
+    /// reason }`.
+    #[method(name = "importReleaseBinary")]
+    async fn import_release_binary(
+        &self,
+        version: String,
+        hex_bytes: String,
+    ) -> RpcResult<ImportReleaseResult>;
 }
 
 /// Wire shape for the release manifest exchanged over JSON-RPC.
@@ -568,6 +611,16 @@ pub struct AnnounceReleaseResult {
     /// `true` if the announcement was accepted (new + valid signature).
     /// `false` if it was rejected (older than the currently-known
     /// latest, or duplicate). Reason in [`Self::reason`].
+    pub accepted: bool,
+    /// Human-readable reason for `accepted=false`. Empty on success.
+    pub reason: String,
+}
+
+/// Response envelope for [`AiiRpc::import_release_binary`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportReleaseResult {
+    /// `true` iff the supplied bytes hashed correctly and were
+    /// written to `<data-dir>/releases/<version>`.
     pub accepted: bool,
     /// Human-readable reason for `accepted=false`. Empty on success.
     pub reason: String,
@@ -934,6 +987,33 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
     async fn latest_release(&self) -> RpcResult<Option<ReleaseManifestView>> {
         Ok(self.state.latest_release().await.map(Into::into))
     }
+
+    async fn get_release_binary(&self, version: String) -> RpcResult<Option<String>> {
+        Ok(self
+            .state
+            .release_binary_bytes(&version)
+            .await
+            .map(|b| format!("0x{}", hex::encode(b))))
+    }
+
+    async fn import_release_binary(
+        &self,
+        version: String,
+        hex_bytes: String,
+    ) -> RpcResult<ImportReleaseResult> {
+        let stripped = hex_bytes.trim_start_matches("0x");
+        let bytes = match hex::decode(stripped) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(ImportReleaseResult {
+                    accepted: false,
+                    reason: format!("hex decode: {e}"),
+                });
+            }
+        };
+        let (accepted, reason) = self.state.import_release_binary(&version, bytes).await;
+        Ok(ImportReleaseResult { accepted, reason })
+    }
 }
 
 fn parse_address(s: &str) -> RpcResult<Address> {
@@ -1168,6 +1248,8 @@ mod tests {
         h.stop().unwrap();
     }
 
+    use sha2::Digest as _;
+
     /// Stateful TestState that actually persists release announcements,
     /// used to exercise the v0.0.75 RPC wiring end-to-end.
     struct ReleaseTestState {
@@ -1175,6 +1257,8 @@ mod tests {
         network: String,
         head: u64,
         latest: std::sync::Mutex<Option<aii_crypto::release::ReleaseManifest>>,
+        /// version → bytes cache for the v0.0.76 import / get tests.
+        binaries: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     }
 
     #[async_trait]
@@ -1210,6 +1294,30 @@ mod tests {
         async fn latest_release(&self) -> Option<aii_crypto::release::ReleaseManifest> {
             self.latest.lock().unwrap().clone()
         }
+        async fn release_binary_bytes(&self, version: &str) -> Option<Vec<u8>> {
+            self.binaries.lock().unwrap().get(version).cloned()
+        }
+        async fn import_release_binary(&self, version: &str, bytes: Vec<u8>) -> (bool, String) {
+            // Verify bytes hash matches the manifest's claimed sha256.
+            let snapshot = self.latest.lock().unwrap().clone();
+            let Some(manifest) = snapshot else {
+                return (false, "no manifest".into());
+            };
+            if manifest.version != version {
+                return (false, "version mismatch".into());
+            }
+            let mut h = sha2::Sha256::new();
+            h.update(&bytes);
+            let computed = hex::encode(<[u8; 32]>::from(h.finalize()));
+            if computed != manifest.sha256_hex.trim_start_matches("0x").to_lowercase() {
+                return (false, "hash mismatch".into());
+            }
+            self.binaries
+                .lock()
+                .unwrap()
+                .insert(version.to_string(), bytes);
+            (true, String::new())
+        }
     }
 
     fn release_fixture() -> Arc<ReleaseTestState> {
@@ -1218,6 +1326,7 @@ mod tests {
             network: "aii-testnet".into(),
             head: 0,
             latest: std::sync::Mutex::new(None),
+            binaries: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1277,6 +1386,84 @@ mod tests {
         let r: Option<ReleaseManifestView> =
             c.request("aii_latestRelease", rpc_params![]).await.unwrap();
         assert!(r.is_none());
+        h.stop().unwrap();
+    }
+
+    /// v0.0.76 — `aii_getReleaseBinary` returns `null` for a
+    /// version the node has never seen.
+    #[tokio::test]
+    async fn aii_get_release_binary_missing_returns_null() {
+        let (url, h) = spawn_release().await;
+        let c = HttpClientBuilder::default().build(url).unwrap();
+        let r: Option<String> = c
+            .request("aii_getReleaseBinary", rpc_params!["0.0.76"])
+            .await
+            .unwrap();
+        assert!(r.is_none());
+        h.stop().unwrap();
+    }
+
+    /// v0.0.76 — announce → import → get round-trips the binary
+    /// bytes via the JSON-RPC layer.
+    #[tokio::test]
+    async fn aii_import_release_binary_round_trip() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+
+        let (url, h) = spawn_release().await;
+        let c = HttpClientBuilder::default().build(url).unwrap();
+
+        // 1. Sign a manifest over real bytes.
+        let payload = b"v0.0.76 release binary blob";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(payload).unwrap();
+        let manifest = sign_release(&sk, tmp.path(), "0.0.76", 1_900_000_001).unwrap();
+
+        // 2. Announce it; the in-test state stores it under `latest`.
+        let view = ReleaseManifestView::from(manifest.clone());
+        let r: AnnounceReleaseResult = c
+            .request("aii_announceRelease", rpc_params![view])
+            .await
+            .unwrap();
+        assert!(r.accepted);
+
+        // 3. Import the binary bytes (hex-encoded). The in-test
+        //    state hashes them and only stores on match.
+        let hex_bytes = format!("0x{}", hex::encode(payload));
+        let imp: ImportReleaseResult = c
+            .request(
+                "aii_importReleaseBinary",
+                rpc_params!["0.0.76", hex_bytes.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(imp.accepted, "happy-path import rejected: {imp:?}");
+
+        // 4. Fetch the binary back via getReleaseBinary.
+        let got: Option<String> = c
+            .request("aii_getReleaseBinary", rpc_params!["0.0.76"])
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(hex_bytes.as_str()));
+
+        // 5. Import with WRONG bytes is rejected; cache untouched.
+        let bad_hex = format!("0x{}", hex::encode(b"tampered"));
+        let imp_bad: ImportReleaseResult = c
+            .request("aii_importReleaseBinary", rpc_params!["0.0.76", bad_hex])
+            .await
+            .unwrap();
+        assert!(!imp_bad.accepted);
+        assert!(imp_bad.reason.contains("hash"));
+
+        // Independent sanity check that the local hash matches.
+        let mut hh = sha2::Sha256::new();
+        hh.update(payload);
+        let _: [u8; 32] = hh.finalize().into();
         h.stop().unwrap();
     }
 

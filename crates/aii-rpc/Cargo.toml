@@ -31,4 +31,5 @@ async-trait = "0.1"
 [dev-dependencies]
 tempfile = "3"
 rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "test-util", "net", "time"] }
