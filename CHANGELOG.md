@@ -5,6 +5,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.57] — 2026-05-26
+
+### Added — End-to-end staking → election → governance integration test
+
+The v0.0.48 → v0.0.50 release window introduced three independent
+primitives (stake table, DPoS election, governance proposals/votes)
+each with isolated unit tests. v0.0.57 closes the loop with one
+integration test that exercises all three composing across the same
+`NodeState`: two stakers bond, four blocks commit and trigger an
+epoch election at block 4, the elected set is observable, the
+biggest staker proposes a parameter change, both stakers vote yes,
+and after the voting window closes the tally records `Passed`. No
+new production code — just proof the existing pieces fit together.
+
+#### `aii-node`
+
+- New `end_to_end_stake_elect_govern_tally` test in
+  `aii_node::tests` walks every step:
+  1. `stake_table.bond(big, 800)` + `stake_table.bond(small, 200)`.
+  2. Four `commit_block` calls; `epoch_length_blocks = 4` so block 4
+     fires the election.
+  3. `latest_validator_set` returns `(epoch=1, [big, small])`.
+  4. `governance.propose(big, "raise block reward", voting_ends=10)`
+     → id=1.
+  5. `governance.cast_vote` from both addresses at block 5.
+  6. `governance.tally` at block 15 returns `Passed`; `tally_of`
+     returns `yes=1000, no=0`.
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **No on-chain submit path.** All three primitives are still
+  library-call-only — the integration test invokes them as Rust
+  methods, not as EIP-1559 transactions. The precompile-style call
+  surface lands together with the engine apply-then-hash refactor.
+- **No engine execution of `Passed` proposals.** Status transitions
+  to `Passed` but the chain doesn't yet apply the parameter change —
+  that requires the engine to read post-tally state at block-build
+  time.
+
 ## [0.0.56] — 2026-05-26
 
 ### Added — Kademlia routing-table primitive (C.3 partial)

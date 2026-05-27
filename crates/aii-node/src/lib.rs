@@ -1568,6 +1568,65 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_stake_elect_govern_tally() {
+        // Builds the full economic + governance loop on a tiny epoch:
+        //   1. two stakers bond,
+        //   2. commit blocks until an epoch boundary fires the election,
+        //   3. the elected set is observable via `latest_validator_set`,
+        //   4. one staker proposes a governance change,
+        //   5. both stakers vote (yes for the majority staker),
+        //   6. tally after the voting window passes the proposal because
+        //      yes > 2/3 of total bonded stake.
+        let mut spec = ChainSpec::mainnet();
+        spec.epoch_length_blocks = 4;
+        spec.min_validator_stake_wei = 1;
+        spec.validators_per_epoch = 5;
+        let backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let state = NodeState::new(spec, backend);
+
+        let big = Address::new([0xb1; 20]);
+        let small = Address::new([0xb2; 20]);
+        state.stake_table().bond(&big, U256::from(800u64)).unwrap();
+        state
+            .stake_table()
+            .bond(&small, U256::from(200u64))
+            .unwrap();
+
+        let mut parent = H256::ZERO;
+        for n in 1..=4 {
+            let b = fake_block(n, parent);
+            parent = b.hash();
+            state.commit_block(&b);
+            state.set_head(n);
+        }
+
+        let (epoch, elected) = state
+            .async_active_validator_set_test_helper()
+            .expect("epoch boundary must record election");
+        assert_eq!(epoch, 1);
+        assert_eq!(elected.len(), 2);
+        assert_eq!(elected[0].address, big, "biggest staker leads");
+
+        let gov = state.governance();
+        let proposal_id = gov.propose(big, "raise block reward".into(), 10).unwrap();
+        assert_eq!(proposal_id, 1);
+
+        let table = state.stake_table();
+        gov.cast_vote(&table, proposal_id, big, true, 5).unwrap();
+        gov.cast_vote(&table, proposal_id, small, true, 5).unwrap();
+
+        let status = gov.tally(&table, proposal_id, 15).unwrap();
+        assert_eq!(
+            status,
+            ProposalStatus::Passed,
+            "1000/1000 yes > 2/3 of 1000 bonded → Passed",
+        );
+        let (yes, no) = gov.tally_of(proposal_id).unwrap().unwrap();
+        assert_eq!(yes, U256::from(1_000u64));
+        assert_eq!(no, U256::ZERO);
+    }
+
+    #[test]
     fn fork_at_same_height_records_evidence() {
         let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let mut canonical = fake_block(1, H256::ZERO);
