@@ -125,20 +125,33 @@ impl<T: BftTransport> BftGossip<T> {
     pub fn tick(&self) -> usize {
         let mut activity = 0;
         // 1. Drain inbox.
+        let mut inbox_drained = 0;
         while let Some(bytes) = self.transport.try_recv() {
+            inbox_drained += 1;
             if let Ok(msg) = BftMessage::decode(&bytes) {
                 let _ = self.dispatch_inbound(msg);
                 activity += 1;
             }
         }
+        if inbox_drained > 0 {
+            tracing::debug!(count = inbox_drained, "gossip.tick: drained inbox");
+        }
 
         // 2. Drive the round forward.
-        if let Some((h, r, phase)) = self.engine.current_round_state() {
+        let round_state = self.engine.current_round_state();
+        let would_lead = self.engine.would_be_leader_next_height();
+        tracing::debug!(
+            round_state = ?round_state,
+            would_lead_next_height = would_lead,
+            "gossip.tick: state"
+        );
+        if let Some((h, r, phase)) = round_state {
             activity += self.drive_phase(h, r, phase);
-        } else if self.engine.would_be_leader_next_height() {
+        } else if would_lead {
             // Bootstrap: no coordinator yet, but it's our turn to lead.
             // cast_proposal lazily creates a coordinator at
             // (head_number+1, round 0) and proposes against it.
+            tracing::debug!("gossip.tick: bootstrap_propose (I'd lead next height)");
             activity += self.bootstrap_propose();
         }
 
@@ -149,7 +162,12 @@ impl<T: BftTransport> BftGossip<T> {
     /// round yet. `cast_proposal` will instantiate a `RoundCoordinator`
     /// and emit a `Proposal` for `(head+1, 0)`.
     fn bootstrap_propose(&self) -> usize {
-        let Ok((block, proof)) = self.engine.cast_proposal() else {
+        let result = self.engine.cast_proposal();
+        let Ok((block, proof)) = result else {
+            tracing::warn!(
+                err = ?result.err(),
+                "bootstrap_propose: cast_proposal failed"
+            );
             return 0;
         };
         let (h, r, _) = self
@@ -166,6 +184,13 @@ impl<T: BftTransport> BftGossip<T> {
             body_bytes,
         };
         let bytes = msg.encode();
+        tracing::info!(
+            height = h,
+            round = r,
+            block_hash = ?block.hash(),
+            wire_bytes = bytes.len(),
+            "bootstrap_propose: broadcasting Proposal"
+        );
         {
             let mut f = self.flags.lock();
             f.proposed = Some((h, r));
@@ -206,13 +231,17 @@ impl<T: BftTransport> BftGossip<T> {
             return 0;
         }
         let Some(leader_idx) = self.engine.current_leader_index() else {
+            tracing::debug!(h, r, "maybe_propose: no leader_index");
             return 0;
         };
         let my_idx = self.engine.my_index();
+        tracing::debug!(h, r, leader_idx, my_idx, "maybe_propose: leader check");
         if leader_idx != my_idx {
             return 0;
         }
-        let Ok((block, proof)) = self.engine.cast_proposal() else {
+        let cp = self.engine.cast_proposal();
+        let Ok((block, proof)) = cp else {
+            tracing::warn!(h, r, err = ?cp.err(), "maybe_propose: cast_proposal failed");
             return 0;
         };
         let body_bytes = encode_block_body(&block.body);
@@ -238,9 +267,12 @@ impl<T: BftTransport> BftGossip<T> {
         if self.flags.lock().already_prevoted(h, r) {
             return 0;
         }
-        let Ok(vote) = self.engine.cast_prevote() else {
+        let cv = self.engine.cast_prevote();
+        let Ok(vote) = cv else {
+            tracing::warn!(h, r, err = ?cv.err(), "maybe_prevote: cast_prevote failed");
             return 0;
         };
+        tracing::info!(h, r, "maybe_prevote: broadcasting Prevote");
         let bytes = BftMessage::Prevote(vote).encode();
         {
             let mut f = self.flags.lock();
@@ -253,12 +285,21 @@ impl<T: BftTransport> BftGossip<T> {
 
     fn maybe_precommit(&self, h: u64, r: u32) -> usize {
         if self.flags.lock().already_precommitted(h, r) {
+            tracing::debug!(h, r, "maybe_precommit: already precommitted");
             return 0;
         }
-        let Ok(vote) = self.engine.cast_precommit() else {
+        let cp = self.engine.cast_precommit();
+        let Ok(vote) = cp else {
+            tracing::warn!(h, r, err = ?cp.err(), "maybe_precommit: cast_precommit failed");
             return 0;
         };
         let bytes = BftMessage::Precommit(vote).encode();
+        tracing::info!(
+            h,
+            r,
+            wire_bytes = bytes.len(),
+            "maybe_precommit: broadcasting Precommit"
+        );
         {
             let mut f = self.flags.lock();
             f.precommitted = Some((h, r));
@@ -307,16 +348,43 @@ impl<T: BftTransport> BftGossip<T> {
                 leader_proof,
                 coinbase,
                 body_bytes,
-            } => self.handle_proposal_msg(
-                height,
-                round,
-                block_hash,
-                leader_proof,
-                coinbase,
-                &body_bytes,
-            ),
-            BftMessage::Prevote(v) => self.engine.submit_remote_prevote(v),
-            BftMessage::Precommit(v) => self.engine.submit_remote_precommit(v),
+            } => {
+                tracing::info!(
+                    height,
+                    round,
+                    block_hash = ?block_hash,
+                    body_len = body_bytes.len(),
+                    "dispatch_inbound: Proposal"
+                );
+                let r = self.handle_proposal_msg(
+                    height,
+                    round,
+                    block_hash,
+                    leader_proof,
+                    coinbase,
+                    &body_bytes,
+                );
+                if let Err(ref e) = r {
+                    tracing::warn!(?e, "handle_proposal_msg returned err");
+                }
+                r
+            }
+            BftMessage::Prevote(v) => {
+                tracing::debug!(?v, "dispatch_inbound: Prevote");
+                let r = self.engine.submit_remote_prevote(v);
+                if let Err(ref e) = r {
+                    tracing::warn!(?e, "submit_remote_prevote returned err");
+                }
+                r
+            }
+            BftMessage::Precommit(v) => {
+                tracing::debug!(?v, "dispatch_inbound: Precommit");
+                let r = self.engine.submit_remote_precommit(v);
+                if let Err(ref e) = r {
+                    tracing::warn!(?e, "submit_remote_precommit returned err");
+                }
+                r
+            }
         }
     }
 

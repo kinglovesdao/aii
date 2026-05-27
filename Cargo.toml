@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.71"
+version = "0.0.72"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -50,33 +50,33 @@ proptest = "1"
 quickcheck = "1"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-aii-types = { path = "crates/aii-types", version = "0.0.71" }
-aii-codec = { path = "crates/aii-codec", version = "0.0.71" }
-aii-crypto = { path = "crates/aii-crypto", version = "0.0.71" }
-aii-storage = { path = "crates/aii-storage", version = "0.0.71" }
-aii-block = { path = "crates/aii-block", version = "0.0.71" }
-aii-state = { path = "crates/aii-state", version = "0.0.71" }
-aii-config = { path = "crates/aii-config", version = "0.0.71" }
-aii-consensus-iface = { path = "crates/aii-consensus-iface", version = "0.0.71" }
-aii-metrics = { path = "crates/aii-metrics", version = "0.0.71" }
-aii-wallet = { path = "crates/aii-wallet", version = "0.0.71" }
-aii-vnode = { path = "crates/aii-vnode", version = "0.0.71" }
-aii-net-txpool = { path = "crates/aii-net-txpool", version = "0.0.71" }
-aii-microchain = { path = "crates/aii-microchain", version = "0.0.71" }
-aii-rpc = { path = "crates/aii-rpc", version = "0.0.71" }
-aii-node = { path = "crates/aii-node", version = "0.0.71" }
-aii-evm = { path = "crates/aii-evm", version = "0.0.71" }
-aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.71" }
-aii-net-sync = { path = "crates/aii-net-sync", version = "0.0.71" }
-aii-onboarding = { path = "crates/aii-onboarding", version = "0.0.71" }
-aii-cli = { path = "crates/aii-cli", version = "0.0.71" }
-aii-mcp = { path = "crates/aii-mcp", version = "0.0.71" }
-aii-consensus-bft = { path = "crates/aii-consensus-bft", version = "0.0.71" }
-aii-consensus-poa = { path = "crates/aii-consensus-poa", version = "0.0.71" }
-aii-crosschain = { path = "crates/aii-crosschain", version = "0.0.71" }
-aii-wasm = { path = "crates/aii-wasm", version = "0.0.71" }
-aii-wasm-state = { path = "crates/aii-wasm-state", version = "0.0.71" }
-aii-erc20 = { path = "crates/aii-erc20", version = "0.0.71" }
+aii-types = { path = "crates/aii-types", version = "0.0.72" }
+aii-codec = { path = "crates/aii-codec", version = "0.0.72" }
+aii-crypto = { path = "crates/aii-crypto", version = "0.0.72" }
+aii-storage = { path = "crates/aii-storage", version = "0.0.72" }
+aii-block = { path = "crates/aii-block", version = "0.0.72" }
+aii-state = { path = "crates/aii-state", version = "0.0.72" }
+aii-config = { path = "crates/aii-config", version = "0.0.72" }
+aii-consensus-iface = { path = "crates/aii-consensus-iface", version = "0.0.72" }
+aii-metrics = { path = "crates/aii-metrics", version = "0.0.72" }
+aii-wallet = { path = "crates/aii-wallet", version = "0.0.72" }
+aii-vnode = { path = "crates/aii-vnode", version = "0.0.72" }
+aii-net-txpool = { path = "crates/aii-net-txpool", version = "0.0.72" }
+aii-microchain = { path = "crates/aii-microchain", version = "0.0.72" }
+aii-rpc = { path = "crates/aii-rpc", version = "0.0.72" }
+aii-node = { path = "crates/aii-node", version = "0.0.72" }
+aii-evm = { path = "crates/aii-evm", version = "0.0.72" }
+aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.72" }
+aii-net-sync = { path = "crates/aii-net-sync", version = "0.0.72" }
+aii-onboarding = { path = "crates/aii-onboarding", version = "0.0.72" }
+aii-cli = { path = "crates/aii-cli", version = "0.0.72" }
+aii-mcp = { path = "crates/aii-mcp", version = "0.0.72" }
+aii-consensus-bft = { path = "crates/aii-consensus-bft", version = "0.0.72" }
+aii-consensus-poa = { path = "crates/aii-consensus-poa", version = "0.0.72" }
+aii-crosschain = { path = "crates/aii-crosschain", version = "0.0.72" }
+aii-wasm = { path = "crates/aii-wasm", version = "0.0.72" }
+aii-wasm-state = { path = "crates/aii-wasm-state", version = "0.0.72" }
+aii-erc20 = { path = "crates/aii-erc20", version = "0.0.72" }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [workspace.lints.rust]

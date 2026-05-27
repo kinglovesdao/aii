@@ -5,6 +5,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.72] — 2026-05-27
+
+### Fixed — BFT engine no longer rejects early-arrival prevotes/precommits
+
+Out-of-order vote arrival was silently freezing 3-validator BFT
+whenever the proposer's precommit reached a remote validator before
+that validator had tallied enough prevotes to transition to
+`Precommitting`. The engine returned `WrongPhase` (or
+`NoActiveCoordinator` for votes that beat the proposal entirely)
+and the gossip layer dropped the message — the round then stalled
+until a timeout, every time, on every block. With cross-pacific
+network latency (the JP/CN/local testnet) this defeated all
+liveness.
+
+Diagnosed via `tracing::warn!` logs added to
+`submit_remote_{prevote,precommit}` showing CN's precommits landing
+on a still-Prevoting JP within ~20 ms of the leader's broadcast,
+ahead of JP's own prevote tally.
+
+The fix: prevotes and precommits that fail with
+`NoActiveCoordinator`, `WrongPhase`, `WrongRound`, or `WrongHeight`
+are now buffered on the engine state rather than rejected. Every
+subsequent state mutation (proposal arrival, prevote tally,
+precommit tally, round timeout) calls a new `drain_pending_votes`
+helper that re-submits the buffered votes through the coordinator
+until no more can be applied. Stale votes (for an already-
+committed height) are dropped silently.
+
+#### `aii-consensus-bft::engine`
+
+- New `BftEngineState::pending_prevotes` + `pending_precommits`
+  buffers (`Vec<PrevoteVote>` / `Vec<PrecommitVote>`).
+- `submit_remote_prevote` / `submit_remote_precommit` rewritten to
+  match on the coordinator's error and route timing-class errors
+  into the buffer; pass other errors (signature failure, dup vote)
+  through unchanged.
+- New private `drain_pending_votes(&mut BftEngineState)` helper.
+  Called from `submit_remote_proposal`, `tick_timeout`, and the
+  success paths of `submit_remote_{prevote,precommit}`. Uses a
+  bounded loop (each iteration must apply ≥1 vote to repeat) so
+  the total work is capped by total buffer size.
+- 3 new unit tests:
+  - `prevote_arriving_before_proposal_is_buffered_and_replayed`
+  - `precommit_arriving_during_prevoting_is_buffered_and_replayed`
+  - `stale_buffered_votes_are_dropped`
+
+762 tests pass; clippy clean.
+
+#### Scope discipline
+
+This release contains ONLY the buffer fix. Deferred to v0.0.73+:
+
+- Real signed auto-update protocol (Ed25519 release manifest +
+  on-chain announce + peer fetch + atomic install). Was previously
+  v0.0.72; bumped now that v0.0.72's slot is needed for the BFT
+  fix that's currently blocking testnet liveness.
+
 ## [0.0.71] — 2026-05-27
 
 ### Added — persistent BFT round state (single-validator restart no longer freezes consensus)

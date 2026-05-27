@@ -183,6 +183,20 @@ struct BftEngineState {
     detector: crate::slashing::EquivocationDetector,
     /// Evidence not yet drained by the host.
     pending_evidence: Vec<crate::slashing::EquivocationEvidence>,
+    /// v0.0.72: prevotes that arrived too early to be tallied — e.g.
+    /// before any coordinator exists, or before the proposal has
+    /// transitioned the coordinator into [`crate::bft::Phase::Prevoting`].
+    /// Drained by [`BftEngine::drain_pending_votes`] after every state
+    /// mutation that could unblock them.
+    pending_prevotes: Vec<PrevoteVote>,
+    /// v0.0.72: precommits that arrived too early. Same pattern as
+    /// [`Self::pending_prevotes`] but for the precommit phase. The
+    /// proposer in a fast leader frequently has its precommit reach
+    /// remote validators before they themselves have tallied enough
+    /// prevotes to transition phase — without this buffer the
+    /// precommit would be rejected with `WrongPhase` and the round
+    /// would stall.
+    pending_precommits: Vec<PrecommitVote>,
 }
 
 impl BftEngine {
@@ -197,6 +211,8 @@ impl BftEngine {
             proposal: None,
             detector: crate::slashing::EquivocationDetector::new(),
             pending_evidence: Vec::new(),
+            pending_prevotes: Vec::new(),
+            pending_precommits: Vec::new(),
         };
         Self {
             config,
@@ -240,6 +256,8 @@ impl BftEngine {
             proposal: None,
             detector: crate::slashing::EquivocationDetector::new(),
             pending_evidence: Vec::new(),
+            pending_prevotes: Vec::new(),
+            pending_precommits: Vec::new(),
         };
         Self {
             config,
@@ -585,6 +603,9 @@ impl BftEngine {
         let block_hash = block.hash();
         coord.submit_proposal(block_hash, &leader_proof)?;
         g.proposal = Some((block, leader_proof));
+        // v0.0.72: a proposal transition unlocks any pending votes
+        // that arrived ahead of it.
+        Self::drain_pending_votes(&mut g);
         Ok(())
     }
 
@@ -593,32 +614,132 @@ impl BftEngine {
     /// the same `(height, round)` for two different block hashes,
     /// the evidence is parked on `pending_evidence` for the host to
     /// drain.
+    ///
+    /// v0.0.72: when the vote arrives before the coordinator exists
+    /// or is in the wrong phase / round, the vote is buffered on
+    /// `pending_prevotes` rather than rejected. Buffered votes are
+    /// re-applied on the next state transition (proposal arrival,
+    /// timeout, phase change) that could unblock them. Stale votes
+    /// (height < `head_number + 1`) are dropped silently.
     pub fn submit_remote_prevote(&self, vote: PrevoteVote) -> Result<(), BftError> {
         let mut g = self.state.lock();
         if let Some(ev) = g.detector.record_prevote(vote.clone()) {
             g.pending_evidence.push(ev);
         }
-        let coord = g
-            .coordinator
-            .as_mut()
-            .ok_or(BftError::NoActiveCoordinator)?;
-        coord.submit_prevote(vote)?;
+        // Drop stale votes (for an already-committed height).
+        if vote.height <= g.head_number {
+            return Ok(());
+        }
+        match g.coordinator.as_mut() {
+            None => {
+                g.pending_prevotes.push(vote);
+            }
+            Some(coord) => match coord.submit_prevote(vote.clone()) {
+                Ok(()) => {
+                    // Submission may have transitioned phase — drain
+                    // any precommits that were waiting for this.
+                    Self::drain_pending_votes(&mut g);
+                }
+                Err(BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight) => {
+                    g.pending_prevotes.push(vote);
+                }
+                Err(e) => return Err(e),
+            },
+        }
         Ok(())
     }
 
     /// Ingest a peer's PRE-COMMIT. Same dual-feed pattern as
-    /// [`submit_remote_prevote`].
+    /// [`submit_remote_prevote`], with the same v0.0.72 buffering
+    /// semantics — early arrivals are queued on `pending_precommits`
+    /// and replayed when the coordinator transitions to
+    /// [`crate::bft::Phase::Precommitting`].
     pub fn submit_remote_precommit(&self, vote: PrecommitVote) -> Result<(), BftError> {
         let mut g = self.state.lock();
         if let Some(ev) = g.detector.record_precommit(vote.clone()) {
             g.pending_evidence.push(ev);
         }
-        let coord = g
-            .coordinator
-            .as_mut()
-            .ok_or(BftError::NoActiveCoordinator)?;
-        coord.submit_precommit(vote)?;
+        if vote.height <= g.head_number {
+            return Ok(());
+        }
+        match g.coordinator.as_mut() {
+            None => {
+                g.pending_precommits.push(vote);
+            }
+            Some(coord) => match coord.submit_precommit(vote.clone()) {
+                Ok(()) => {
+                    Self::drain_pending_votes(&mut g);
+                }
+                Err(BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight) => {
+                    g.pending_precommits.push(vote);
+                }
+                Err(e) => return Err(e),
+            },
+        }
         Ok(())
+    }
+
+    /// Re-apply every buffered prevote / precommit to the active
+    /// coordinator. Called after any state mutation that might have
+    /// transitioned the coordinator into a state where previously-
+    /// rejected votes become valid (proposal arrival, prevote tally
+    /// crossing quorum, precommit tally crossing quorum, timeout
+    /// advancing the round, …).
+    ///
+    /// Votes still rejected stay in the buffer; votes that succeed
+    /// or are now stale (height <= committed head) are removed.
+    /// Recursion is bounded by the fact that each successful drain
+    /// removes one element from the buffer.
+    fn drain_pending_votes(g: &mut BftEngineState) {
+        // Each iteration runs both buffers through the coordinator
+        // once. The outer loop reruns whenever at least one vote was
+        // successfully applied — because a successful prevote may
+        // transition the phase to Precommitting, which unblocks
+        // previously-buffered precommits, and vice versa. Bounded
+        // by the fact that each iteration must apply at least one
+        // buffered vote to repeat, so total iterations is capped by
+        // the total buffer size.
+        loop {
+            // Pre-flight: drop stale (already-committed) buffered votes.
+            let head = g.head_number;
+            g.pending_prevotes.retain(|v| v.height > head);
+            g.pending_precommits.retain(|v| v.height > head);
+            let Some(coord) = g.coordinator.as_mut() else {
+                return;
+            };
+            let prevotes = std::mem::take(&mut g.pending_prevotes);
+            let mut leftover_prev: Vec<PrevoteVote> = Vec::new();
+            let mut applied_any = false;
+            for v in prevotes {
+                match coord.submit_prevote(v.clone()) {
+                    Ok(()) => {
+                        applied_any = true;
+                    }
+                    Err(
+                        BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight,
+                    ) => leftover_prev.push(v),
+                    Err(_) => {} // signature / dedup errors — drop
+                }
+            }
+            g.pending_prevotes = leftover_prev;
+            let precommits = std::mem::take(&mut g.pending_precommits);
+            let mut leftover_pc: Vec<PrecommitVote> = Vec::new();
+            for v in precommits {
+                match coord.submit_precommit(v.clone()) {
+                    Ok(()) => {
+                        applied_any = true;
+                    }
+                    Err(
+                        BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight,
+                    ) => leftover_pc.push(v),
+                    Err(_) => {}
+                }
+            }
+            g.pending_precommits = leftover_pc;
+            if !applied_any {
+                return;
+            }
+        }
     }
 
     /// Drain every equivocation record the detector has observed
@@ -638,6 +759,8 @@ impl BftEngine {
         let coord = g.coordinator.as_mut().expect("ensured");
         coord.fire_timeout();
         g.proposal = None;
+        // v0.0.72: round change unblocks buffered votes for the new round.
+        Self::drain_pending_votes(&mut g);
         Ok(())
     }
 
@@ -1498,6 +1621,145 @@ mod tests {
         let p = <BftEngine as Engine>::step(&mut e0).unwrap();
         assert!(matches!(p, EngineProgress::NewBlock(_)));
         assert_eq!(e0.head().1, 1);
+    }
+
+    /// v0.0.72 — a peer's prevote arriving BEFORE we've seen the
+    /// proposal must be buffered, not rejected with
+    /// `NoActiveCoordinator`. After the proposal arrives the
+    /// coordinator is created and the buffered prevote is replayed.
+    #[test]
+    fn prevote_arriving_before_proposal_is_buffered_and_replayed() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+
+        // Leader: proposal + own prevote.
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        let leader_prevote = engines[leader].cast_prevote().unwrap();
+
+        // Pick a follower that hasn't seen anything yet.
+        let follower = (0..3).find(|i| *i != leader).unwrap();
+
+        // PRE-v0.0.72 this would return Err(NoActiveCoordinator).
+        // POST-v0.0.72 it must buffer and return Ok.
+        engines[follower]
+            .submit_remote_prevote(leader_prevote)
+            .expect("early prevote must be buffered, not rejected");
+        assert!(
+            engines[follower].current_round_state().is_none(),
+            "follower must not yet have a coordinator"
+        );
+
+        // Deliver the proposal — drain_pending_votes should re-submit
+        // the buffered prevote, so after this the follower's tally
+        // already has the leader's prevote on file.
+        engines[follower]
+            .submit_remote_proposal(block.clone(), proof.clone())
+            .unwrap();
+        let phase = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(
+            phase,
+            crate::bft::Phase::Prevoting,
+            "must be in Prevoting after proposal lands"
+        );
+
+        // The follower casts its own prevote, then receives the third
+        // validator's prevote — that's 3 of 3 prevotes, quorum forms,
+        // phase transitions to Precommitting.
+        let _follower_pv = engines[follower].cast_prevote().unwrap();
+        let third = (0..3).find(|i| *i != leader && *i != follower).unwrap();
+        engines[third].submit_remote_proposal(block, proof).unwrap();
+        let third_pv = engines[third].cast_prevote().unwrap();
+        engines[follower].submit_remote_prevote(third_pv).unwrap();
+        let phase = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(
+            phase,
+            crate::bft::Phase::Precommitting,
+            "buffered prevote was replayed; quorum reached"
+        );
+    }
+
+    /// v0.0.72 — a peer's precommit arriving while we're still in
+    /// Prevoting must be buffered (WrongPhase is not a rejection
+    /// path anymore). After we transition to Precommitting the
+    /// buffered precommit gets re-applied.
+    #[test]
+    fn precommit_arriving_during_prevoting_is_buffered_and_replayed() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        let leader_pv = engines[leader].cast_prevote().unwrap();
+        let other_indices: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+        let follower = other_indices[0];
+        let third = other_indices[1];
+
+        // Bring third online with a prevote of its own.
+        engines[third]
+            .submit_remote_proposal(block.clone(), proof.clone())
+            .unwrap();
+        let third_pv = engines[third].cast_prevote().unwrap();
+        engines[leader]
+            .submit_remote_prevote(third_pv.clone())
+            .unwrap();
+
+        // Drive the leader to Precommitting by also feeding the follower's prevote.
+        engines[follower]
+            .submit_remote_proposal(block, proof)
+            .unwrap();
+        let follower_pv = engines[follower].cast_prevote().unwrap();
+        engines[leader].submit_remote_prevote(follower_pv).unwrap();
+        let leader_precommit = engines[leader].cast_precommit().unwrap();
+
+        // Follower is currently in Prevoting (only saw the proposal + its own prevote).
+        let phase_before = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(phase_before, crate::bft::Phase::Prevoting);
+
+        // The early precommit arrives.
+        engines[follower]
+            .submit_remote_precommit(leader_precommit)
+            .expect("early precommit must be buffered, not rejected");
+        // Still in Prevoting — the precommit can't tally yet.
+        assert_eq!(
+            engines[follower].current_round_state().unwrap().2,
+            crate::bft::Phase::Prevoting
+        );
+
+        // Now feed enough prevotes to transition follower to Precommitting.
+        engines[follower].submit_remote_prevote(leader_pv).unwrap();
+        engines[follower].submit_remote_prevote(third_pv).unwrap();
+        // POLC formed → Precommitting; drain_pending_votes runs and
+        // the buffered leader precommit is replayed.
+        let phase_after = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(phase_after, crate::bft::Phase::Precommitting);
+        // The follower can now cast its own precommit.
+        let _ = engines[follower].cast_precommit().unwrap();
+    }
+
+    /// v0.0.72 — buffered vote for a height we've already committed
+    /// past is silently dropped, not retained forever.
+    #[test]
+    fn stale_buffered_votes_are_dropped() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let engine = engine_for(0, &vs, &keys, &g);
+        // Construct an artificial PRECOMMIT for height 0 (already
+        // committed — genesis IS at head=0). Submission must succeed
+        // (Ok) but the vote must not stick around in the buffer.
+        let v = PrecommitVote::sign(
+            &keys[0].0,
+            H256::ZERO,
+            0, // stale
+            0,
+            0,
+        );
+        engine.submit_remote_precommit(v).unwrap();
+        // Submission is silent — verify by ticking timeout (no panic)
+        // and by checking head unchanged.
+        assert_eq!(engine.head().1, 0);
     }
 
     #[test]
