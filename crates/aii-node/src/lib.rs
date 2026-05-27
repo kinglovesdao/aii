@@ -173,6 +173,9 @@ pub struct NodeState {
     blocks: RwLock<BlockStore>,
     /// Mempool for incoming signed transactions (v0.0.37).
     tx_pool: TxPool,
+    /// Latest signed release manifest accepted via the v0.0.75
+    /// `aii_announceRelease` RPC. `None` on a fresh node.
+    latest_release: RwLock<Option<aii_crypto::release::ReleaseManifest>>,
 }
 
 /// Headers + bodies keyed by hash and number, plus an insertion-order
@@ -206,6 +209,7 @@ impl NodeState {
             backend,
             blocks: RwLock::new(BlockStore::default()),
             tx_pool: TxPool::new(100_000),
+            latest_release: RwLock::new(None),
         })
     }
 
@@ -305,6 +309,7 @@ impl NodeState {
                 tx_index,
             }),
             tx_pool: TxPool::new(100_000),
+            latest_release: RwLock::new(None),
         }))
     }
 
@@ -1635,6 +1640,38 @@ impl RpcState for NodeState {
             storage_root: format!("0x{}", hex::encode(acc.storage_root.as_bytes())),
             code_hash: format!("0x{}", hex::encode(acc.code_hash.as_bytes())),
         })
+    }
+
+    async fn record_release_announcement(
+        &self,
+        manifest: aii_crypto::release::ReleaseManifest,
+    ) -> bool {
+        let Ok(mut guard) = self.latest_release.write() else {
+            return false;
+        };
+        // Only accept a strictly newer manifest. Compare on
+        // (timestamp_unix, version-string) — timestamp first so a
+        // backdated re-sign of the same version cannot displace the
+        // live one.
+        if let Some(current) = guard.as_ref() {
+            let strictly_newer = manifest.timestamp_unix > current.timestamp_unix
+                || (manifest.timestamp_unix == current.timestamp_unix
+                    && manifest.version > current.version);
+            if !strictly_newer {
+                return false;
+            }
+        }
+        tracing::info!(
+            version = %manifest.version,
+            ts = manifest.timestamp_unix,
+            "accepted release announcement",
+        );
+        *guard = Some(manifest);
+        true
+    }
+
+    async fn latest_release(&self) -> Option<aii_crypto::release::ReleaseManifest> {
+        self.latest_release.read().ok()?.clone()
     }
 }
 

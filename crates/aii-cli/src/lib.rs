@@ -7,7 +7,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod release;
+/// Convenience re-export of the release-signing primitives. The
+/// authoritative module lives in `aii-crypto::release` so the RPC
+/// layer + node binary can share the same types.
+pub use aii_crypto::release;
 
 use aii_onboarding::{detect, recommend_tier, score, Tier};
 use aii_wallet::{EncryptedKeystore, LocalWallet, MnemonicPhrase, ScryptParams};
