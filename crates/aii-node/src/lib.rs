@@ -21,12 +21,13 @@ pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
 
 use aii_block::tx::Tx;
-use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType};
+use aii_block::{Block, BlockBody, Bloom, Hashable, Header, Receipt, TxType, EMPTY_TRIE_HASH};
 use aii_config::ChainSpec;
 use aii_net_txpool::{effective_gas_price, AddOutcome, PoolEntry, TxPool};
 use aii_rpc::{
-    AccountView, ActiveValidatorsView, ForkView, HeaderView, LogView, ProposalView, ReceiptView,
-    RpcState, SlashView, StakeView, SubchainAnchorView, SubmitTxError, TxView, ValidatorEntryView,
+    AccountView, ActiveValidatorsView, ForkView, HeaderView, LogView, PostRootsView, ProposalView,
+    ReceiptView, RpcState, SlashView, StakeView, SubchainAnchorView, SubmitTxError, TxView,
+    ValidatorEntryView,
 };
 use aii_state::StateDb;
 use aii_storage::{ColumnFamily, KvBackend, RocksDbBackend, WriteBatch};
@@ -51,6 +52,26 @@ const META_KEY_SLASH_PREFIX: &[u8] = b"slash:";
 /// per height are allowed — every conflicting hash seen lands here so
 /// the operator can audit re-org candidates.
 const META_KEY_FORK_PREFIX: &[u8] = b"fork:";
+/// Meta-CF key prefix for post-block root sidecar records.
+/// Layout: `b"postroot:" ‖ block_hash[32]` → 32+32+256-byte value
+/// (state_root ‖ receipts_root ‖ logs_bloom). Lets light clients
+/// fetch the Yellow-Paper roots that *should* have been in the
+/// header. The header itself still embeds the v0.0.39-compatible
+/// placeholder so block hashes don't drift.
+const META_KEY_POSTROOT_PREFIX: &[u8] = b"postroot:";
+
+/// Bundle of post-block Yellow-Paper roots persisted as a sidecar
+/// to the block header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostBlockRoots {
+    /// `keccak256(rlp(world_state_mpt))` after applying every tx in
+    /// the block.
+    pub state_root: H256,
+    /// `keccak256(rlp(receipts_mpt))` over the block's receipts.
+    pub receipts_root: H256,
+    /// 256-byte aggregate logs bloom (Yellow Paper §4.4.2).
+    pub logs_bloom: Bloom,
+}
 
 /// One observed competing block at a given height.
 ///
@@ -658,6 +679,76 @@ impl NodeState {
             self.credit(&block.header.beneficiary, U256::from(subsidy_wei));
         }
         self.persist_receipts(block.hash(), &receipts);
+        // Compute + persist Yellow-Paper sidecar roots so light
+        // clients can validate the block's post-execution state.
+        // (Header itself still carries placeholders to keep block
+        // hashes stable across this release.)
+        let receipts_only: Vec<aii_block::Receipt> =
+            receipts.iter().map(|(_, r)| r.clone()).collect();
+        let state_root = self.state.state_root().unwrap_or(EMPTY_TRIE_HASH);
+        let receipts_root = aii_state::receipts_root(&receipts_only);
+        let mut block_bloom = Bloom::ZERO;
+        for (_, r) in &receipts {
+            for log in &r.logs {
+                block_bloom.accrue(log.address.as_bytes());
+                for topic in &log.topics {
+                    block_bloom.accrue(topic.as_bytes());
+                }
+            }
+        }
+        self.persist_post_roots(
+            block.hash(),
+            &PostBlockRoots {
+                state_root,
+                receipts_root,
+                logs_bloom: block_bloom,
+            },
+        );
+    }
+
+    /// Persist the post-block roots sidecar for `block_hash`.
+    fn persist_post_roots(&self, block_hash: H256, roots: &PostBlockRoots) {
+        let mut key = Vec::with_capacity(META_KEY_POSTROOT_PREFIX.len() + 32);
+        key.extend_from_slice(META_KEY_POSTROOT_PREFIX);
+        key.extend_from_slice(block_hash.as_bytes());
+        let mut val = Vec::with_capacity(32 + 32 + 256);
+        val.extend_from_slice(roots.state_root.as_bytes());
+        val.extend_from_slice(roots.receipts_root.as_bytes());
+        val.extend_from_slice(&roots.logs_bloom.0);
+        if let Err(e) = self.backend.put(ColumnFamily::Meta, &key, &val) {
+            tracing::error!(error = %e, "persist_post_roots: write failed");
+        }
+    }
+
+    /// Read back the post-block roots for `block_hash`, or `Ok(None)`
+    /// if no record exists (e.g. block produced before v0.0.58).
+    ///
+    /// # Errors
+    /// Propagates backend errors.
+    pub fn post_roots(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<PostBlockRoots>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut key = Vec::with_capacity(META_KEY_POSTROOT_PREFIX.len() + 32);
+        key.extend_from_slice(META_KEY_POSTROOT_PREFIX);
+        key.extend_from_slice(block_hash.as_bytes());
+        let Some(bytes) = self.backend.get(ColumnFamily::Meta, &key)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 + 32 + 256 {
+            return Ok(None);
+        }
+        let mut sr = [0u8; 32];
+        sr.copy_from_slice(&bytes[..32]);
+        let mut rr = [0u8; 32];
+        rr.copy_from_slice(&bytes[32..64]);
+        let mut bloom = [0u8; 256];
+        bloom.copy_from_slice(&bytes[64..320]);
+        Ok(Some(PostBlockRoots {
+            state_root: H256::new(sr),
+            receipts_root: H256::new(rr),
+            logs_bloom: Bloom(bloom),
+        }))
     }
 
     /// Add `delta` Wei to the balance of `addr`. Used by the gas-fee
@@ -1142,6 +1233,16 @@ impl RpcState for NodeState {
         Some((tx_to_view(tx, chain_id), block_number))
     }
 
+    async fn post_roots_for(&self, block_hash_hex: &str) -> Option<PostRootsView> {
+        let h = parse_hash_str(block_hash_hex)?;
+        let r = self.post_roots(h).ok().flatten()?;
+        Some(PostRootsView {
+            state_root: format!("0x{}", hex::encode(r.state_root.as_bytes())),
+            receipts_root: format!("0x{}", hex::encode(r.receipts_root.as_bytes())),
+            logs_bloom: format!("0x{}", hex::encode(r.logs_bloom.0)),
+        })
+    }
+
     async fn forks(&self) -> Vec<ForkView> {
         self.list_forks()
             .unwrap_or_default()
@@ -1624,6 +1725,26 @@ mod tests {
         let (yes, no) = gov.tally_of(proposal_id).unwrap().unwrap();
         assert_eq!(yes, U256::from(1_000u64));
         assert_eq!(no, U256::ZERO);
+    }
+
+    #[test]
+    fn empty_block_post_roots_record_world_state() {
+        // After committing an empty block, the sidecar should hold
+        // the current state_root (genesis-empty here), an empty
+        // receipts_root, and a zero logs_bloom. Persistence + read-
+        // back must round-trip.
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let b = fake_block(1, H256::ZERO);
+        let h = b.hash();
+        state.commit_block(&b);
+        let roots = state.post_roots(h).unwrap().expect("post-roots persisted");
+        // Empty body → receipts_root == EMPTY_TRIE_HASH.
+        assert_eq!(roots.receipts_root, EMPTY_TRIE_HASH);
+        // No logs → bloom is zero.
+        assert_eq!(roots.logs_bloom, Bloom::ZERO);
+        // state_root should equal the live state's computed root.
+        let live = state.state().state_root().unwrap();
+        assert_eq!(roots.state_root, live);
     }
 
     #[test]

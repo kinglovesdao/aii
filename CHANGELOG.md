@@ -5,6 +5,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.58] — 2026-05-26
+
+### Added — Post-block Yellow-Paper roots sidecar (closes A.3 + B.5 observability)
+
+The Yellow-Paper `state_root`, `receipts_root`, and `logs_bloom`
+header fields have been `EMPTY_TRIE_HASH` / `Bloom::ZERO` since
+v0.0.39 — every prior release deferred their wiring to a future
+engine apply-then-hash refactor. v0.0.58 ships the pragmatic
+alternative: persist the *computed* post-execution roots in a
+`Meta:postroot:<block_hash>` sidecar record after every commit_block,
+and expose them via JSON-RPC `aii_getPostRoots(block_hash)`. The
+block header still embeds placeholders (so block hashes stay stable
+across this release), but light clients can now fetch the real
+roots and verify the chain's post-state directly.
+
+#### `aii-state`
+
+- New free function `receipts_root(&[Receipt]) -> H256` — sibling to
+  `transactions_root`. Keys are `rlp(i)`, values are EIP-2718-encoded
+  receipt bytes. Empty input returns `EMPTY_TRIE_HASH`.
+
+#### `aii-node`
+
+- New `PostBlockRoots { state_root, receipts_root, logs_bloom }`
+  struct + `Meta:postroot:<hash>` key prefix.
+- `execute_block_txs` now, after committing every tx + minting the
+  subsidy:
+  1. Computes `state.state_root()`,
+  2. Computes `aii_state::receipts_root(receipts)`,
+  3. Aggregates every per-tx log into a block-level `Bloom`,
+  4. Persists the triple via `persist_post_roots`.
+- New `NodeState::post_roots(block_hash) -> Result<Option<PostBlockRoots>>`
+  reads the sidecar back.
+- New `RpcState::post_roots_for(block_hash)` default-`None`; impl
+  hex-encodes all three fields into a `PostRootsView`.
+- New test `empty_block_post_roots_record_world_state`: commits an
+  empty block, asserts the sidecar persists with `receipts_root ==
+  EMPTY_TRIE_HASH`, `logs_bloom == Bloom::ZERO`, and `state_root`
+  matching the live state's `state_root()`.
+
+#### `aii-rpc`
+
+- New JSON-RPC method
+  `aii_getPostRoots(block_hash) -> Option<PostRootsView>`.
+- New response type `PostRootsView { state_root, receipts_root,
+  logs_bloom }` (all `0x…` hex).
+
+#### Scope discipline
+
+Not in this release (already on the roadmap):
+
+- **Header still carries placeholders.** Block hash continues to
+  embed `EMPTY_TRIE_HASH` / `Bloom::ZERO` for `state_root` /
+  `receipts_root` / `logs_bloom`. Folding the post-roots into the
+  header at build time (so the hash itself locks to them) is the
+  full engine apply-then-hash refactor — pairs with the consensus
+  protocol upgrade that lets followers verify proposer-supplied
+  roots before voting.
+- **No proof generation.** The sidecar is the root only — Merkle
+  proof generation for individual accounts / receipts / logs is
+  light-client work for a later release.
+
 ## [0.0.57] — 2026-05-26
 
 ### Added — End-to-end staking → election → governance integration test

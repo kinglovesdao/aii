@@ -39,6 +39,29 @@ pub fn transactions_root(body: &BlockBody) -> H256 {
     mpt_root(pairs)
 }
 
+/// Compute the Yellow Paper `receipts_root` of a slice of receipts.
+///
+/// Keys are RLP-encoded receipt indices, values are the EIP-2718
+/// envelope bytes of each receipt. Empty input returns [`EMPTY_TRIE_HASH`].
+#[must_use]
+pub fn receipts_root(receipts: &[aii_block::Receipt]) -> H256 {
+    if receipts.is_empty() {
+        return EMPTY_TRIE_HASH;
+    }
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = receipts
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut k = alloy_rlp::bytes::BytesMut::new();
+            (i as u64).encode(&mut k);
+            let mut v = alloy_rlp::bytes::BytesMut::new();
+            r.encode_2718(&mut v);
+            (k.to_vec(), v.to_vec())
+        })
+        .collect();
+    mpt_root(pairs)
+}
+
 /// Compute the Merkle Patricia Tree root of an ordered KV set.
 ///
 /// Empty input returns `EMPTY_TRIE_HASH`. Otherwise computes the full

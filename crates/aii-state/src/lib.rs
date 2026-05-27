@@ -29,4 +29,4 @@ pub use account::{Account, EMPTY_CODE_HASH};
 pub use aii_block::EMPTY_TRIE_HASH;
 pub use db::StateDb;
 pub use error::StateError;
-pub use trie::{mpt_root, transactions_root};
+pub use trie::{mpt_root, receipts_root, transactions_root};

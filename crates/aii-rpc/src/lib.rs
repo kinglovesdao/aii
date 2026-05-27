@@ -215,6 +215,11 @@ pub trait RpcState: Send + Sync + 'static {
     async fn forks(&self) -> Vec<ForkView> {
         Vec::new()
     }
+
+    /// Read post-block Yellow-Paper sidecar roots. Default `None`.
+    async fn post_roots_for(&self, _block_hash: &str) -> Option<PostRootsView> {
+        None
+    }
 }
 
 /// JSON-RPC-facing view of an [`aii_block::Receipt`].
@@ -408,6 +413,26 @@ pub trait AiiRpc {
     /// is observability-only — re-org execution lands later.
     #[method(name = "listForks")]
     async fn list_forks(&self) -> RpcResult<Vec<ForkView>>;
+
+    /// `aii_getPostRoots(block_hash)` — Yellow-Paper sidecar roots
+    /// computed after applying every tx in the block. Lets a light
+    /// client verify post-execution state without the header itself
+    /// carrying these fields (header still embeds placeholders for
+    /// backward-compatible block hashing). Returns `null` for an
+    /// unknown block hash or one produced before v0.0.58.
+    #[method(name = "getPostRoots")]
+    async fn get_post_roots(&self, block_hash: String) -> RpcResult<Option<PostRootsView>>;
+}
+
+/// JSON-RPC view of the post-block Yellow-Paper roots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostRootsView {
+    /// World-state MPT root after applying every tx (`0x…` hex).
+    pub state_root: String,
+    /// Receipts MPT root over the block's receipts (`0x…` hex).
+    pub receipts_root: String,
+    /// Aggregate 256-byte logs bloom (`0x…` hex).
+    pub logs_bloom: String,
 }
 
 /// JSON-RPC view of one fork-detection record.
@@ -690,6 +715,10 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
 
     async fn list_forks(&self) -> RpcResult<Vec<ForkView>> {
         Ok(self.state.forks().await)
+    }
+
+    async fn get_post_roots(&self, block_hash: String) -> RpcResult<Option<PostRootsView>> {
+        Ok(self.state.post_roots_for(&block_hash).await)
     }
 }
 
