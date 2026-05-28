@@ -118,6 +118,31 @@ pub trait RpcState: Send + Sync + 'static {
     /// Return the account view for `addr`, or `None` if no record exists.
     async fn account(&self, addr: &Address) -> Option<AccountView>;
 
+    /// Return the runtime bytecode at `addr`, or empty
+    /// `Vec::new()` if the account has no code (EOA or
+    /// non-existent). Default returns empty; node impls
+    /// override. Used by [`AiiRpc::call`]-adjacent
+    /// `eth_getCode` (v0.0.89).
+    async fn code_at(&self, _addr: &Address) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Return the 32-byte storage value at `(addr, slot)`.
+    /// Unset slots return all-zero (matches EVM semantics).
+    /// Default returns zero; node impls override. Used by
+    /// `eth_getStorageAt` (v0.0.89).
+    async fn storage_at(&self, _addr: &Address, _slot: &aii_types::H256) -> aii_types::H256 {
+        aii_types::H256::ZERO
+    }
+
+    /// Estimate the gas a transaction would consume by
+    /// running it through the EVM as a simulation (no state
+    /// changes). Default returns `Unsupported`. Node impls
+    /// route through `aii_evm::simulate_with_revm` (v0.0.89).
+    async fn estimate_gas(&self, _req: SimulateCallParams) -> Result<u64, SimulateCallError> {
+        Err(SimulateCallError::Unsupported)
+    }
+
     /// Header by block number, or `None` if the chain has not produced
     /// `n` yet. Default returns `None`; node impls override.
     async fn header_by_number(&self, _n: u64) -> Option<HeaderView> {
@@ -487,6 +512,37 @@ pub trait EthRpc {
     /// currently ignored (only head-state is supported).
     #[method(name = "call")]
     async fn call(&self, req: EthCallRequest, block_tag: Option<String>) -> RpcResult<String>;
+
+    /// `eth_estimateGas(req, blockTag)` — return the gas a
+    /// transaction would consume if submitted, as `0x…` hex
+    /// (v0.0.89). Runs the same simulation as `eth_call` but
+    /// reports `gas_used` instead of the return data.
+    /// `blockTag` ignored (head-state only).
+    #[method(name = "estimateGas")]
+    async fn estimate_gas(
+        &self,
+        req: EthCallRequest,
+        block_tag: Option<String>,
+    ) -> RpcResult<String>;
+
+    /// `eth_getCode(address, blockTag)` — return the runtime
+    /// bytecode at `address` as `0x…` hex (v0.0.89). Empty
+    /// `0x` for EOAs or non-existent accounts. `blockTag`
+    /// ignored (head-state only).
+    #[method(name = "getCode")]
+    async fn get_code(&self, address: String, block_tag: Option<String>) -> RpcResult<String>;
+
+    /// `eth_getStorageAt(address, slot, blockTag)` — return
+    /// the 32-byte storage value at `(address, slot)` as
+    /// `0x…` hex (v0.0.89). Unset slots return
+    /// `0x000…000`. `blockTag` ignored (head-state only).
+    #[method(name = "getStorageAt")]
+    async fn get_storage_at(
+        &self,
+        address: String,
+        slot: String,
+        block_tag: Option<String>,
+    ) -> RpcResult<String>;
 }
 
 /// Request body for the v0.0.88 `eth_call` JSON-RPC method.
@@ -994,6 +1050,62 @@ impl<S: RpcState> EthRpcServer for EthRpcImpl<S> {
             )),
         }
     }
+
+    async fn estimate_gas(
+        &self,
+        req: EthCallRequest,
+        _block_tag: Option<String>,
+    ) -> RpcResult<String> {
+        let params = parse_eth_call_request(&req)?;
+        match self.state.estimate_gas(params).await {
+            Ok(g) => Ok(format!("0x{g:x}")),
+            Err(e) => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32000,
+                e.to_string(),
+                None::<()>,
+            )),
+        }
+    }
+
+    async fn get_code(&self, address: String, _block_tag: Option<String>) -> RpcResult<String> {
+        let addr = parse_address(&address)?;
+        let code = self.state.code_at(&addr).await;
+        Ok(format!("0x{}", hex::encode(code)))
+    }
+
+    async fn get_storage_at(
+        &self,
+        address: String,
+        slot: String,
+        _block_tag: Option<String>,
+    ) -> RpcResult<String> {
+        let addr = parse_address(&address)?;
+        let slot_h = parse_h256(&slot)?;
+        let value = self.state.storage_at(&addr, &slot_h).await;
+        Ok(format!("0x{}", hex::encode(value.as_bytes())))
+    }
+}
+
+/// Parse a `0x…` 32-byte hex string into an `H256`. Accepts
+/// shorter hex by zero-padding on the left (matches Ethereum
+/// JSON-RPC behavior for `eth_getStorageAt`'s slot arg, where
+/// callers commonly pass `"0x0"`).
+fn parse_h256(s: &str) -> RpcResult<aii_types::H256> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() > 64 {
+        return Err(jsonrpsee::types::ErrorObjectOwned::owned(
+            -32602,
+            format!("h256: expected at most 64 hex chars, got {}", s.len()),
+            None::<()>,
+        ));
+    }
+    // Left-pad to 64 chars.
+    let padded = format!("{s:0>64}");
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(&padded, &mut out).map_err(|e| {
+        jsonrpsee::types::ErrorObjectOwned::owned(-32602, format!("h256 hex: {e}"), None::<()>)
+    })?;
+    Ok(aii_types::H256::new(out))
 }
 
 /// Decode an [`EthCallRequest`] (hex strings) into a typed

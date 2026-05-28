@@ -5,6 +5,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.89] — 2026-05-28
+
+### Added — `eth_estimateGas` + `eth_getCode` + `eth_getStorageAt`
+
+Closes the remaining Ethereum-JSON-RPC gap that wallet UX cares
+about. With v0.0.88's `eth_call` already wired, wallets could
+preview contract returns but still couldn't show users gas
+estimates, fetch deployed bytecode, or read storage slots
+directly. v0.0.89 lights up all three.
+
+After this release, a stock MetaMask / ethers.js / viem stack
+talking to an `aiid` node has everything it needs to display
+balances, call view functions, fetch contract code for ABI
+discovery, and pre-compute transaction gas — all the
+read-side surface dApps rely on.
+
+#### `aii-rpc`
+
+- New `eth_estimateGas(req, blockTag)` — same wire shape as
+  `eth_call`; returns `gas_used` from a simulated run as
+  `0x…` hex. Matches geth: reverts surface as JSON-RPC
+  errors so wallets can render them.
+- New `eth_getCode(address, blockTag)` — `0x…`-hex runtime
+  bytecode for a deployed contract, `"0x"` for EOAs and
+  non-existent accounts.
+- New `eth_getStorageAt(address, slot, blockTag)` — 32-byte
+  storage value at `(address, slot)` as `0x…` hex. Unset
+  slots return all zeros (EVM-spec). Accepts short slot hex
+  via left-pad (e.g., `"0x0"` for slot 0).
+- New `RpcState::code_at`, `RpcState::storage_at`,
+  `RpcState::estimate_gas` trait methods. Defaults: empty
+  vec, `H256::ZERO`, `Unsupported`. `aii-node::NodeState`
+  overrides all three.
+- New `parse_h256` hex helper with left-pad semantics.
+
+#### `aii-node::NodeState`
+
+- `code_at` → `state.account(addr).code_hash` →
+  `state.code_get(&hash)`. Returns empty for EOAs /
+  non-existent accounts.
+- `storage_at` → `state.storage_get(&addr, &slot)`. Errors
+  fall back to `H256::ZERO`.
+- `estimate_gas` → reuses `simulate_with_revm`; returns
+  `sim.gas_used` on success, `SimulateCallError::Reverted`
+  on EVM failure (so wallets get an actionable error).
+
+#### `aii-node` integration tests
+
+- `eth_estimate_gas_value_transfer_is_21000` — exact-equals
+  check on the intrinsic gas floor.
+- `eth_get_code_eoa_and_contract` — round-trip a deployed
+  contract's bytecode through the RPC.
+- `eth_get_storage_at_returns_committed_value` — deploy a
+  contract that `SSTORE`s `0xdead` into slot 0, then read it
+  back through `eth_getStorageAt`. Also asserts unset slot
+  reads as 32 bytes of zeros.
+
+### Wallet/explorer surface — current state
+
+```
+eth_chainId            ✓
+eth_blockNumber        ✓
+eth_gasPrice           ✓
+eth_getBalance         ✓
+eth_sendRawTransaction ✓
+eth_getTransactionReceipt ✓
+eth_getLogs            ✓
+eth_call               ✓ (v0.0.88)
+eth_estimateGas        ✓ (v0.0.89)
+eth_getCode            ✓ (v0.0.89)
+eth_getStorageAt       ✓ (v0.0.89)
+```
+
+A MetaMask user pointing at an `aiid` RPC endpoint can now
+view balances, call view functions, see real gas estimates,
+inspect deployed contracts, and send transactions through the
+same UX they'd get on Ethereum mainnet.
+
+### Scope discipline
+
+Out of scope for v0.0.89:
+
+- **`eth_getTransactionByHash` / `…Block…`.** Tx-lookup
+  scaffolding exists (`tx_index` in `BlockStore`) but no
+  RPC wrapper. Next slice.
+- **Block-tag handling.** All three new methods (and v0.0.88's
+  `eth_call`) ignore the `blockTag` argument — every read
+  runs against head state. Historical-state queries need MPT
+  + state-root pinning; separately scoped.
+- **EIP-1559 fee fields.** `eth_estimateGas`'s request body
+  accepts `gasPrice` but not `maxFeePerGas` /
+  `maxPriorityFeePerGas` yet. EIP-1559 fields surface when
+  the fee market lands.
+- **Gas-cap policy.** A node could refuse very-high-gas
+  `eth_call` / `eth_estimateGas` calls; today the default
+  30 M cap is purely advisory.
+
+Tests: +3 RPC integration. 859 tests pass / clippy clean.
+
 ## [0.0.88] — 2026-05-28
 
 ### Added — `eth_call` read-only revm simulation
