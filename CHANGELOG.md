@@ -5,6 +5,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.87] — 2026-05-28
+
+### Added — multi-key release signing (pubkey rotation)
+
+The last hard requirement before mainnet: rotating the
+release-signing key without manually wiping every node. Until
+v0.0.86, `RELEASE_SIGNING_PUBKEY_HEX` was a single hex string;
+"rotation" meant "edit constant, hope nobody is mid-upgrade."
+v0.0.87 generalizes the pin to a SLICE of trusted pubkeys, and
+the auto-update verifiers accept a manifest signed by **any**
+entry.
+
+#### `aii-crypto::release`
+
+- `RELEASE_SIGNING_PUBKEYS: &[&str]` — new constant slice.
+  Initially contains the single entry that was previously in
+  `RELEASE_SIGNING_PUBKEY_HEX`.
+- `pinned_release_pubkeys() -> Vec<PublicKey>` — parses every
+  entry. Panics at startup on a malformed constant (the
+  failure surfaces during `cargo build`'s constant
+  initialization or the first call).
+- `verify_manifest_signature_any(pubkeys, manifest) -> Result<()>` —
+  returns `Ok(())` on the first key that verifies; returns the
+  last key's `ReleaseError::Crypto` when none match. Empty
+  `pubkeys` returns `ReleaseError::Hex("no pubkeys supplied")`.
+  Decodes the manifest fields ONCE per call.
+- `RELEASE_SIGNING_PUBKEY_HEX` and `pinned_release_pubkey()`
+  retained as back-compat aliases for callers that knew only
+  the single-key world. They both correspond to the FIRST
+  entry of the slice.
+- 6 new tests cover the multi-key paths: primary-first ordering
+  invariant, accept-by-primary, accept-by-secondary, reject-on-
+  unknown, empty-set returns Hex error, short-circuit
+  on first match.
+
+#### `aii-rpc`
+
+- `AiiRpcImpl::announce_release` now verifies against
+  `pinned_release_pubkeys()` instead of the single
+  `pinned_release_pubkey()`. The wire reason now reports the
+  number of pinned keys in the failure case
+  (`"signature does not verify against any of the N pinned pubkeys"`).
+- `release_poller::poll_once` uses
+  `verify_manifest_signature_any(&pinned_release_pubkeys(), …)`.
+  Same trust boundary as before, with the rotation set now
+  included.
+
+### Rotation procedure (operator-facing)
+
+To rotate from key `A` to a new key `B` without bricking the
+network:
+
+1. **Generate** `B`: `aii release keygen --out new-secret.hex`
+   produces the secret seed; copy the printed pubkey hex.
+2. **Add** `B` to `RELEASE_SIGNING_PUBKEYS` in
+   `crates/aii-crypto/src/release.rs`. Ship the workspace as
+   the next release (`vX.Y.Z`).
+3. **Roll out** the binary via the v0.0.74-86 auto-update
+   protocol. Every node ends up trusting both `A` and `B`.
+4. **Switch signing** to `B`: release manager starts signing
+   the next batch of manifests with `B`. Existing nodes
+   already accept both, so consensus doesn't notice.
+5. **Drop** `A` in a subsequent release. After that wave
+   propagates, `A` is retired.
+
+If `A` is compromised, step 3 has to happen FAST (a compromised
+key holder can still sign manifests). Operators may want to
+keep step 1-2 pre-baked into each release as a standing
+mitigation.
+
+### Scope discipline
+
+Out of scope for v0.0.87:
+
+- **On-chain rotation registry.** The pin is still compile-
+  time. A truly post-deploy rotation needs governance — most
+  likely a chain-level registry where a quorum of validators
+  can add/remove signing keys. That's a much bigger slice and
+  lands separately once `aii-config::Governance` matures.
+- **Per-key version constraints.** Currently every key in the
+  slice is trusted for every version. A future slice could
+  scope keys to version ranges (e.g., `A` for `<= 1.0`,
+  `B` for `>= 1.0`).
+
+Tests: +6 multi-key release tests. 851 tests pass / clippy clean.
+
 ## [0.0.86] — 2026-05-28
 
 ### Added — restart rate limit + stale-sentinel shortcut

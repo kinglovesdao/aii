@@ -29,7 +29,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aii_crypto::release::{pinned_release_pubkey, verify_manifest_signature, ReleaseManifest};
+use aii_crypto::release::{pinned_release_pubkeys, verify_manifest_signature_any, ReleaseManifest};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
@@ -131,8 +131,11 @@ where
         }
 
         // 3. Verify signature locally — never trust the peer.
-        let pk = pinned_release_pubkey();
-        if let Err(e) = verify_manifest_signature(&pk, &remote) {
+        // v0.0.87: try the full pinned-pubkey set so a node
+        // mid-rotation still accepts manifests signed by the
+        // key it can verify.
+        let pks = pinned_release_pubkeys();
+        if let Err(e) = verify_manifest_signature_any(&pks, &remote) {
             po.note = format!("sig verify: {e}");
             outcome.peers.push(po);
             continue;
