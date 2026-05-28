@@ -1936,6 +1936,28 @@ impl RpcState for NodeState {
                 }
             }
         };
+        // v0.0.80 safety net: snapshot the currently-running
+        // binary at `<data-dir>/releases/.previous` BEFORE we
+        // clobber it. Lets `aii_rollbackRelease` restore the
+        // pre-install state if the new binary turns out to be
+        // bad. Snapshot failure is non-fatal — we'd rather ship
+        // the new binary without rollback than refuse the
+        // install over a transient I/O hiccup.
+        let releases_dir = dir.join(crate::release_store::RELEASES_SUBDIR);
+        match crate::release_install::save_previous(&target, &releases_dir) {
+            Ok(path) => {
+                tracing::info!(
+                    snapshot = %path.display(),
+                    "pre-install snapshot saved for rollback",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "pre-install snapshot failed; rollback will be unavailable for this install",
+                );
+            }
+        }
         if let Err(e) = crate::release_install::install_binary(&staged, &target) {
             return aii_rpc::InstallOutcome {
                 scheduled: false,
@@ -1965,6 +1987,69 @@ impl RpcState for NodeState {
                     error = %err,
                     target = %exec_target.display(),
                     "execve self failed; node continues on old binary",
+                );
+            });
+        }
+        aii_rpc::InstallOutcome {
+            scheduled: true,
+            reason: String::new(),
+            restart_in_secs: RESTART_DELAY_SECS,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn rollback_release(&self) -> aii_rpc::InstallOutcome {
+        const RESTART_DELAY_SECS: u64 = 2;
+
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: "node has no data_dir configured (set_data_dir not called)".into(),
+                restart_in_secs: 0,
+            };
+        };
+        let releases_dir = dir.join(crate::release_store::RELEASES_SUBDIR);
+        let override_target = self
+            .install_target_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone());
+        let target = if let Some(p) = override_target.clone() {
+            p
+        } else {
+            match crate::release_install::current_aiid_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    return aii_rpc::InstallOutcome {
+                        scheduled: false,
+                        reason: format!("cannot resolve current_exe: {e}"),
+                        restart_in_secs: 0,
+                    };
+                }
+            }
+        };
+        if let Err(e) = crate::release_install::rollback_to_previous(&releases_dir, &target) {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: format!("rollback failed: {e}"),
+                restart_in_secs: 0,
+            };
+        }
+        tracing::info!(
+            target = %target.display(),
+            restart_in_secs = RESTART_DELAY_SECS,
+            test_mode = override_target.is_some(),
+            "release rolled back to .previous; self-restart scheduled",
+        );
+        if override_target.is_none() {
+            let exec_target = target;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                let err = crate::release_install::exec_self_at(&exec_target);
+                tracing::error!(
+                    error = %err,
+                    target = %exec_target.display(),
+                    "execve self after rollback failed; node continues on rolled-back binary",
                 );
             });
         }
@@ -2697,6 +2782,101 @@ mod tests {
         assert!(!outcome.scheduled);
         assert!(outcome.reason.contains("no cached binary"));
         assert_eq!(std::fs::read(&target).unwrap(), b"UNCHANGED");
+    }
+
+    /// v0.0.80 explicit rollback: after one install the snapshot
+    /// of the pre-install binary lives at `.previous`. Calling
+    /// rollback restores it onto the target and leaves the
+    /// newly-installed bytes in `.previous` so a second rollback
+    /// flips back. Both swaps verified.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_release_restores_previous_after_install() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_ORIGINAL").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Sign + accept manifest, then stage the binary in the
+        // release store so install_release has bytes to install.
+        let payload = b"V_NEW_INSTALLED";
+        let mut tmpf = tempfile::NamedTempFile::new().unwrap();
+        tmpf.write_all(payload).unwrap();
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let manifest = sign_release(&sk, tmpf.path(), "0.0.80", 1_900_000_080).unwrap();
+        assert!(aii_rpc::RpcState::record_release_announcement(&*state, manifest.clone()).await);
+        crate::release_store::store_verified_binary(
+            &data_dir,
+            "0.0.80",
+            &manifest.sha256_hex,
+            payload,
+        )
+        .unwrap();
+
+        // Install: snapshots target (V_ORIGINAL) to .previous,
+        // then overlays payload (V_NEW_INSTALLED) onto target.
+        let out = aii_rpc::RpcState::install_release(&*state, "0.0.80").await;
+        assert!(out.scheduled, "install must succeed: {out:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        let prev_path = crate::release_install::previous_path(
+            &data_dir.join(crate::release_store::RELEASES_SUBDIR),
+        );
+        assert_eq!(
+            std::fs::read(&prev_path).unwrap(),
+            b"V_ORIGINAL",
+            "install must snapshot the pre-install bytes"
+        );
+
+        // Rollback once: target → V_ORIGINAL, .previous → V_NEW_INSTALLED.
+        let r = aii_rpc::RpcState::rollback_release(&*state).await;
+        assert!(r.scheduled, "rollback must succeed: {r:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"V_ORIGINAL");
+        assert_eq!(
+            std::fs::read(&prev_path).unwrap(),
+            payload,
+            "rollback must leave the rolled-away-from bytes in .previous"
+        );
+
+        // Rollback again: target → V_NEW_INSTALLED, .previous → V_ORIGINAL.
+        let r2 = aii_rpc::RpcState::rollback_release(&*state).await;
+        assert!(r2.scheduled);
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert_eq!(std::fs::read(&prev_path).unwrap(), b"V_ORIGINAL");
+    }
+
+    /// v0.0.80 — rollback on a fresh node (no install yet) must
+    /// fail-soft with a clear reason and leave the target alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_release_rejects_when_no_previous_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"UNTOUCHED").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir);
+        state.set_install_target_for_tests(target.clone());
+
+        let r = aii_rpc::RpcState::rollback_release(&*state).await;
+        assert!(!r.scheduled);
+        assert!(r.reason.contains("rollback failed") || r.reason.contains("snapshot"));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"UNTOUCHED",
+            "target must not be modified when rollback is rejected"
+        );
     }
 
     /// v0.0.78 auto-install path: when --auto-install-releases is

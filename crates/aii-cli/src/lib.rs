@@ -111,6 +111,22 @@ pub async fn run_send_raw_tx(rpc: &str, raw_hex: &str) -> Result<String, CliErro
     Ok(h)
 }
 
+/// Run `aii release rollback --rpc URL` (v0.0.80).
+///
+/// Hits the target node's `aii_rollbackRelease` to restore the
+/// pre-install snapshot at `<data-dir>/releases/.previous` over
+/// the running binary and `execve` self into it. Returns the
+/// node's `InstallReleaseResult` envelope verbatim.
+///
+/// # Errors
+///
+/// Transport failure or a non-success JSON-RPC reply.
+pub async fn run_rollback_release(rpc: &str) -> Result<aii_rpc::InstallReleaseResult, CliError> {
+    let c = client(rpc)?;
+    let r: aii_rpc::InstallReleaseResult = c.request("aii_rollbackRelease", rpc_params![]).await?;
+    Ok(r)
+}
+
 // ──────────────────────── Sub-chain runner (v0.0.38) ────────────────────────
 
 /// One sub-chain → parent-chain flush record.

@@ -295,6 +295,22 @@ pub trait RpcState: Send + Sync + 'static {
             restart_in_secs: 0,
         }
     }
+
+    /// Roll the running binary back to the snapshot saved at
+    /// `<data-dir>/releases/.previous` (v0.0.80). Composes the
+    /// inverse of [`Self::install_release`]: restore the
+    /// snapshot atomically, then `execve` self into it. The
+    /// rollback itself is reversible — after the swap,
+    /// `.previous` holds the bytes we rolled away from, so a
+    /// second `rollback_release` call flips the pair back.
+    /// Default returns "not supported".
+    async fn rollback_release(&self) -> InstallOutcome {
+        InstallOutcome {
+            scheduled: false,
+            reason: "node does not support release rollback".into(),
+            restart_in_secs: 0,
+        }
+    }
 }
 
 /// Result type carried back from [`RpcState::install_release`].
@@ -621,6 +637,18 @@ pub trait AiiRpc {
     /// the JSON-RPC reply makes it back to the caller.
     #[method(name = "installRelease")]
     async fn install_release(&self, version: String) -> RpcResult<InstallReleaseResult>;
+
+    /// `aii_rollbackRelease()` — restore the binary saved at
+    /// `<data-dir>/releases/.previous` over the running `aiid`
+    /// and `execve` into it (v0.0.80). The pre-install
+    /// snapshot is written by [`Self::install_release`] just
+    /// before it clobbers the running binary, so a rollback is
+    /// available iff at least one install has happened since
+    /// the data directory was created. Reversible: a second
+    /// rollback flips back to whatever was running before the
+    /// first.
+    #[method(name = "rollbackRelease")]
+    async fn rollback_release(&self) -> RpcResult<InstallReleaseResult>;
 }
 
 /// Wire shape for the release manifest exchanged over JSON-RPC.
@@ -1123,6 +1151,11 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
         let outcome = self.state.install_release(&version).await;
         Ok(outcome.into())
     }
+
+    async fn rollback_release(&self) -> RpcResult<InstallReleaseResult> {
+        let outcome = self.state.rollback_release().await;
+        Ok(outcome.into())
+    }
 }
 
 fn parse_address(s: &str) -> RpcResult<Address> {
@@ -1483,6 +1516,26 @@ mod tests {
                 }
             }
         }
+        // v0.0.80: in-test rollback simulates success when at
+        // least one binary has been cached (treating "binary
+        // exists in fixture" as a proxy for "a pre-install
+        // snapshot also exists"). Otherwise rejects.
+        async fn rollback_release(&self) -> InstallOutcome {
+            let any = !self.binaries.lock().unwrap().is_empty();
+            if any {
+                InstallOutcome {
+                    scheduled: true,
+                    reason: String::new(),
+                    restart_in_secs: 2,
+                }
+            } else {
+                InstallOutcome {
+                    scheduled: false,
+                    reason: "no pre-install snapshot".into(),
+                    restart_in_secs: 0,
+                }
+            }
+        }
     }
 
     fn release_fixture() -> Arc<ReleaseTestState> {
@@ -1802,6 +1855,47 @@ mod tests {
         assert!(!r.scheduled);
         assert!(!r.reason.is_empty());
         assert_eq!(r.restart_in_secs, 0);
+        h.stop().unwrap();
+    }
+
+    /// v0.0.80 — aii_rollbackRelease happy path: with a binary
+    /// pre-loaded in the fixture (proxy for a previous install
+    /// having snapshotted), the RPC returns scheduled = true.
+    #[tokio::test]
+    async fn aii_rollback_release_returns_scheduled_when_snapshot_present() {
+        let fixture = release_fixture();
+        fixture
+            .binaries
+            .lock()
+            .unwrap()
+            .insert("0.0.80".to_string(), b"prior".to_vec());
+        let (addr, handle) = serve("127.0.0.1:0".parse().unwrap(), fixture)
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let c = HttpClientBuilder::default().build(url).unwrap();
+        let r: InstallReleaseResult = c
+            .request("aii_rollbackRelease", rpc_params![])
+            .await
+            .unwrap();
+        assert!(r.scheduled, "rollback must succeed with snapshot: {r:?}");
+        assert!(r.restart_in_secs > 0);
+        assert!(r.reason.is_empty());
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.80 — aii_rollbackRelease rejects with reason when no
+    /// snapshot has been recorded.
+    #[tokio::test]
+    async fn aii_rollback_release_rejects_when_no_snapshot() {
+        let (url, h) = spawn_release().await;
+        let c = HttpClientBuilder::default().build(url).unwrap();
+        let r: InstallReleaseResult = c
+            .request("aii_rollbackRelease", rpc_params![])
+            .await
+            .unwrap();
+        assert!(!r.scheduled);
+        assert!(r.reason.contains("snapshot") || r.reason.contains("rollback"));
         h.stop().unwrap();
     }
 }
