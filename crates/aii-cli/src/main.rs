@@ -174,6 +174,15 @@ enum ReleaseCmd {
         #[arg(long)]
         pubkey: Option<String>,
     },
+    /// Restore the binary saved at `<data-dir>/releases/.previous`
+    /// over the running `aiid` and `execve` into it (v0.0.80).
+    /// Reversible: a second `rollback` call flips back to the
+    /// previously-running binary.
+    Rollback {
+        /// JSON-RPC endpoint of the target node.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -353,7 +362,23 @@ async fn main() -> Result<(), CliError> {
             }
         }
         Cmd::Release { sub } => {
-            handle_release_cmd(sub, cli.json)?;
+            // v0.0.80 — async-only rollback subcommand peels off
+            // here; everything else stays in the sync handler.
+            if let ReleaseCmd::Rollback { rpc } = &sub {
+                let r = aii_cli::run_rollback_release(rpc).await?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&r)?);
+                } else if r.scheduled {
+                    println!(
+                        "scheduled rollback to .previous; node will restart in {} s",
+                        r.restart_in_secs
+                    );
+                } else {
+                    println!("rollback rejected: {}", r.reason);
+                }
+            } else {
+                handle_release_cmd(sub, cli.json)?;
+            }
         }
         Cmd::Stress {
             chain_id,
@@ -656,6 +681,15 @@ fn handle_release_cmd(sub: ReleaseCmd, json_out: bool) -> Result<(), CliError> {
                     &pk.to_hex()[..16]
                 );
             }
+        }
+        // Rollback is handled in the async dispatch in main.rs
+        // (needs to await an HTTP RPC call); reaching it here
+        // means the dispatch shortcut was bypassed somehow.
+        ReleaseCmd::Rollback { .. } => {
+            return Err(CliError::Client(
+                "release rollback is dispatched in main(); reaching the sync handler is a bug"
+                    .into(),
+            ));
         }
     }
     Ok(())

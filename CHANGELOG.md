@@ -5,6 +5,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.80] — 2026-05-27
+
+### Added — pre-install snapshot + rollback safety net
+
+Closes the loop on the auto-update protocol's last remaining
+sharp edge: a bad release pushed to every validator can no
+longer brick the network with no recovery path. Every install
+now atomically snapshots the running binary to
+`<data-dir>/releases/.previous` before clobbering it, and a new
+RPC + CLI exposes one-shot rollback.
+
+The same trust boundary still applies — only a manifest signed
+with the pinned project pubkey reaches the install path — but
+the consequence of "the operator signed the wrong binary" is
+now "type `aii release rollback`" instead of "drive to the
+data center."
+
+#### `aii-node::release_install`
+
+- `PREVIOUS_NAME = ".previous"` constant — fixed filename
+  inside the release store. Dot-prefix avoids collision with a
+  real release version (all versions are semver-ish, never
+  start with `.`).
+- `previous_path(releases_dir) -> PathBuf`.
+- `save_previous(current_exe, releases_dir) -> io::Result<PathBuf>` —
+  copies the running binary into `<releases_dir>/.previous`
+  atomically via `<target>.new` + `rename(2)`, with `0o755`.
+- `rollback_to_previous(releases_dir, target) -> io::Result<PathBuf>` —
+  reversible swap. Moves `.previous` to a holding path, snaps
+  the current target into `.previous`, then installs the held
+  bytes back onto target. After the call `.previous` holds the
+  bytes we rolled away from, so a second rollback flips the
+  pair back.
+- 5 unit tests: atomic snapshot write + executable bit;
+  overwrites existing; rollback round-trip; rollback is
+  reversible via a second call; rollback returns NotFound
+  with no `.previous` and leaves the target untouched.
+
+#### `aii-node::NodeState`
+
+- `RpcState::install_release` now calls `save_previous` before
+  `install_binary`. Snapshot failure is logged at WARN and the
+  install proceeds — we'd rather ship the binary without a
+  rollback option than refuse the install over a transient
+  I/O hiccup.
+- New `RpcState::rollback_release` impl on Unix: resolves data
+  dir + target (with the v0.0.78 `install_target_override` for
+  tests), invokes `rollback_to_previous`, then spawns the same
+  `exec_self_at(target)` self-restart task.
+- 2 lib-level integration tests verify install → rollback → roll
+  forward via a second rollback, and the fail-soft path when no
+  snapshot exists.
+
+#### `aii-rpc`
+
+- New `aii_rollbackRelease() -> InstallReleaseResult` JSON-RPC
+  method. Same envelope as install for client symmetry.
+- New `RpcState::rollback_release` trait method with a
+  "not supported" default.
+- 2 RPC integration tests cover the happy path and the
+  no-snapshot rejection.
+
+#### `aii-cli`
+
+- New `aii release rollback --rpc URL` subcommand. Async
+  dispatch in `main()` (the existing sync `handle_release_cmd`
+  can't await an HTTP RPC call); pretty-prints
+  `scheduled rollback to .previous; node will restart in 2 s`
+  on success, `rollback rejected: …` on failure.
+- New `aii_cli::run_rollback_release(rpc)` helper for
+  integrators that want the typed result.
+
+### Scope discipline
+
+Out of scope for v0.0.80, explicitly:
+
+- **Boot-health watchdog** that auto-rolls-back when the new
+  binary fails to come up. The current rollback is operator-
+  initiated; an automatic rollback needs a "did I reach a
+  known-good state within N seconds of startup?" signal,
+  which couples this layer to consensus health and is best
+  shipped after the late-joiner re-poll lands.
+- **Late-joiner periodic `aii_latestRelease` poll** against
+  the update-peer list. Nodes that miss the gossip wave
+  (offline at announce time) currently have no way to
+  discover a release was made; will land in v0.0.81.
+- **Pubkey rotation.** Still pinned at compile time.
+
 ## [0.0.79] — 2026-05-27
 
 ### Fixed — v0.0.78 install hotfix (now actually works in production)

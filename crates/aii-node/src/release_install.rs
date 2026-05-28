@@ -43,6 +43,106 @@ pub const NEW_SUFFIX: &str = ".new";
 /// typically have under `/usr/local/bin`.
 pub const INSTALLED_MODE: u32 = 0o755;
 
+/// File name of the pre-install snapshot inside the release
+/// store (v0.0.80).
+///
+/// Lives at `<data-dir>/releases/<PREVIOUS_NAME>` and holds a
+/// byte-for-byte copy of the binary that was running just
+/// before the most recent `install_binary` call. The rollback
+/// path reads it back via [`rollback_to_previous`].
+///
+/// The dot-prefix avoids collision with a hypothetical release
+/// version literally named `previous` — release versions are
+/// semver-ish (`0.0.80`) and never start with `.`.
+pub const PREVIOUS_NAME: &str = ".previous";
+
+/// Resolve the on-disk path of the pre-install snapshot.
+#[must_use]
+pub fn previous_path(releases_dir: &Path) -> PathBuf {
+    releases_dir.join(PREVIOUS_NAME)
+}
+
+/// Snapshot the currently-running aiid binary at `current_exe`
+/// into `<releases_dir>/<PREVIOUS_NAME>` (v0.0.80).
+///
+/// Call this BEFORE [`install_binary`] so the rollback path
+/// has something to restore. Writes atomically via
+/// `<target>.new` + `rename(2)` so a crash mid-copy never
+/// leaves a half-written `.previous` that pretends to be a
+/// valid binary.
+///
+/// # Errors
+///
+/// I/O failures from mkdir, copy, set_permissions, or rename.
+pub fn save_previous(current_exe: &Path, releases_dir: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(releases_dir)?;
+    let target = previous_path(releases_dir);
+    let staging = path_with_suffix(&target, NEW_SUFFIX);
+    if staging.exists() {
+        fs::remove_file(&staging)?;
+    }
+    fs::copy(current_exe, &staging)?;
+    let mut perm = fs::metadata(&staging)?.permissions();
+    perm.set_mode(INSTALLED_MODE);
+    fs::set_permissions(&staging, perm)?;
+    fs::rename(&staging, &target)?;
+    Ok(target)
+}
+
+/// Roll the binary at `target` back to the snapshot stored at
+/// `<releases_dir>/<PREVIOUS_NAME>` (v0.0.80).
+///
+/// Composes [`save_previous`] (snapshot current as the *new*
+/// `.previous` before clobbering it) with [`install_binary`]
+/// (atomic rename of the old `.previous` over the running
+/// binary). After this call:
+///
+/// 1. The previously-running bytes are now at `target`.
+/// 2. The bytes that were at `target` going in are now at
+///    `<releases_dir>/<PREVIOUS_NAME>`, so you can roll
+///    forward again with another rollback if needed.
+///
+/// Returns the absolute path of the now-installed
+/// (previously-snapshotted) binary on success.
+///
+/// # Errors
+///
+/// - `io::ErrorKind::NotFound` if `.previous` doesn't exist
+///   (typical on a node that has never installed a release).
+/// - Any I/O failure from the underlying copy / chmod /
+///   rename steps.
+pub fn rollback_to_previous(releases_dir: &Path, target: &Path) -> io::Result<PathBuf> {
+    let previous = previous_path(releases_dir);
+    if !previous.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no pre-install snapshot at {} — nothing to roll back to",
+                previous.display()
+            ),
+        ));
+    }
+    // We need to swap target ↔ .previous atomically-ish. Move
+    // .previous to a holding path FIRST so the upcoming
+    // save_previous (which writes `.previous`) doesn't clobber
+    // the bytes we want to restore. After the swap the operator
+    // can roll back a second time to flip back to whatever was
+    // running at the start of this call.
+    let holding = path_with_suffix(&previous, ".roll");
+    if holding.exists() {
+        fs::remove_file(&holding)?;
+    }
+    fs::rename(&previous, &holding)?;
+    // Snapshot the about-to-be-replaced bytes as the new
+    // `.previous` so a second rollback flips the pair back.
+    let _: PathBuf = save_previous(target, releases_dir)?;
+    // Overlay the held snapshot onto `target`.
+    let installed = install_binary(&holding, target);
+    // Clean up holding regardless of install outcome.
+    let _ = fs::remove_file(&holding);
+    installed
+}
+
 /// Replace `target` with the bytes of `staged` atomically.
 ///
 /// Steps:
@@ -247,5 +347,96 @@ mod tests {
         let p = current_aiid_path().unwrap();
         assert!(p.is_absolute(), "current_exe must be absolute, got {p:?}");
         assert!(p.exists(), "current_exe must exist at {p:?}");
+    }
+
+    #[test]
+    fn save_previous_writes_atomic_executable_snapshot() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let current = dir.join("aiid");
+        fs::write(&current, b"RUNNING BYTES").unwrap();
+        let snap = save_previous(&current, &releases).unwrap();
+        assert_eq!(snap, releases.join(PREVIOUS_NAME));
+        assert!(snap.exists());
+        assert_eq!(fs::read(&snap).unwrap(), b"RUNNING BYTES");
+        let mode = fs::metadata(&snap).unwrap().mode() & 0o777;
+        assert_eq!(mode, INSTALLED_MODE, "snapshot must be +x");
+        // .new staging file must not survive.
+        let staging = path_with_suffix(&snap, NEW_SUFFIX);
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn save_previous_overwrites_existing_snapshot() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let current = dir.join("aiid");
+        fs::write(&current, b"FIRST").unwrap();
+        save_previous(&current, &releases).unwrap();
+        // Update current and re-snapshot — should replace.
+        fs::write(&current, b"SECOND").unwrap();
+        let snap = save_previous(&current, &releases).unwrap();
+        assert_eq!(fs::read(&snap).unwrap(), b"SECOND");
+    }
+
+    #[test]
+    fn rollback_swaps_target_with_previous() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let target = dir.join("aiid");
+
+        // Set up: target = "NEW", .previous = "OLD".
+        fs::write(&target, b"NEW").unwrap();
+        fs::create_dir_all(&releases).unwrap();
+        fs::write(releases.join(PREVIOUS_NAME), b"OLD").unwrap();
+
+        let installed = rollback_to_previous(&releases, &target).unwrap();
+        assert_eq!(installed, target);
+        assert_eq!(fs::read(&target).unwrap(), b"OLD", "target restored");
+        // After rollback, .previous now holds the bytes we
+        // rolled away from, so the operator can roll forward
+        // again by calling rollback a second time.
+        assert_eq!(
+            fs::read(releases.join(PREVIOUS_NAME)).unwrap(),
+            b"NEW",
+            ".previous holds the rolled-away-from bytes"
+        );
+        // Holding file must be cleaned up.
+        let holding = releases.join(format!("{PREVIOUS_NAME}.roll"));
+        assert!(!holding.exists());
+    }
+
+    #[test]
+    fn rollback_is_reversible_via_second_call() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let target = dir.join("aiid");
+        fs::write(&target, b"VERSION_B").unwrap();
+        fs::create_dir_all(&releases).unwrap();
+        fs::write(releases.join(PREVIOUS_NAME), b"VERSION_A").unwrap();
+
+        // First rollback: B → A
+        rollback_to_previous(&releases, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"VERSION_A");
+        // Second rollback: A → B (because .previous now holds B)
+        rollback_to_previous(&releases, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"VERSION_B");
+    }
+
+    #[test]
+    fn rollback_returns_not_found_when_previous_missing() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let target = dir.join("aiid");
+        fs::write(&target, b"UNCHANGED").unwrap();
+        fs::create_dir_all(&releases).unwrap();
+
+        let err = rollback_to_previous(&releases, &target).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"UNCHANGED",
+            "target must not be touched when there's nothing to roll back to"
+        );
     }
 }
