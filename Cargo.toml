@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.81"
+version = "0.0.82"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -52,33 +52,33 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 
-aii-types = { path = "crates/aii-types", version = "0.0.81" }
-aii-codec = { path = "crates/aii-codec", version = "0.0.81" }
-aii-crypto = { path = "crates/aii-crypto", version = "0.0.81" }
-aii-storage = { path = "crates/aii-storage", version = "0.0.81" }
-aii-block = { path = "crates/aii-block", version = "0.0.81" }
-aii-state = { path = "crates/aii-state", version = "0.0.81" }
-aii-config = { path = "crates/aii-config", version = "0.0.81" }
-aii-consensus-iface = { path = "crates/aii-consensus-iface", version = "0.0.81" }
-aii-metrics = { path = "crates/aii-metrics", version = "0.0.81" }
-aii-wallet = { path = "crates/aii-wallet", version = "0.0.81" }
-aii-vnode = { path = "crates/aii-vnode", version = "0.0.81" }
-aii-net-txpool = { path = "crates/aii-net-txpool", version = "0.0.81" }
-aii-microchain = { path = "crates/aii-microchain", version = "0.0.81" }
-aii-rpc = { path = "crates/aii-rpc", version = "0.0.81" }
-aii-node = { path = "crates/aii-node", version = "0.0.81" }
-aii-evm = { path = "crates/aii-evm", version = "0.0.81" }
-aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.81" }
-aii-net-sync = { path = "crates/aii-net-sync", version = "0.0.81" }
-aii-onboarding = { path = "crates/aii-onboarding", version = "0.0.81" }
-aii-cli = { path = "crates/aii-cli", version = "0.0.81" }
-aii-mcp = { path = "crates/aii-mcp", version = "0.0.81" }
-aii-consensus-bft = { path = "crates/aii-consensus-bft", version = "0.0.81" }
-aii-consensus-poa = { path = "crates/aii-consensus-poa", version = "0.0.81" }
-aii-crosschain = { path = "crates/aii-crosschain", version = "0.0.81" }
-aii-wasm = { path = "crates/aii-wasm", version = "0.0.81" }
-aii-wasm-state = { path = "crates/aii-wasm-state", version = "0.0.81" }
-aii-erc20 = { path = "crates/aii-erc20", version = "0.0.81" }
+aii-types = { path = "crates/aii-types", version = "0.0.82" }
+aii-codec = { path = "crates/aii-codec", version = "0.0.82" }
+aii-crypto = { path = "crates/aii-crypto", version = "0.0.82" }
+aii-storage = { path = "crates/aii-storage", version = "0.0.82" }
+aii-block = { path = "crates/aii-block", version = "0.0.82" }
+aii-state = { path = "crates/aii-state", version = "0.0.82" }
+aii-config = { path = "crates/aii-config", version = "0.0.82" }
+aii-consensus-iface = { path = "crates/aii-consensus-iface", version = "0.0.82" }
+aii-metrics = { path = "crates/aii-metrics", version = "0.0.82" }
+aii-wallet = { path = "crates/aii-wallet", version = "0.0.82" }
+aii-vnode = { path = "crates/aii-vnode", version = "0.0.82" }
+aii-net-txpool = { path = "crates/aii-net-txpool", version = "0.0.82" }
+aii-microchain = { path = "crates/aii-microchain", version = "0.0.82" }
+aii-rpc = { path = "crates/aii-rpc", version = "0.0.82" }
+aii-node = { path = "crates/aii-node", version = "0.0.82" }
+aii-evm = { path = "crates/aii-evm", version = "0.0.82" }
+aii-net-p2p = { path = "crates/aii-net-p2p", version = "0.0.82" }
+aii-net-sync = { path = "crates/aii-net-sync", version = "0.0.82" }
+aii-onboarding = { path = "crates/aii-onboarding", version = "0.0.82" }
+aii-cli = { path = "crates/aii-cli", version = "0.0.82" }
+aii-mcp = { path = "crates/aii-mcp", version = "0.0.82" }
+aii-consensus-bft = { path = "crates/aii-consensus-bft", version = "0.0.82" }
+aii-consensus-poa = { path = "crates/aii-consensus-poa", version = "0.0.82" }
+aii-crosschain = { path = "crates/aii-crosschain", version = "0.0.82" }
+aii-wasm = { path = "crates/aii-wasm", version = "0.0.82" }
+aii-wasm-state = { path = "crates/aii-wasm-state", version = "0.0.82" }
+aii-erc20 = { path = "crates/aii-erc20", version = "0.0.82" }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [workspace.lints.rust]

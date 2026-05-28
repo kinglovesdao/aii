@@ -103,7 +103,11 @@ where
             binary_imported: false,
             note: String::new(),
         };
-        let client = match HttpClientBuilder::default().build(&peer_url) {
+        let client = match HttpClientBuilder::default()
+            .max_request_size(crate::MAX_REQUEST_BODY_SIZE)
+            .max_response_size(crate::MAX_RESPONSE_BODY_SIZE)
+            .build(&peer_url)
+        {
             Ok(c) => c,
             Err(e) => {
                 po.note = format!("client: {e}");

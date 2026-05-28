@@ -5,6 +5,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.82] — 2026-05-27
+
+### Fixed — v0.0.81 client-side body cap hotfix
+
+Live-testnet self-validation of the v0.0.81 late-joiner poller
+revealed that `release_poller::poll_once` and
+`release_gossip::propagate_release` build their outbound
+`HttpClient` with `HttpClientBuilder::default()`, which carries
+jsonrpsee's 10 MiB default `max_response_size`. The 16 MiB aiid
+binary hex-encodes to ~32 MiB, so the catch-up path got as far
+as accepting the manifest (small JSON), then silently failed to
+ingest the binary — `accepted_manifests=1 imported_binaries=0`,
+with `<data-dir>/releases/<version>` never created.
+
+The v0.0.79 fix bumped the SERVER's body caps to 128 MiB. The
+CLIENT side carries an independent default. Both
+`release_poller::poll_once` and
+`release_gossip::propagate_release` now build their
+`HttpClient` with `max_request_size` and `max_response_size`
+pinned to the shared `MAX_REQUEST_BODY_SIZE` /
+`MAX_RESPONSE_BODY_SIZE` constants.
+
+#### Live e2e self-validation result (post-fix)
+
+```
+04:24:31  A starts, release poller scheduled (interval=5s, peers=1)
+04:24:33  A's aii_latestRelease = null
+          [B has been pre-seeded with a signed manifest + 16 MiB binary]
+04:24:36  A accepts manifest 0.0.81-poll-test (sig verified locally)
+04:24:37  A imports 16,259,992-byte binary, sha256 verified
+04:24:37  release poll catch-up accepted_manifests=1 imported_binaries=1
+```
+
+Both `aii_latestRelease` and `<data-dir>/releases/<version>` on
+A match B after a single 5-second poll cycle.
+
+### Scope discipline
+
+This is a hotfix release; no new features. Same shape as the
+v0.0.79 fix — the failure was a quiet truncation in the
+transport layer that the unit tests couldn't catch because they
+exercise the trait via in-process calls, not real jsonrpsee
+HTTP round-trips with large bodies.
+
 ## [0.0.81] — 2026-05-27
 
 ### Added — late-joiner release re-poll
