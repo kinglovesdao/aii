@@ -1142,11 +1142,43 @@ fn parse_address(s: &str) -> RpcResult<Address> {
 }
 
 /// Bind an RPC server to `addr` backed by `state`.
+/// Cap on inbound JSON-RPC request body size.
+///
+/// jsonrpsee's default is 10 MiB, which truncates the
+/// hex-encoded `aii_importReleaseBinary` call for any aiid
+/// build above ~5 MiB (hex doubles the size). 128 MiB leaves
+/// comfortable headroom for the current ~16 MiB release binary
+/// while keeping the surface narrow enough to reject obvious
+/// abuse.
+pub const MAX_REQUEST_BODY_SIZE: u32 = 128 * 1024 * 1024;
+
+/// Cap on outbound JSON-RPC response body size.
+///
+/// `aii_getReleaseBinary` serves the cached binary as a hex
+/// string — the response is roughly 2× the binary size. Keep
+/// this in step with [`MAX_REQUEST_BODY_SIZE`].
+pub const MAX_RESPONSE_BODY_SIZE: u32 = 128 * 1024 * 1024;
+
+/// Bind an HTTP JSON-RPC server to `addr` backed by `state`.
+///
+/// Configures jsonrpsee with [`MAX_REQUEST_BODY_SIZE`] /
+/// [`MAX_RESPONSE_BODY_SIZE`] to accept the full hex-encoded
+/// release-binary payloads used by `aii_importReleaseBinary` and
+/// `aii_getReleaseBinary` (v0.0.76 onwards).
+///
+/// # Errors
+///
+/// I/O failure binding the socket or registering RPC modules.
 pub async fn serve<S: RpcState>(
     addr: SocketAddr,
     state: Arc<S>,
 ) -> Result<(SocketAddr, ServerHandle), RpcError> {
+    let cfg = jsonrpsee::server::ServerConfig::builder()
+        .max_request_body_size(MAX_REQUEST_BODY_SIZE)
+        .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
+        .build();
     let server = Server::builder()
+        .set_config(cfg)
         .build(addr)
         .await
         .map_err(RpcError::Bind)?;

@@ -5,6 +5,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.79] — 2026-05-27
+
+### Fixed — v0.0.78 install hotfix (now actually works in production)
+
+Live-testnet self-validation of v0.0.78 surfaced two showstopper
+bugs that made the auto-update path inoperable outside the unit-
+test harness. Both are fixed here. With this release the
+end-to-end flow (sign → announce → import → atomic install →
+`execve` self-restart) has been verified against a real running
+aiid binary, with the kernel reporting the same PID across the
+upgrade and `/proc/$PID/exe` resolving cleanly to the new file.
+
+#### `aii-rpc::serve` — bump JSON-RPC body cap to 128 MiB
+
+jsonrpsee's default `max_request_body_size` is 10 MiB. The
+hex-encoded `aii_importReleaseBinary` call for a ~16 MiB aiid
+build produces a ~32 MiB request body, which the server rejected
+with `-32007 "Request is too big"`. The binary never even
+reached the import handler, let alone the install path.
+
+- `MAX_REQUEST_BODY_SIZE = 128 MiB`
+- `MAX_RESPONSE_BODY_SIZE = 128 MiB`
+- `serve()` now builds a `ServerConfig` via
+  `ServerConfig::builder().max_*_body_size(...)` and passes it
+  through `Server::builder().set_config(cfg)`. This is the
+  jsonrpsee-0.26 idiom — the builder no longer exposes the
+  per-field setters directly.
+
+#### `aii-node::release_install::exec_self_at` — pass install target explicitly
+
+After `install_binary` swaps the running binary via `rename(2)`,
+the kernel marks `/proc/self/exe` with a literal `" (deleted)"`
+suffix. `std::env::current_exe()` then returns
+`/path/to/aiid (deleted)` — a string `execve` rejects with
+`ENOENT`. The install succeeded, the new bytes were on disk,
+but the self-restart never reached the new image.
+
+- New `exec_self_at(exe: &Path) -> io::Error` that `execve`s an
+  explicit path with the current process's argv (minus arg0)
+  and env. `exec_self()` keeps the old contract via this
+  function for callers that haven't replaced their binary
+  yet.
+- `RpcState::install_release` now captures `target` BEFORE the
+  rename and moves it into the spawned restart task, which calls
+  `exec_self_at(&exec_target)` instead of re-resolving via
+  `current_exe()`.
+
+#### Live testnet self-validation log
+
+A v0.0.79-built aiid was booted with `--auto-install-releases`,
+a manifest was signed with the pinned project secret, and the
+binary was imported via `aii_importReleaseBinary`. Outcome:
+
+- Manifest accepted ✓
+- 16,199,408 byte binary written to
+  `<data-dir>/releases/<version>` ✓
+- `auto-install conditions met; invoking install_release` ✓
+- `release installed; self-restart scheduled` ✓ (binary mtime
+  flipped)
+- 2 s later: `starting aiid …` with the **same PID** — execve
+  hot-swapped the process image ✓
+- `recovered persisted chain from data_dir recovered_head=2` ✓
+- `/proc/<PID>/exe -> /tmp/aii-v0078-test/bin/aiid` (no
+  `(deleted)`) ✓
+- Chain continued producing blocks (head reached 26 within 30 s
+  of the restart) ✓
+
+### Scope discipline
+
+This is a hotfix release; no new features. The 128 MiB cap was
+chosen as a defensive ceiling rather than a permanent design
+decision — when binaries grow past that the cap moves with
+them. Streaming binary transfer (chunked import) is a future
+slice when the per-binary size makes the in-memory hex payload
+genuinely uncomfortable.
+
 ## [0.0.78] — 2026-05-27
 
 ### Added — atomic install + execve self-restart
