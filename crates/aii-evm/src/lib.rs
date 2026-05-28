@@ -16,7 +16,7 @@ pub mod revm_db;
 pub mod revm_exec;
 
 pub use revm_db::RevmDb;
-pub use revm_exec::{execute_with_revm, ExecutionSummary};
+pub use revm_exec::{execute_with_revm, simulate_with_revm, ExecutionSummary, SimulationResult};
 
 use aii_block::{Bloom, Receipt, Tx, TxType};
 use aii_state::{Account, StateDb, StateError};

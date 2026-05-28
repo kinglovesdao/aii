@@ -1894,6 +1894,36 @@ impl RpcState for NodeState {
         self.update_peers()
     }
 
+    async fn simulate_call(
+        &self,
+        req: aii_rpc::SimulateCallParams,
+    ) -> Result<Vec<u8>, aii_rpc::SimulateCallError> {
+        // v0.0.88: route eth_call into aii_evm::simulate_with_revm.
+        // The simulation runs against the live committed state but
+        // never writes back — see simulate_with_revm's contract.
+        match aii_evm::simulate_with_revm(
+            &self.state,
+            req.from,
+            Some(req.to),
+            req.value,
+            req.data,
+            req.gas_limit,
+            req.gas_price,
+        ) {
+            Ok(sim) => {
+                if sim.success {
+                    Ok(sim.return_data)
+                } else {
+                    Err(aii_rpc::SimulateCallError::Reverted(
+                        sim.revert_reason
+                            .unwrap_or_else(|| "execution failed".to_string()),
+                    ))
+                }
+            }
+            Err(e) => Err(aii_rpc::SimulateCallError::Evm(e.to_string())),
+        }
+    }
+
     #[cfg(unix)]
     #[allow(clippy::too_many_lines)] // v0.0.78-v0.0.85 layered safety checks
     async fn install_release(&self, version: &str) -> aii_rpc::InstallOutcome {
@@ -2113,6 +2143,121 @@ mod tests {
         let client = HttpClientBuilder::default().build(url).unwrap();
         let chain_id: String = client.request("eth_chainId", rpc_params![]).await.unwrap();
         assert_eq!(chain_id, "0x63"); // 99
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.88 eth_call: a plain value-transfer simulation
+    /// returns 0x (empty return data) and leaves the
+    /// underlying state untouched.
+    #[tokio::test]
+    async fn eth_call_value_transfer_returns_empty_and_state_unchanged() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xaa; 20]);
+        let bob = aii_types::Address::new([0xbb; 20]);
+        let alice_balance = aii_types::U256::from(1_000_000_000_000_000_000_u128);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: alice_balance,
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        let req = serde_json::json!({
+            "from": format!("0x{}", hex::encode(alice.as_bytes())),
+            "to":   format!("0x{}", hex::encode(bob.as_bytes())),
+            "value": "0x16345785d8a0000", // 0.1 AII
+        });
+        let result: String = client
+            .request("eth_call", rpc_params![req, "latest"])
+            .await
+            .unwrap();
+        assert_eq!(result, "0x", "value-transfer call has empty return data");
+
+        // State must be untouched.
+        let alice_after = state.state.account(&alice).unwrap().unwrap();
+        assert_eq!(
+            alice_after.balance, alice_balance,
+            "eth_call must not modify sender balance",
+        );
+        let bob_after = state.state.account(&bob).unwrap();
+        assert!(
+            bob_after.is_none() || bob_after.unwrap().balance == aii_types::U256::ZERO,
+            "eth_call must not modify recipient balance",
+        );
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.88 eth_call against a contract that returns a
+    /// constant: the return data round-trips back through the
+    /// RPC as hex.
+    #[tokio::test]
+    async fn eth_call_against_deployed_contract_returns_constant() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa1; 20]);
+        let alice_balance = aii_types::U256::from(1_000_000_000_000_000_000_u128);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: alice_balance,
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // Deploy a contract whose runtime always returns 32
+        // bytes of 0x...77.
+        let runtime: Vec<u8> = vec![0x60, 0x77, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let deploy = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            None,
+            aii_types::U256::ZERO,
+            init,
+            500_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+        assert!(deploy.success);
+        let contract = deploy.deployed_contract.unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let req = serde_json::json!({
+            "from": format!("0x{}", hex::encode(alice.as_bytes())),
+            "to":   format!("0x{}", hex::encode(contract.as_bytes())),
+        });
+        let result: String = client
+            .request("eth_call", rpc_params![req, "latest"])
+            .await
+            .unwrap();
+        // 32 bytes, last byte 0x77.
+        assert_eq!(result.len(), 2 + 64); // "0x" + 64 hex chars
+        assert!(result.ends_with("77"));
         handle.stop().unwrap();
     }
 
