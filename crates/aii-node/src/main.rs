@@ -159,6 +159,27 @@ struct Cli {
     release_poll_secs: u64,
 }
 
+/// Resolve the effective bootnode URL for cold-sync and follow-loop
+/// purposes (v0.0.83).
+///
+/// Precedence:
+/// 1. Explicit `--bootnode URL`.
+/// 2. First entry of `--update-peers` (already parsed to HTTP URLs).
+/// 3. `None` — no implicit fallback available; bootstrap-sync skips.
+///
+/// Reusing `--update-peers[0]` means an operator who configured the
+/// v0.0.77 release-gossip peer list automatically gets the v0.0.69
+/// cold-sync recovery path on every restart, without needing to
+/// also pass `--bootnode`. Solves the post-deploy BFT stall pattern
+/// observed in v0.0.82 production rollout.
+#[must_use]
+fn effective_bootnode(explicit: Option<&str>, update_peers: &[String]) -> Option<String> {
+    if let Some(b) = explicit {
+        return Some(b.to_string());
+    }
+    update_peers.first().cloned()
+}
+
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
     let s = s.trim_start_matches("0x");
     let raw = hex::decode(s).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -288,13 +309,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // v0.0.76: tell the state where to put release-binary cache files.
     node_state.set_data_dir(cli.data_dir.clone());
     // v0.0.77: populate the release-gossip peer list.
-    {
-        let peers = aii_rpc::release_gossip::parse_update_peers(&cli.update_peers);
-        if !peers.is_empty() {
-            tracing::info!(peers = ?peers, "release-gossip peers configured");
-        }
-        node_state.set_update_peers(peers);
+    let update_peers = aii_rpc::release_gossip::parse_update_peers(&cli.update_peers);
+    if !update_peers.is_empty() {
+        tracing::info!(peers = ?update_peers, "release-gossip peers configured");
     }
+    node_state.set_update_peers(update_peers.clone());
+
     // v0.0.78: opt-in atomic install + execve self-restart on
     // release accept. Off by default.
     node_state.set_auto_install_releases(cli.auto_install_releases);
@@ -302,12 +322,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("auto-install of accepted releases is ENABLED");
     }
 
+    // v0.0.83: implicit bootnode fallback. When `--bootnode` is not
+    // set but `--update-peers` is, use the first update-peer URL as
+    // the cold-sync source. This addresses the post-restart BFT
+    // stall observed during the v0.0.82 production deploy: any node
+    // that fell behind by even 1 block during a 1-second restart
+    // window could not catch up via BFT alone (the engine doesn't
+    // re-propose finalised blocks), so a `bootstrap_sync_from_peer`
+    // call was required — but it only ran when `--bootnode` was
+    // explicitly configured. Any operator who configured
+    // `--update-peers` for the v0.0.77 gossip flow already has the
+    // right peer URLs handy; reusing them as the implicit
+    // bootnode/follow source means an explicit `--bootnode` is
+    // only ever needed for asymmetric topologies (bootnode != peer).
+    let effective_bootnode = effective_bootnode(cli.bootnode.as_deref(), &update_peers);
+    if cli.bootnode.is_none() {
+        if let Some(implicit) = effective_bootnode.as_deref() {
+            tracing::info!(
+                bootnode = %implicit,
+                source = "update-peers[0]",
+                "no --bootnode set; using first --update-peers URL as implicit cold-sync source (v0.0.83)",
+            );
+        }
+    }
+
     // Cold-join sync: catch up to the bootnode's head before opening
-    // RPC. Skips when no bootnode is set or when the peer is at/below
-    // our local head. Each fetched block goes through the same
-    // commit_block path as a freshly produced one — so state mutations
-    // (including subsidy minting) run as part of catch-up.
-    if let Some(boot_url) = cli.bootnode.as_deref() {
+    // RPC. Skips when no bootnode is set (explicit or implicit) or
+    // when the peer is at/below our local head. Each fetched block
+    // goes through the same commit_block path as a freshly produced
+    // one — so state mutations (including subsidy minting) run as
+    // part of catch-up.
+    if let Some(boot_url) = effective_bootnode.as_deref() {
         match aii_node::bootstrap_sync_from_peer(&node_state, boot_url).await {
             Ok(synced) => tracing::info!(
                 head = node_state.head_block_number_sync(),
@@ -692,8 +737,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // follow_seconds is 0. Implicitly requires `--no-produce-blocks`
     // (otherwise the local DevMode/BFT producer would fork the chain
     // off the bootnode's head).
-    let follow_handle = if cli.follow_seconds > 0 && cli.bootnode.is_some() {
-        let url = cli.bootnode.clone().unwrap();
+    let follow_handle = if cli.follow_seconds > 0 && effective_bootnode.is_some() {
+        let url = effective_bootnode.clone().unwrap();
         let interval = Duration::from_secs(cli.follow_seconds);
         let state = Arc::clone(&node_state);
         Some(tokio::spawn(async move {
@@ -753,4 +798,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         h.abort();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_bootnode;
+
+    #[test]
+    fn explicit_bootnode_wins_over_update_peers() {
+        let peers = vec![
+            "http://peer-a:8545".to_string(),
+            "http://peer-b:8545".to_string(),
+        ];
+        let got = effective_bootnode(Some("http://explicit:8545"), &peers);
+        assert_eq!(got.as_deref(), Some("http://explicit:8545"));
+    }
+
+    #[test]
+    fn falls_back_to_first_update_peer_when_explicit_is_none() {
+        let peers = vec![
+            "http://peer-a:8545".to_string(),
+            "http://peer-b:8545".to_string(),
+        ];
+        let got = effective_bootnode(None, &peers);
+        assert_eq!(got.as_deref(), Some("http://peer-a:8545"));
+    }
+
+    #[test]
+    fn returns_none_when_both_empty() {
+        let got = effective_bootnode(None, &[]);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn explicit_wins_even_when_update_peers_is_empty() {
+        let got = effective_bootnode(Some("http://explicit:8545"), &[]);
+        assert_eq!(got.as_deref(), Some("http://explicit:8545"));
+    }
+
+    #[test]
+    fn fallback_ignores_later_peers_when_first_exists() {
+        // Even if peer-a is unreachable later, we still pick it
+        // here — connectivity is bootstrap_sync_from_peer's
+        // problem, not the selector's.
+        let peers = vec![
+            "http://peer-a:8545".to_string(),
+            "http://peer-b:8545".to_string(),
+        ];
+        let got = effective_bootnode(None, &peers);
+        assert_eq!(got.as_deref(), Some("http://peer-a:8545"));
+    }
 }

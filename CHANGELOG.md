@@ -5,6 +5,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.83] — 2026-05-28
+
+### Fixed — implicit bootnode fallback from `--update-peers`
+
+The v0.0.82 cross-pacific production deploy surfaced a sharp edge
+that wasn't caught in unit tests or single-node e2e: any node that
+took **even 1 second of downtime** during a binary swap would fall
+behind by 1 block (because the other 2 validators kept reaching
+quorum without it), and then permanently strand itself because the
+BFT engine has no "I'm behind, pull blocks from a peer" fallback —
+it only knows how to vote on the next height.
+
+The cold-sync code path that handles exactly this case
+(`bootstrap_sync_from_peer`) already exists from v0.0.69, but it
+only ran when the operator explicitly set `--bootnode URL`. On the
+JP swap the systemd unit had no `--bootnode`, so the node came up
+without sync and stuck. Recovery required SSH'ing in, editing the
+unit, `daemon-reload`, and restarting.
+
+#### `aii-node::main` (binary)
+
+- New `effective_bootnode(explicit, update_peers) -> Option<String>`
+  selector: prefer `--bootnode`; otherwise fall back to the first
+  entry of `--update-peers`. Returns `None` when both are empty.
+- The startup cold-sync block now uses `effective_bootnode(...)` in
+  place of `cli.bootnode`. Same for the `--follow-seconds` loop.
+- An INFO log line announces when the implicit fallback fires, so
+  the source of the catch-up URL is unambiguous in production logs.
+
+#### Why reuse `--update-peers` instead of adding a new flag
+
+Every operator who configured the v0.0.77 release-gossip flow
+already has the right peer HTTP-RPC URLs in their systemd unit. A
+separate `--catchup-peers` flag would be one more knob to
+misconfigure — and miss the JP-style stall scenario. Asymmetric
+topologies (different bootnode than gossip peer) can still set
+`--bootnode` explicitly, which takes precedence.
+
+### Production deploy lesson (recorded for posterity)
+
+The auto-update protocol's `execve` same-PID path (v0.0.78) avoids
+this entire scenario because there's no downtime — the kernel
+hands the new binary the open BFT sockets mid-flight. But that
+path is only available once every node is already running v0.0.74+.
+The FIRST upgrade from a pre-release-RPC binary to a release-RPC
+binary always goes through a systemd stop/start, which is where
+the stall came from. With this fix, that first upgrade is
+recoverable without operator intervention as long as
+`--update-peers` is set on the unit.
+
+### Scope discipline
+
+Out of scope for v0.0.83, explicitly:
+
+- **Runtime BFT catch-up watchdog.** A node that falls behind
+  AFTER startup (e.g., due to a transient network partition) still
+  needs an external restart to trigger
+  `bootstrap_sync_from_peer`. A cleaner solution would be a tokio
+  task that periodically checks `(head_block_number, last_advance_ts)`
+  and triggers an in-place sync when stalled. The in-place sync's
+  interaction with the running BFT engine needs design work
+  (engine state would be stale after the sync), so it lands later.
+- **Multi-peer fallback order.** Currently uses
+  `update_peers[0]` unconditionally. A future slice could rotate
+  through the list on connection failure.
+
 ## [0.0.82] — 2026-05-27
 
 ### Fixed — v0.0.81 client-side body cap hotfix
