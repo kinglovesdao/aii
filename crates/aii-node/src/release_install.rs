@@ -347,6 +347,98 @@ pub fn clear_boot_pending(releases_dir: &Path) -> io::Result<()> {
     }
 }
 
+// ────────────────────── v0.0.86: restart rate limiting ──────────────────────
+
+/// File name of the restart-log inside the release store.
+///
+/// Persistent, append-driven log of recent automatic restart
+/// events (stall recovery via `exec_self`, boot-health
+/// rollback). Used to break crash-loops: when too many
+/// auto-restarts happen in a short window, the watchdogs back
+/// off and leave the node in its current state for operator
+/// inspection.
+pub const RESTART_LOG_NAME: &str = ".restart-log";
+
+/// On-disk record of recent automatic-restart timestamps.
+///
+/// Events are unix-seconds, sorted ascending. The list is
+/// pruned to the trailing window on every read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RestartLog {
+    /// Timestamps of past automatic restarts, oldest first.
+    pub events: Vec<u64>,
+}
+
+/// Resolve the on-disk path of the restart-log.
+#[must_use]
+pub fn restart_log_path(releases_dir: &Path) -> PathBuf {
+    releases_dir.join(RESTART_LOG_NAME)
+}
+
+/// Read the restart-log, returning an empty log if the file
+/// doesn't exist or is unparseable.
+///
+/// **Why permissive**: a missing or corrupt log is "we don't
+/// have data about previous restarts." Treating that as "no
+/// previous restarts" is the safe failure mode — the rate
+/// limiter will allow the FIRST auto-restart, which is fine.
+/// Treating it as "infinite previous restarts" would brick the
+/// recovery path on a fresh node.
+pub fn read_restart_log(releases_dir: &Path) -> RestartLog {
+    let path = restart_log_path(releases_dir);
+    let Ok(bytes) = fs::read(&path) else {
+        return RestartLog::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Append a restart event at unix-seconds `ts` and prune the
+/// log to events within the trailing `window_secs`.
+///
+/// Atomic via `.tmp` + `rename(2)` (same pattern as
+/// [`write_boot_pending`]).
+///
+/// # Errors
+///
+/// I/O failures from mkdir, write, or rename.
+pub fn append_restart_event(releases_dir: &Path, ts: u64, window_secs: u64) -> io::Result<()> {
+    fs::create_dir_all(releases_dir)?;
+    let mut log = read_restart_log(releases_dir);
+    log.events.push(ts);
+    let cutoff = ts.saturating_sub(window_secs);
+    log.events.retain(|t| *t >= cutoff);
+    log.events.sort_unstable();
+    let json =
+        serde_json::to_vec(&log).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let target = restart_log_path(releases_dir);
+    let staging = path_with_suffix(&target, NEW_SUFFIX);
+    if staging.exists() {
+        fs::remove_file(&staging)?;
+    }
+    fs::write(&staging, &json)?;
+    fs::rename(&staging, &target)?;
+    Ok(())
+}
+
+/// Decide whether a restart is allowed under the current
+/// rolling-window policy.
+///
+/// `now` is unix-seconds, `window_secs` is the rolling window
+/// width, `max_in_window` is the cap. A `0` cap disables the
+/// gate (always allow); use that when the operator explicitly
+/// turns rate-limiting off.
+///
+/// Pure function — no I/O, easily unit-testable.
+#[must_use]
+pub fn restart_allowed(log: &RestartLog, now: u64, window_secs: u64, max_in_window: u32) -> bool {
+    if max_in_window == 0 {
+        return true;
+    }
+    let cutoff = now.saturating_sub(window_secs);
+    let in_window = log.events.iter().filter(|t| **t >= cutoff).count();
+    (in_window as u32) < max_in_window
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,5 +706,82 @@ mod tests {
         fs::write(boot_pending_path(&releases), b"not valid json").unwrap();
         let err = read_boot_pending(&releases).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ───────────────── v0.0.86: restart rate-limit tests ─────────────────
+
+    #[test]
+    fn restart_allowed_with_empty_log() {
+        let log = RestartLog::default();
+        assert!(restart_allowed(&log, 1000, 60, 3));
+    }
+
+    #[test]
+    fn restart_allowed_within_cap() {
+        let log = RestartLog {
+            events: vec![900, 950],
+        };
+        assert!(restart_allowed(&log, 1000, 600, 3));
+    }
+
+    #[test]
+    fn restart_blocked_when_window_full() {
+        let log = RestartLog {
+            events: vec![900, 950, 980],
+        };
+        // Three events in trailing 600 s, cap 3 → blocked.
+        assert!(!restart_allowed(&log, 1000, 600, 3));
+    }
+
+    #[test]
+    fn restart_allowed_after_window_rolls_off() {
+        let log = RestartLog {
+            events: vec![10, 20, 30],
+        };
+        // Now is 1000, window 600 ⇒ cutoff 400. All three are
+        // outside the window.
+        assert!(restart_allowed(&log, 1000, 600, 3));
+    }
+
+    #[test]
+    fn restart_max_in_window_zero_disables_gate() {
+        let log = RestartLog {
+            events: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        };
+        // Cap 0 = disabled, always allow even with a flooded log.
+        assert!(restart_allowed(&log, 100, 1000, 0));
+    }
+
+    #[test]
+    fn append_then_read_round_trip_with_prune() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        append_restart_event(&releases, 100, 60).unwrap();
+        append_restart_event(&releases, 130, 60).unwrap();
+        append_restart_event(&releases, 200, 60).unwrap();
+        // At ts=200 with window=60, cutoff=140. Only 200 should
+        // remain after pruning by the final append.
+        let log = read_restart_log(&releases);
+        assert_eq!(log.events, vec![200]);
+    }
+
+    #[test]
+    fn read_restart_log_missing_returns_default() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let log = read_restart_log(&releases);
+        assert!(log.events.is_empty());
+    }
+
+    #[test]
+    fn read_restart_log_garbage_returns_default_not_panic() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        fs::create_dir_all(&releases).unwrap();
+        fs::write(restart_log_path(&releases), b"not valid json").unwrap();
+        let log = read_restart_log(&releases);
+        // Permissive read: corrupt log treated as no events,
+        // so the first auto-restart still gets its chance.
+        assert!(log.events.is_empty());
     }
 }

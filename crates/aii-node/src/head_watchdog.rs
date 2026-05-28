@@ -25,10 +25,48 @@
 //! `--stall-recover-secs N`. Recommend `N` >= 5× the BFT slot
 //! interval so single-slot hiccups don't trigger restarts.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::NodeState;
+
+/// Read the current unix-seconds clock for rate-limit
+/// accounting. Returns `0` if the system clock predates the
+/// epoch (won't happen in practice; safe fallback).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Try to record a restart event under the rolling-window
+/// policy (v0.0.86). Returns `true` if the action is allowed
+/// (in which case the event is appended); `false` if the cap
+/// would be exceeded (in which case nothing is written).
+///
+/// A `max_per_window == 0` cap disables the gate (always
+/// allow). Use that when the operator explicitly turns
+/// rate-limiting off.
+fn try_register_restart(
+    releases_dir: &std::path::Path,
+    window_secs: u64,
+    max_per_window: u32,
+) -> bool {
+    let log = crate::release_install::read_restart_log(releases_dir);
+    let now = now_unix_secs();
+    if !crate::release_install::restart_allowed(&log, now, window_secs, max_per_window) {
+        return false;
+    }
+    if let Err(e) = crate::release_install::append_restart_event(releases_dir, now, window_secs) {
+        tracing::warn!(
+            error = %e,
+            "restart-log append failed; proceeding with action anyway (one less data point next time)",
+        );
+    }
+    true
+}
 
 /// Outcome of one [`StallDetector::observe`] tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +192,9 @@ pub fn start_head_watchdog(
     state: Arc<NodeState>,
     stall_recover_secs: u64,
     poll_secs: u64,
+    releases_dir: PathBuf,
+    restart_window_secs: u64,
+    restart_max_per_window: u32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if stall_recover_secs == 0 || poll_secs == 0 {
@@ -164,7 +205,13 @@ pub fn start_head_watchdog(
             );
             return;
         }
-        tracing::info!(stall_recover_secs, poll_secs, "head watchdog armed",);
+        tracing::info!(
+            stall_recover_secs,
+            poll_secs,
+            restart_window_secs,
+            restart_max_per_window,
+            "head watchdog armed",
+        );
         let mut detector = StallDetector::new(stall_recover_secs, poll_secs);
         let mut tick = tokio::time::interval(Duration::from_secs(poll_secs));
         tick.tick().await; // burn immediate
@@ -188,6 +235,29 @@ pub fn start_head_watchdog(
                     head,
                     stalled_for_secs,
                 } => {
+                    // v0.0.86: check the rolling-window
+                    // rate limit before triggering exec_self.
+                    // Prevents crash-loops where the
+                    // restarted binary stalls again
+                    // immediately.
+                    if !try_register_restart(
+                        &releases_dir,
+                        restart_window_secs,
+                        restart_max_per_window,
+                    ) {
+                        tracing::error!(
+                            head,
+                            stalled_for_secs,
+                            restart_window_secs,
+                            restart_max_per_window,
+                            "head stall threshold crossed BUT restart rate limit exceeded; refusing exec_self (operator must intervene)",
+                        );
+                        // Stay on the current binary. Reset
+                        // detector so we don't immediately
+                        // re-fire on the next tick.
+                        detector = StallDetector::new(stall_recover_secs, poll_secs);
+                        continue;
+                    }
                     tracing::error!(
                         head,
                         stalled_for_secs,
@@ -242,6 +312,8 @@ pub fn start_boot_health_confirm(
     state: Arc<NodeState>,
     releases_dir: std::path::PathBuf,
     confirm_secs: u64,
+    restart_window_secs: u64,
+    restart_max_per_window: u32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if confirm_secs == 0 {
@@ -259,36 +331,72 @@ pub fn start_boot_health_confirm(
                 return;
             }
         };
-        tracing::info!(
-            version = %pending.version,
-            pre_install_head = pending.pre_install_head,
-            install_ts = pending.install_ts,
-            confirm_secs,
-            "boot-health confirm armed; will check head advancement after grace window",
-        );
-        tokio::time::sleep(Duration::from_secs(confirm_secs)).await;
-        let head = state.head_block_number_sync();
-        if head > pending.pre_install_head {
+
+        // v0.0.86 stale-sentinel shortcut: if the sentinel's
+        // install_ts is older than 2× confirm_secs, a previous
+        // boot of this binary likely crashed before clearing
+        // it. Skip the sleep and go straight to rollback —
+        // waiting another full confirm window won't change the
+        // outcome (no head movement is going to happen) and
+        // delays operator notification.
+        let now = now_unix_secs();
+        let stale_threshold = confirm_secs.saturating_mul(2);
+        let sentinel_age = now.saturating_sub(pending.install_ts);
+        let is_stale = sentinel_age >= stale_threshold;
+        if is_stale {
+            tracing::error!(
+                sentinel_age_secs = sentinel_age,
+                stale_threshold_secs = stale_threshold,
+                version = %pending.version,
+                "boot-pending sentinel is stale (previous boot crashed before confirm); rolling back immediately",
+            );
+        } else {
             tracing::info!(
+                version = %pending.version,
+                pre_install_head = pending.pre_install_head,
+                install_ts = pending.install_ts,
+                confirm_secs,
+                "boot-health confirm armed; will check head advancement after grace window",
+            );
+            tokio::time::sleep(Duration::from_secs(confirm_secs)).await;
+            let head = state.head_block_number_sync();
+            if head > pending.pre_install_head {
+                tracing::info!(
+                    head,
+                    pre_install_head = pending.pre_install_head,
+                    version = %pending.version,
+                    "boot-health confirm: head advanced; clearing .boot-pending",
+                );
+                if let Err(e) = crate::release_install::clear_boot_pending(&releases_dir) {
+                    tracing::warn!(error = %e, "boot-health confirm: clear failed (file may linger)");
+                }
+                return;
+            }
+            tracing::error!(
                 head,
                 pre_install_head = pending.pre_install_head,
                 version = %pending.version,
-                "boot-health confirm: head advanced; clearing .boot-pending",
+                "boot-health confirm: head did NOT advance within {confirm_secs}s; triggering rollback",
             );
-            if let Err(e) = crate::release_install::clear_boot_pending(&releases_dir) {
-                tracing::warn!(error = %e, "boot-health confirm: clear failed (file may linger)");
-            }
+        }
+
+        // v0.0.86 rate-limit gate: stale shortcut and normal
+        // unhealthy path both funnel through here. If the
+        // rolling window is full, refuse to roll back — the
+        // operator needs to investigate why we keep hitting
+        // this path.
+        if !try_register_restart(&releases_dir, restart_window_secs, restart_max_per_window) {
+            tracing::error!(
+                restart_window_secs,
+                restart_max_per_window,
+                "boot-health rollback BUT restart rate limit exceeded; refusing rollback (operator must intervene)",
+            );
             return;
         }
-        // Unhealthy boot — trigger rollback. Use the trait
-        // method on RpcState so the rollback + execve path is
-        // exactly the same one operators get via the RPC.
-        tracing::error!(
-            head,
-            pre_install_head = pending.pre_install_head,
-            version = %pending.version,
-            "boot-health confirm: head did NOT advance within {confirm_secs}s; triggering rollback",
-        );
+
+        // Trigger rollback via the trait method so the path is
+        // exactly the same one operators get via the
+        // `aii_rollbackRelease` RPC.
         let outcome = <NodeState as aii_rpc::RpcState>::rollback_release(&state).await;
         if outcome.scheduled {
             tracing::error!(
