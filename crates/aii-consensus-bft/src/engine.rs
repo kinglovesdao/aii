@@ -37,7 +37,7 @@ use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
 use aii_crypto::{bls, vrf};
-use aii_types::{Address, H256, U256};
+use aii_types::{Address, BlsPubKey, H256, U256};
 
 /// Gas cost charged per included tx in the v0.0.37 placeholder
 /// pipeline (no actual EVM execution — every tx is treated as a
@@ -164,6 +164,8 @@ pub struct BftEngine {
 }
 
 struct BftEngineState {
+    validator_set: ValidatorSet,
+    my_index: u32,
     head_hash: H256,
     head_number: u64,
     head_timestamp: u64,
@@ -203,6 +205,8 @@ impl BftEngine {
     /// Construct from config + genesis block.
     pub fn new(config: BftConfig, genesis: &Block) -> Self {
         let state = BftEngineState {
+            validator_set: config.validator_set.clone(),
+            my_index: config.my_index,
             head_hash: genesis.hash(),
             head_number: genesis.header.number,
             head_timestamp: genesis.header.timestamp,
@@ -248,6 +252,8 @@ impl BftEngine {
             *head.header.mix_hash.as_bytes()
         };
         let state = BftEngineState {
+            validator_set: config.validator_set.clone(),
+            my_index: config.my_index,
             head_hash: head.hash(),
             head_number: head.header.number,
             head_timestamp: head.header.timestamp,
@@ -303,7 +309,7 @@ impl BftEngine {
     /// `true` iff this engine is configured with a single-validator set.
     #[must_use]
     pub fn is_single_validator(&self) -> bool {
-        self.config.validator_set.size() == 1
+        self.state.lock().validator_set.size() == 1
     }
 
     /// This node's coinbase — i.e. the address that becomes the
@@ -314,6 +320,13 @@ impl BftEngine {
     #[must_use]
     pub const fn coinbase(&self) -> Address {
         self.config.coinbase
+    }
+
+    /// This node's BLS public key in the 48-byte wire form used by
+    /// genesis and keyed DPoS validator-set records.
+    #[must_use]
+    pub fn my_bls_pubkey(&self) -> BlsPubKey {
+        BlsPubKey::new(self.config.my_bls_sk.public_key().to_compressed())
     }
 
     /// Current `(height, round, Phase)` if a coordinator is active.
@@ -361,8 +374,7 @@ impl BftEngine {
                 return Err(BftError::WrongHeight);
             }
         }
-        let mut coord =
-            RoundCoordinator::new(next_height, g.seed, self.config.validator_set.clone());
+        let mut coord = RoundCoordinator::new(next_height, g.seed, g.validator_set.clone());
         for _ in 0..target_round {
             coord.fire_timeout();
         }
@@ -379,8 +391,8 @@ impl BftEngine {
 
     /// This node's index inside its `validator_set`.
     #[must_use]
-    pub const fn my_index(&self) -> usize {
-        self.config.my_index as usize
+    pub fn my_index(&self) -> usize {
+        self.state.lock().my_index as usize
     }
 
     /// `true` iff this node would be the elected leader for the
@@ -391,14 +403,47 @@ impl BftEngine {
     pub fn would_be_leader_next_height(&self) -> bool {
         let g = self.state.lock();
         let next_h = g.head_number.saturating_add(1);
-        let leader = self.config.validator_set.select_leader(next_h, 0, &g.seed);
-        leader == self.config.my_index as usize
+        let leader = g.validator_set.select_leader(next_h, 0, &g.seed);
+        leader == g.my_index as usize
     }
 
     /// Validator-set size in force.
     #[must_use]
     pub fn validator_set_size(&self) -> usize {
-        self.config.validator_set.size()
+        self.state.lock().validator_set.size()
+    }
+
+    /// Replace the active validator set at a safe epoch boundary.
+    ///
+    /// Rotation is only accepted when no coordinator/proposal is active,
+    /// which is the post-harvest boundary after a height commits. That
+    /// keeps votes collected under the old set from being interpreted
+    /// under a new set.
+    ///
+    /// # Errors
+    /// Returns [`BftError::ActiveRoundInProgress`] if a round is in
+    /// flight, or [`BftError::ValidatorIndexOutOfBounds`] if `my_index`
+    /// is not a member of `validator_set`.
+    pub fn rotate_validator_set(
+        &self,
+        validator_set: ValidatorSet,
+        my_index: u32,
+    ) -> Result<(), BftError> {
+        if (my_index as usize) >= validator_set.size() {
+            return Err(BftError::ValidatorIndexOutOfBounds {
+                index: my_index,
+                size: validator_set.size(),
+            });
+        }
+        let mut g = self.state.lock();
+        if g.coordinator.is_some() || g.proposal.is_some() {
+            return Err(BftError::ActiveRoundInProgress);
+        }
+        g.pending_prevotes.clear();
+        g.pending_precommits.clear();
+        g.validator_set = validator_set;
+        g.my_index = my_index;
+        Ok(())
     }
 
     /// Reconstruct an empty-body block under this engine's own coinbase
@@ -489,10 +534,11 @@ impl BftEngine {
     /// identically.
     pub fn cast_proposal(&self) -> Result<(Block, LeaderProof), BftError> {
         let mut g = self.state.lock();
-        self.ensure_coordinator(&mut g);
+        Self::ensure_coordinator(&mut g);
+        let my_index = g.my_index;
         let coord = g.coordinator.as_mut().expect("ensured");
         let leader_idx = coord.leader_index();
-        if leader_idx != self.config.my_index as usize {
+        if leader_idx != my_index as usize {
             return Err(BftError::NotLeader {
                 round: coord.round(),
                 expected: u32::try_from(leader_idx).unwrap_or(u32::MAX),
@@ -542,6 +588,7 @@ impl BftEngine {
     /// the host to broadcast.
     pub fn cast_prevote(&self) -> Result<PrevoteVote, BftError> {
         let mut g = self.state.lock();
+        let my_index = g.my_index;
         let coord = g
             .coordinator
             .as_mut()
@@ -556,7 +603,7 @@ impl BftEngine {
             block_hash,
             coord.height(),
             coord.round(),
-            self.config.my_index,
+            my_index,
         );
         coord.submit_prevote(vote.clone())?;
         Ok(vote)
@@ -566,6 +613,7 @@ impl BftEngine {
     /// the host to broadcast.
     pub fn cast_precommit(&self) -> Result<PrecommitVote, BftError> {
         let mut g = self.state.lock();
+        let my_index = g.my_index;
         let coord = g
             .coordinator
             .as_mut()
@@ -584,7 +632,7 @@ impl BftEngine {
             block_hash,
             coord.height(),
             coord.round(),
-            self.config.my_index,
+            my_index,
         );
         coord.submit_precommit(vote.clone())?;
         Ok(vote)
@@ -598,7 +646,7 @@ impl BftEngine {
         leader_proof: LeaderProof,
     ) -> Result<(), BftError> {
         let mut g = self.state.lock();
-        self.ensure_coordinator(&mut g);
+        Self::ensure_coordinator(&mut g);
         let coord = g.coordinator.as_mut().expect("ensured");
         let block_hash = block.hash();
         coord.submit_proposal(block_hash, &leader_proof)?;
@@ -755,7 +803,7 @@ impl BftEngine {
     /// to the next round and drop the captured proposal.
     pub fn tick_timeout(&self) -> Result<(), BftError> {
         let mut g = self.state.lock();
-        self.ensure_coordinator(&mut g);
+        Self::ensure_coordinator(&mut g);
         let coord = g.coordinator.as_mut().expect("ensured");
         coord.fire_timeout();
         g.proposal = None;
@@ -766,12 +814,12 @@ impl BftEngine {
 
     /// Lazy: instantiate a fresh `RoundCoordinator` for `head_number + 1`
     /// if none is active.
-    fn ensure_coordinator(&self, g: &mut BftEngineState) {
+    fn ensure_coordinator(g: &mut BftEngineState) {
         if g.coordinator.is_none() {
             g.coordinator = Some(RoundCoordinator::new(
                 g.head_number + 1,
                 g.seed,
-                self.config.validator_set.clone(),
+                g.validator_set.clone(),
             ));
         }
     }
@@ -861,11 +909,11 @@ impl BftEngine {
     /// ourselves. Only valid in single-validator mode.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn advance_single(&self) -> Result<AdvanceOutput, BftError> {
-        let vs_size = self.config.validator_set.size();
+        let mut g = self.state.lock();
+        let vs_size = g.validator_set.size();
         if vs_size != 1 {
             return Err(BftError::NotSingleValidator(vs_size));
         }
-        let mut g = self.state.lock();
         let new_number = g.head_number.checked_add(1).ok_or(BftError::Overflow)?;
         let new_timestamp = g.head_timestamp + self.config.slot_seconds;
         let seed = g.seed;
@@ -948,21 +996,21 @@ impl BftEngine {
 
         // Drive the coordinator: submit proposal, prevote, precommit
         // — all signed by ourselves.
-        let mut coord = RoundCoordinator::new(new_number, seed, self.config.validator_set.clone());
+        let mut coord = RoundCoordinator::new(new_number, seed, g.validator_set.clone());
         coord.submit_proposal(block_hash, &leader_proof)?;
         coord.submit_prevote(PrevoteVote::sign(
             &self.config.my_bls_sk,
             block_hash,
             new_number,
             0,
-            self.config.my_index,
+            g.my_index,
         ))?;
         coord.submit_precommit(PrecommitVote::sign(
             &self.config.my_bls_sk,
             block_hash,
             new_number,
             0,
-            self.config.my_index,
+            g.my_index,
         ))?;
         let certificate = coord
             .certificate()
@@ -1160,6 +1208,43 @@ mod tests {
     fn is_single_validator_returns_false_for_size_3() {
         let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
         assert!(!engine.is_single_validator());
+    }
+
+    #[test]
+    fn rotate_validator_set_at_idle_boundary_updates_size_and_index() {
+        let engine = BftEngine::new(single_validator_config(), &genesis());
+        let cfg = three_validator_config_as_validator_0();
+        let new_set = cfg.validator_set;
+
+        engine.rotate_validator_set(new_set, 0).unwrap();
+
+        assert_eq!(engine.validator_set_size(), 3);
+        assert_eq!(engine.my_index(), 0);
+        assert!(!engine.is_single_validator());
+    }
+
+    #[test]
+    fn rotate_validator_set_rejects_out_of_bounds_index() {
+        let engine = BftEngine::new(single_validator_config(), &genesis());
+        let new_set = three_validator_config_as_validator_0().validator_set;
+
+        let err = engine.rotate_validator_set(new_set, 99).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BftError::ValidatorIndexOutOfBounds { index: 99, size: 3 },
+        ));
+    }
+
+    #[test]
+    fn rotate_validator_set_rejects_active_round() {
+        let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
+        let _ = engine.cast_proposal();
+        let new_set = single_validator_config().validator_set;
+
+        let err = engine.rotate_validator_set(new_set, 0).unwrap_err();
+
+        assert_eq!(err, BftError::ActiveRoundInProgress);
     }
 
     #[test]

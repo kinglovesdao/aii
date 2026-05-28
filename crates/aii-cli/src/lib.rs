@@ -881,6 +881,285 @@ pub fn run_tier() -> TierReport {
     }
 }
 
+// ──────────────────────── BFT capacity tooling ─────────────────────────────
+
+/// Deterministic BFT capacity report for one successful height/round.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BftCapacityReport {
+    /// Active validator count in the DPoS/BFT committee.
+    pub validators: usize,
+    /// Target seconds available for the round.
+    pub target_secs: u64,
+    /// Proposal bytes emitted by the leader before peer fan-out.
+    pub proposal_bytes: usize,
+    /// Equal-stake validators required to cross 2/3 + 1 quorum.
+    pub equal_stake_quorum_votes: usize,
+    /// Committee-wide vote messages in a full-mesh broadcast model.
+    pub vote_messages_per_round: u64,
+    /// Committee-wide vote payload bytes in a full-mesh broadcast model.
+    pub vote_payload_bytes_per_round: u64,
+    /// Leader upload bytes for sending the proposal to every other validator.
+    pub leader_proposal_fanout_bytes: u64,
+    /// Minimum leader upload bandwidth for proposal fan-out within
+    /// `target_secs`, in megabits/s.
+    pub min_leader_upload_mbps: u64,
+    /// Whether this scenario respects the protocol design cap.
+    pub satisfies_design_cap: bool,
+}
+
+/// Run the BFT capacity budget calculator.
+///
+/// Defaults to max wire proposal size and the roadmap 30-second finality
+/// target. The caller supplies the active DPoS/BFT committee size.
+///
+/// # Errors
+/// Returns an error for empty or oversized committees, zero target
+/// seconds, or a proposal larger than the wire codec permits.
+pub fn run_bft_capacity(
+    validators: usize,
+    proposal_bytes: Option<usize>,
+    target_secs: Option<u64>,
+) -> Result<BftCapacityReport, CliError> {
+    let budget = aii_consensus_bft::capacity_budget(
+        validators,
+        proposal_bytes.unwrap_or_else(aii_consensus_bft::max_wire_proposal_bytes),
+        target_secs.unwrap_or(aii_consensus_bft::FINALITY_TARGET_SECS),
+    )
+    .map_err(|e| CliError::Client(e.to_string()))?;
+    Ok(BftCapacityReport {
+        validators: budget.validators,
+        target_secs: budget.target_secs,
+        proposal_bytes: budget.proposal_bytes,
+        equal_stake_quorum_votes: budget.equal_stake_quorum_votes,
+        vote_messages_per_round: budget.vote_messages_per_round,
+        vote_payload_bytes_per_round: budget.vote_payload_bytes_per_round,
+        leader_proposal_fanout_bytes: budget.leader_proposal_fanout_bytes,
+        min_leader_upload_mbps: budget.min_leader_upload_mbps,
+        satisfies_design_cap: budget.satisfies_design_cap(),
+    })
+}
+
+// ──────────────────────── Discovery diagnostics ────────────────────────────
+
+/// Default public testnet Discovery v4 seeds used by `aii discovery-probe`.
+pub const DEFAULT_DISCOVERY_PROBE_SEEDS: &[&str] = &["8.211.135.234:30310", "106.14.223.128:30310"];
+
+/// Result from one Discovery v4 probe window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryProbeReport {
+    /// Seed specs supplied to the probe before DNS/socket resolution.
+    pub seed_specs: Vec<String>,
+    /// Seed socket addresses that resolved and were queried.
+    pub resolved_seeds: Vec<String>,
+    /// BFT TCP peers returned by `Neighbours`.
+    pub discovered_bft_peers: Vec<String>,
+    /// UDP Discovery v4 peers returned by `Neighbours`.
+    pub discovered_discovery_peers: Vec<String>,
+    /// Public UDP endpoint observed by a seed/responder via `Pong.to`.
+    pub observed_discovery: Option<String>,
+    /// Probe wall-clock duration in milliseconds.
+    pub elapsed_ms: u128,
+}
+
+/// Run a one-shot Discovery v4 probe against public or operator-supplied seeds.
+///
+/// This is a diagnostic command: it binds a temporary UDP socket,
+/// pings each seed, asks for neighbours, and reports both discovered
+/// BFT peers and the public UDP endpoint the seed observed for us.
+///
+/// # Errors
+/// Returns bind, packet signing, or UDP transport errors from the
+/// discovery layer.
+#[allow(clippy::too_many_lines)]
+pub async fn run_discovery_probe(
+    seed_specs: &[String],
+    listen: std::net::SocketAddr,
+    bft_listen: std::net::SocketAddr,
+    timeout_ms: u64,
+) -> Result<DiscoveryProbeReport, CliError> {
+    use aii_net_p2p::discovery::{
+        expiration_in, Endpoint, FindNode, Neighbours, Packet, Ping, UdpDiscovery,
+        DISCOVERY_VERSION,
+    };
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    let resolved_seeds = resolve_probe_seed_specs(seed_specs);
+    let started = Instant::now();
+    if resolved_seeds.is_empty() {
+        return Ok(DiscoveryProbeReport {
+            seed_specs: seed_specs.to_vec(),
+            resolved_seeds: Vec::new(),
+            discovered_bft_peers: Vec::new(),
+            discovered_discovery_peers: Vec::new(),
+            observed_discovery: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+    }
+
+    let driver = UdpDiscovery::bind(listen, probe_secret_key())
+        .await
+        .map_err(|e| CliError::Client(format!("discovery: {e}")))?;
+    let local = Endpoint {
+        ip: driver.local_addr().ip(),
+        udp_port: driver.local_addr().port(),
+        tcp_port: bft_listen.port(),
+    };
+    let target = aii_crypto::keccak256(&driver.local_addr().to_string().into_bytes());
+
+    for seed in &resolved_seeds {
+        let seed_ep = Endpoint {
+            ip: seed.ip(),
+            udp_port: seed.port(),
+            tcp_port: 0,
+        };
+        let ping = Packet::Ping(Ping {
+            version: DISCOVERY_VERSION,
+            from: local.clone(),
+            to: seed_ep,
+            expiration: expiration_in(60),
+        });
+        let _ = driver.send(*seed, &ping).await;
+        let find = Packet::FindNode(FindNode {
+            target,
+            expiration: expiration_in(60),
+        });
+        let _ = driver.send(*seed, &find).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut found_bft = BTreeSet::new();
+    let mut found_discovery = BTreeSet::new();
+    let mut observed_discovery = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let slice = remaining.min(Duration::from_millis(100));
+        let Ok((decoded, src)) = driver.recv(slice).await else {
+            continue;
+        };
+        match decoded.packet {
+            Packet::Ping(p) => {
+                let observed = Endpoint {
+                    ip: src.ip(),
+                    udp_port: src.port(),
+                    tcp_port: p.from.tcp_port,
+                };
+                let _ = driver
+                    .send(
+                        src,
+                        &Packet::Pong(aii_net_p2p::discovery::Pong {
+                            to: observed,
+                            ping_hash: decoded.packet_hash,
+                            expiration: expiration_in(60),
+                        }),
+                    )
+                    .await;
+            }
+            Packet::FindNode(_) => {
+                let _ = driver
+                    .send(
+                        src,
+                        &Packet::Neighbours(Neighbours {
+                            nodes: Vec::new(),
+                            expiration: expiration_in(60),
+                        }),
+                    )
+                    .await;
+            }
+            Packet::Neighbours(n) => {
+                for node in &n.nodes {
+                    if let Some(peer) = endpoint_to_probe_peer(node, false) {
+                        found_bft.insert(peer);
+                    }
+                    if let Some(peer) = endpoint_to_probe_peer(node, true) {
+                        found_discovery.insert(peer);
+                    }
+                }
+            }
+            Packet::Pong(p) => {
+                if observed_discovery.is_none() {
+                    observed_discovery =
+                        endpoint_to_probe_peer(&p.to, true).map(|addr| addr.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(DiscoveryProbeReport {
+        seed_specs: seed_specs.to_vec(),
+        resolved_seeds: resolved_seeds
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        discovered_bft_peers: found_bft
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        discovered_discovery_peers: found_discovery
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        observed_discovery,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn resolve_probe_seed_specs(seed_specs: &[String]) -> Vec<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in seed_specs {
+        if let Ok(addr) = spec.parse::<std::net::SocketAddr>() {
+            if seen.insert(addr) {
+                out.push(addr);
+            }
+            continue;
+        }
+        if let Ok(addrs) = spec.to_socket_addrs() {
+            for addr in addrs {
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn endpoint_to_probe_peer(
+    endpoint: &aii_net_p2p::discovery::Endpoint,
+    discovery_port: bool,
+) -> Option<std::net::SocketAddr> {
+    let port = if discovery_port {
+        endpoint.udp_port
+    } else {
+        endpoint.tcp_port
+    };
+    let peer = std::net::SocketAddr::new(endpoint.ip, port);
+    (!peer.ip().is_unspecified() && peer.port() != 0).then_some(peer)
+}
+
+fn probe_secret_key() -> aii_crypto::secp::SecretKey {
+    let seed = format!(
+        "{}:{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    for counter in 0u64.. {
+        let mut input = seed.as_bytes().to_vec();
+        input.extend_from_slice(&counter.to_be_bytes());
+        let bytes = *aii_crypto::keccak256(&input).as_bytes();
+        if let Ok(sk) = aii_crypto::secp::SecretKey::from_bytes(&bytes) {
+            return sk;
+        }
+    }
+    unreachable!("secp256k1 key generation loop should eventually find a valid scalar")
+}
+
 // ──────────────────────── Validator / Genesis tooling (v0.0.32) ─────────────
 
 /// Plaintext validator keystore.
@@ -1229,6 +1508,124 @@ mod tests {
         let r2 = run_tier();
         assert_eq!(r1.tier, r2.tier);
         assert!(r1.score <= 100);
+    }
+
+    #[test]
+    fn bft_capacity_reports_default_roadmap_budget() {
+        let r = run_bft_capacity(21, None, None).unwrap();
+        assert_eq!(r.validators, 21);
+        assert_eq!(r.target_secs, aii_consensus_bft::FINALITY_TARGET_SECS);
+        assert_eq!(
+            r.proposal_bytes,
+            aii_consensus_bft::max_wire_proposal_bytes()
+        );
+        assert_eq!(r.equal_stake_quorum_votes, 15);
+        assert_eq!(r.vote_messages_per_round, 840);
+        assert!(r.satisfies_design_cap);
+    }
+
+    #[test]
+    fn bft_capacity_rejects_oversized_committee() {
+        let err = run_bft_capacity(aii_consensus_bft::MAX_VALIDATORS + 1, None, None).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_returns_empty_report_for_unresolvable_seed() {
+        let report = run_discovery_probe(
+            &["not a socket address".to_string()],
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:30311".parse().unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.resolved_seeds, Vec::<String>::new());
+        assert_eq!(report.discovered_bft_peers, Vec::<String>::new());
+        assert_eq!(report.observed_discovery, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_reports_neighbours_and_observed_endpoint() {
+        use aii_net_p2p::discovery::{
+            expiration_in, Endpoint, Neighbours, Packet, Pong, UdpDiscovery,
+        };
+
+        fn fixed_secret(byte: u8) -> aii_crypto::secp::SecretKey {
+            let mut bytes = [0u8; 32];
+            bytes[31] = byte;
+            aii_crypto::secp::SecretKey::from_bytes(&bytes).unwrap()
+        }
+
+        let seed = UdpDiscovery::bind("127.0.0.1:0".parse().unwrap(), fixed_secret(1))
+            .await
+            .unwrap();
+        let seed_addr = seed.local_addr();
+        let observed = "127.0.0.1:43000".parse::<std::net::SocketAddr>().unwrap();
+        let advertised_bft = "127.0.0.1:30331".parse::<std::net::SocketAddr>().unwrap();
+        let advertised_discovery = "127.0.0.1:30330".parse::<std::net::SocketAddr>().unwrap();
+
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((decoded, src)) = seed.recv(std::time::Duration::from_secs(2)).await else {
+                    continue;
+                };
+                match decoded.packet {
+                    Packet::Ping(p) => {
+                        let _ = seed
+                            .send(
+                                src,
+                                &Packet::Pong(Pong {
+                                    to: Endpoint {
+                                        ip: observed.ip(),
+                                        udp_port: observed.port(),
+                                        tcp_port: p.from.tcp_port,
+                                    },
+                                    ping_hash: decoded.packet_hash,
+                                    expiration: expiration_in(60),
+                                }),
+                            )
+                            .await;
+                    }
+                    Packet::FindNode(_) => {
+                        let _ = seed
+                            .send(
+                                src,
+                                &Packet::Neighbours(Neighbours {
+                                    nodes: vec![Endpoint {
+                                        ip: advertised_bft.ip(),
+                                        udp_port: advertised_discovery.port(),
+                                        tcp_port: advertised_bft.port(),
+                                    }],
+                                    expiration: expiration_in(60),
+                                }),
+                            )
+                            .await;
+                    }
+                    Packet::Pong(_) | Packet::Neighbours(_) => {}
+                }
+            }
+        });
+
+        let report = run_discovery_probe(
+            &[seed_addr.to_string()],
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:30311".parse().unwrap(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert_eq!(report.resolved_seeds, vec![seed_addr.to_string()]);
+        assert_eq!(
+            report.discovered_bft_peers,
+            vec![advertised_bft.to_string()],
+        );
+        assert_eq!(
+            report.discovered_discovery_peers,
+            vec![advertised_discovery.to_string()],
+        );
+        assert_eq!(report.observed_discovery, Some(observed.to_string()));
     }
 
     // ───────────────────── validator / genesis tooling tests ─────────────────────

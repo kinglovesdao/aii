@@ -3,9 +3,10 @@
 use aii_cli::release::{sign_release, verify_release, ReleaseError};
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
-    run_account_verify, run_chain_id, run_genesis_init, run_genesis_validate, run_get_block_header,
-    run_random_seed_hex, run_recent_blocks, run_status, run_stress, run_subchain, run_tier,
-    run_validator_keygen, run_validator_pubkey, CliError, ValidatorEntry, ValidatorPubkeys,
+    run_account_verify, run_bft_capacity, run_chain_id, run_discovery_probe, run_genesis_init,
+    run_genesis_validate, run_get_block_header, run_random_seed_hex, run_recent_blocks, run_status,
+    run_stress, run_subchain, run_tier, run_validator_keygen, run_validator_pubkey, CliError,
+    ValidatorEntry, ValidatorPubkeys, DEFAULT_DISCOVERY_PROBE_SEEDS,
 };
 use aii_crypto::ed25519::{PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey};
 use clap::{Parser, Subcommand};
@@ -42,6 +43,33 @@ enum Cmd {
     },
     /// Probe local hardware + recommend a node Tier (T1–T7).
     Tier,
+    /// Compute the deterministic BFT committee capacity budget.
+    BftCapacity {
+        /// Active DPoS/BFT validators in the voting committee.
+        #[arg(long, default_value = "21")]
+        validators: usize,
+        /// Proposal bytes to budget. Defaults to the wire codec maximum.
+        #[arg(long)]
+        proposal_bytes: Option<usize>,
+        /// Finality target seconds. Defaults to the roadmap 30 s target.
+        #[arg(long)]
+        target_secs: Option<u64>,
+    },
+    /// Probe Discovery v4 seeds and report discovered peers/public endpoint.
+    DiscoveryProbe {
+        /// UDP Discovery v4 seed specs. DNS names and IP host:port are accepted.
+        #[arg(long, value_delimiter = ',')]
+        seeds: Vec<String>,
+        /// Temporary UDP bind address for the probe.
+        #[arg(long, default_value = "0.0.0.0:0")]
+        listen: std::net::SocketAddr,
+        /// BFT listener advertised in the probe Ping's TCP port.
+        #[arg(long, default_value = "0.0.0.0:30311")]
+        bft_listen: std::net::SocketAddr,
+        /// Milliseconds to wait for Discovery v4 replies.
+        #[arg(long, default_value = "1500")]
+        timeout_ms: u64,
+    },
     /// Validator (BFT consensus participant) management.
     Validator {
         #[command(subcommand)]
@@ -501,6 +529,64 @@ async fn main() -> Result<(), CliError> {
                 println!("{}", serde_json::to_string(&t)?);
             } else {
                 println!("score: {} → {:?}", t.score, t.tier);
+            }
+        }
+        Cmd::BftCapacity {
+            validators,
+            proposal_bytes,
+            target_secs,
+        } => {
+            let r = run_bft_capacity(validators, proposal_bytes, target_secs)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("validators:              {}", r.validators);
+                println!("target_secs:             {}", r.target_secs);
+                println!("proposal_bytes:          {}", r.proposal_bytes);
+                println!("quorum_votes:            {}", r.equal_stake_quorum_votes);
+                println!("vote_messages/round:     {}", r.vote_messages_per_round);
+                println!(
+                    "vote_payload_bytes/round: {}",
+                    r.vote_payload_bytes_per_round
+                );
+                println!(
+                    "leader_fanout_bytes:      {}",
+                    r.leader_proposal_fanout_bytes
+                );
+                println!("min_leader_upload_mbps:  {}", r.min_leader_upload_mbps);
+                println!("satisfies_design_cap:    {}", r.satisfies_design_cap);
+            }
+        }
+        Cmd::DiscoveryProbe {
+            seeds,
+            listen,
+            bft_listen,
+            timeout_ms,
+        } => {
+            let seed_specs = if seeds.is_empty() {
+                DEFAULT_DISCOVERY_PROBE_SEEDS
+                    .iter()
+                    .map(|seed| (*seed).to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                seeds
+            };
+            let r = run_discovery_probe(&seed_specs, listen, bft_listen, timeout_ms).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("seeds:                {}", r.seed_specs.join(","));
+                println!("resolved:             {}", r.resolved_seeds.join(","));
+                println!(
+                    "observed_discovery:   {}",
+                    r.observed_discovery.as_deref().unwrap_or("-")
+                );
+                println!("bft_peers:            {}", r.discovered_bft_peers.join(","));
+                println!(
+                    "discovery_peers:      {}",
+                    r.discovered_discovery_peers.join(",")
+                );
+                println!("elapsed_ms:           {}", r.elapsed_ms);
             }
         }
         Cmd::Validator {

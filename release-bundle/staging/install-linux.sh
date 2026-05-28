@@ -15,7 +15,10 @@ LOG_FILE="${LOG_FILE:-/var/log/aiid.log}"
 UNIT="/etc/systemd/system/aiid.service"
 RPC_BIND="${RPC_BIND:-0.0.0.0:8545}"
 BFT_LISTEN="${BFT_LISTEN:-0.0.0.0:30311}"
+DISCOVERY_ADVERTISE="${DISCOVERY_ADVERTISE:-}"
+BFT_ADVERTISE="${BFT_ADVERTISE:-}"
 BOOTNODE="${BOOTNODE:-http://8.211.135.234:8545}"
+DISCOVERY_SEEDS="${DISCOVERY_SEEDS:-8.211.135.234:30310,106.14.223.128:30310}"
 MODE="${1:-validator}"
 
 if [[ "$MODE" == "--uninstall" ]]; then
@@ -75,10 +78,17 @@ fi
 
 # Build the ExecStart line.
 EXEC_BASE="$PREFIX/bin/aiid --data-dir $DATA_DIR/data --rpc $RPC_BIND --testnet --bootnode $BOOTNODE"
+ADVERTISE_ARGS=""
+if [[ -n "$DISCOVERY_ADVERTISE" ]]; then
+  ADVERTISE_ARGS="$ADVERTISE_ARGS --discovery-advertise $DISCOVERY_ADVERTISE"
+fi
+if [[ -n "$BFT_ADVERTISE" ]]; then
+  ADVERTISE_ARGS="$ADVERTISE_ARGS --bft-advertise $BFT_ADVERTISE"
+fi
 if [[ "$MODE" == "--observer" ]]; then
   EXEC="$EXEC_BASE"
 else
-  EXEC="$EXEC_BASE --bft --genesis $DATA_DIR/genesis.json --keystore $DATA_DIR/keystore.json --bft-listen $BFT_LISTEN --peers 8.211.135.234:30311,106.14.223.128:30311"
+  EXEC="$EXEC_BASE --bft --genesis $DATA_DIR/genesis.json --keystore $DATA_DIR/keystore.json --bft-listen $BFT_LISTEN$ADVERTISE_ARGS --peers 8.211.135.234:30311,106.14.223.128:30311"
 fi
 
 cat > "$UNIT" <<UNIT_EOF
@@ -89,6 +99,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=AII_DISCOVERY_SEEDS=$DISCOVERY_SEEDS
 ExecStart=$EXEC
 StandardOutput=append:$LOG_FILE
 StandardError=append:$LOG_FILE

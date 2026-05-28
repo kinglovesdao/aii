@@ -13,8 +13,8 @@
 
 use aii_cli::{
     run_account_from_mnemonic, run_account_mnemonic, run_account_new, run_account_new_encrypted,
-    run_account_verify, run_chain_id, run_get_block_header, run_recent_blocks, run_status,
-    run_tier,
+    run_account_verify, run_bft_capacity, run_chain_id, run_discovery_probe, run_get_block_header,
+    run_recent_blocks, run_status, run_tier, DEFAULT_DISCOVERY_PROBE_SEEDS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -123,7 +123,7 @@ impl Server {
         })
     }
 
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::too_many_lines, clippy::unused_self)]
     fn handle_tools_list(&self) -> Value {
         json!({
             "tools": [
@@ -194,6 +194,31 @@ impl Server {
                     "inputSchema": { "type": "object", "properties": {} },
                 },
                 {
+                    "name": "bft_capacity",
+                    "description": "Compute the deterministic BFT committee capacity budget for the 30-second PoS finality target.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "validators": { "type": "integer", "description": "Active DPoS/BFT validators in the voting committee. Defaults to 21.", "minimum": 1, "maximum": 128 },
+                            "proposal_bytes": { "type": "integer", "description": "Proposal bytes to budget. Defaults to the wire codec maximum.", "minimum": 0 },
+                            "target_secs": { "type": "integer", "description": "Finality target seconds. Defaults to 30.", "minimum": 1 }
+                        }
+                    },
+                },
+                {
+                    "name": "discovery_probe",
+                    "description": "Probe AII Discovery v4 seeds and report discovered peers plus the public UDP endpoint observed by the seed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "seeds": { "type": "string", "description": "Comma-separated Discovery v4 seed specs. Defaults to public testnet seeds." },
+                            "listen": { "type": "string", "description": "Temporary UDP bind address. Defaults to 0.0.0.0:0." },
+                            "bft_listen": { "type": "string", "description": "BFT listener whose TCP port is advertised in the probe. Defaults to 0.0.0.0:30311." },
+                            "timeout_ms": { "type": "integer", "description": "Milliseconds to wait for replies. Defaults to 1500.", "minimum": 1 }
+                        }
+                    },
+                },
+                {
                     "name": "block_lookup",
                     "description": "Fetch a single block header by number or 32-byte hash.",
                     "inputSchema": {
@@ -218,6 +243,7 @@ impl Server {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_tools_call(&self, params: Value) -> Result<Value, RpcErrorObject> {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
@@ -270,6 +296,57 @@ impl Server {
                 let t = run_tier();
                 Ok(tool_text(format!("score {} → {:?}", t.score, t.tier)))
             }
+            "bft_capacity" => {
+                let validators = args
+                    .get("validators")
+                    .and_then(Value::as_u64)
+                    .map_or(21usize, |n| n as usize);
+                let proposal_bytes = args
+                    .get("proposal_bytes")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                let target_secs = args.get("target_secs").and_then(Value::as_u64);
+                let r = run_bft_capacity(validators, proposal_bytes, target_secs)
+                    .map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(serde_json::to_string_pretty(&r).unwrap()))
+            }
+            "discovery_probe" => {
+                let seeds = args.get("seeds").and_then(Value::as_str).map_or_else(
+                    || {
+                        DEFAULT_DISCOVERY_PROBE_SEEDS
+                            .iter()
+                            .map(|seed| (*seed).to_string())
+                            .collect()
+                    },
+                    split_csv,
+                );
+                let listen = args
+                    .get("listen")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0.0.0.0:0")
+                    .parse()
+                    .map_err(|e| RpcErrorObject {
+                        code: -32602,
+                        message: format!("bad listen address: {e}"),
+                    })?;
+                let bft_listen = args
+                    .get("bft_listen")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0.0.0.0:30311")
+                    .parse()
+                    .map_err(|e| RpcErrorObject {
+                        code: -32602,
+                        message: format!("bad bft_listen address: {e}"),
+                    })?;
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1500);
+                let r = run_discovery_probe(&seeds, listen, bft_listen, timeout_ms)
+                    .await
+                    .map_err(|e| rpc_err(&e))?;
+                Ok(tool_text(serde_json::to_string_pretty(&r).unwrap()))
+            }
             "block_lookup" => {
                 let query = string_arg(&args, "query")?;
                 let r = run_get_block_header(&self.rpc_url, &query)
@@ -310,6 +387,14 @@ fn string_arg(args: &Value, key: &str) -> Result<String, RpcErrorObject> {
             code: -32602,
             message: format!("missing or non-string argument: {key}"),
         })
+}
+
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn tool_text(s: impl Into<String>) -> Value {
@@ -353,7 +438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_ten_tools() {
+    async fn tools_list_includes_twelve_tools() {
         let s = Server::new("http://127.0.0.1:0");
         let req = Request {
             jsonrpc: "2.0".into(),
@@ -364,7 +449,7 @@ mod tests {
         let resp = s.handle(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         for expected in [
             "chain_status",
@@ -375,6 +460,8 @@ mod tests {
             "mnemonic_new",
             "account_from_mnemonic",
             "tier_recommend",
+            "bft_capacity",
+            "discovery_probe",
             "block_lookup",
             "recent_blocks",
         ] {
@@ -584,6 +671,59 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(text.starts_with("score "));
+    }
+
+    #[tokio::test]
+    async fn bft_capacity_tool_returns_budget_json() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s
+            .handle(call("bft_capacity", json!({ "validators": 21 })))
+            .await
+            .unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["validators"], 21);
+        assert_eq!(parsed["target_secs"], 30);
+        assert_eq!(parsed["equal_stake_quorum_votes"], 15);
+        assert_eq!(parsed["satisfies_design_cap"], true);
+    }
+
+    #[tokio::test]
+    async fn bft_capacity_tool_rejects_oversized_committee() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s
+            .handle(call("bft_capacity", json!({ "validators": 129 })))
+            .await
+            .unwrap();
+        assert!(resp.error.is_some());
+        assert!(resp.error.unwrap().message.contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_tool_returns_empty_report_for_bad_seed() {
+        let s = Server::new("http://127.0.0.1:0");
+        let resp = s
+            .handle(call(
+                "discovery_probe",
+                json!({
+                    "seeds": "not a seed",
+                    "listen": "127.0.0.1:0",
+                    "bft_listen": "127.0.0.1:30311",
+                    "timeout_ms": 1
+                }),
+            ))
+            .await
+            .unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["resolved_seeds"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["discovered_bft_peers"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

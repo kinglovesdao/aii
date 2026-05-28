@@ -83,9 +83,18 @@ The installer reads these overrides:
 | `LOG_FILE` | `/var/log/aiid.log` | aiid stdout/stderr destination |
 | `RPC_BIND` | `0.0.0.0:8545` | JSON-RPC listener |
 | `BFT_LISTEN` | `0.0.0.0:30311` | BFT gossip TCP listener |
+| `DISCOVERY_ADVERTISE` | empty | Public UDP Discovery v4 address advertised to peers, e.g. `203.0.113.10:30310` |
+| `BFT_ADVERTISE` | empty | Public BFT TCP address advertised to peers, e.g. `203.0.113.10:30311` |
 | `BOOTNODE` | `http://8.211.135.234:8545` | Used by `--bootnode` for cold-join sync |
+| `DISCOVERY_SEEDS` | `8.211.135.234:30310,106.14.223.128:30310` | Exported as `AII_DISCOVERY_SEEDS` for automatic peer discovery |
 
 Example: `sudo PREFIX=/opt DATA_DIR=/srv/aii ./install-linux.sh`
+
+When `DISCOVERY_ADVERTISE` / `BFT_ADVERTISE` are empty, the node asks
+Discovery v4 seeds what UDP endpoint they observe and uses that public
+IP for advertisement. Set the variables explicitly when port mappings
+do not match the default Discovery/BFT ports or when the inferred
+address is not reachable from other validators.
 
 ## Verify the node works
 
@@ -137,7 +146,7 @@ Open inbound on the firewall when running a validator:
 |---|---|---|
 | `8545` | TCP | JSON-RPC (eth_* + aii_*) |
 | `30311` | TCP | BFT gossip |
-| `30311` | UDP | (reserved for Discovery v4, not yet wired) |
+| `30310` | UDP | Discovery v4 peer bootstrap |
 
 ## Reporting issues
 

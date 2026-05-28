@@ -5,6 +5,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.91] — 2026-05-28
+
+### Added — public-internet discovery glue + BFT capacity budget + validator registry
+
+This release integrates ~2,500 LoC across 26 files of in-flight
+work that had been accumulating in the working tree (codex-
+authored). Three new modules + threading through the BFT
+producer + transport layers. Focused on the user-stated goal of
+"real public-internet multi-node discovery / dial verification".
+
+#### `aii-node::discovery_bootstrap` (new, 1148 lines)
+
+Glues the v0.0.17 devp2p Discovery v4 wire (`aii-net-p2p::
+discovery`) into the `aiid` startup path. On boot in `--bft`
+mode the node:
+
+1. Resolves seeds (`--discovery-seeds` CLI + `AII_DISCOVERY_SEEDS`
+   env + compile-time `TESTNET_DISCOVERY_SEEDS` /
+   `MAINNET_DISCOVERY_SEEDS` defaults like
+   `bootnodes.aii.network:30310`). Resolution tolerates DNS or
+   raw `host:port`.
+2. Loads or creates `<data-dir>/discovery.key` — a persistent
+   secp256k1 identity for Discovery v4 packet signing.
+3. Runs `discover_once_full`: ping each seed, ask for
+   `FindNode`, accept `Neighbours` replies. Newly-discovered
+   BFT TCP endpoints are merged into the v0.0.69 peer cache
+   and dialed via the BFT transport's `add_peer`.
+4. Infers public IP from `Pong.to` observed-endpoint when no
+   `--discovery-advertise` / `--bft-advertise` is set.
+5. Spawns a long-running `UdpDiscovery` responder bound to
+   `--discovery-listen` (default `0.0.0.0:30310`) that answers
+   `Ping` / `FindNode` from external callers — the node now
+   ACTS as a discovery seed for others.
+6. Every `--discovery-refresh-secs` (default 60s), re-queries
+   seeds, picks up new peers, dials them, persists the merged
+   list. Observation-driven public-IP updates take effect
+   without restart.
+
+CLI surface (new on `aiid`):
+- `--discovery-listen` (default `0.0.0.0:30310`)
+- `--discovery-advertise` (None — let observation infer)
+- `--bft-advertise` (None — let observation infer)
+- `--discovery-seeds` (None — use compile-time defaults)
+- `--no-discovery` (default false)
+- `--discovery-timeout-ms` (default 1500)
+- `--discovery-refresh-secs` (default 60; 0 to disable refresh)
+
+14 unit tests cover seed-spec merge ordering, DNS resolution,
+endpoint conversion, advertised-endpoint inference (including
+NAT / outbound-only / explicit-advertise cases), shared peer
+view (filter wildcard + dedupe), and one full `discover_once`
+loopback integration test.
+
+#### `aii-consensus-bft::capacity` (new, 210 lines)
+
+Deterministic budget calculator that encodes the protocol-level
+ceilings:
+
+- `FINALITY_TARGET_SECS = 30`
+- `MAX_VALIDATORS = 128` (BFT bitmap cap)
+- Equal-stake quorum = `(N*2)/3 + 1`
+- Full-mesh vote messages per round = `2 * N * (N-1)`
+- Leader proposal fan-out = `proposal_bytes * (N-1)`
+- Min leader uplink Mbps = `bytes * 8 / target_secs / 1e6`
+
+`capacity_budget(validators, proposal_bytes, target_secs) ->
+Result<CapacityBudget, CapacityError>` returns the full table
+or rejects oversize committees / proposals.
+
+5 unit tests including the proof that at max committee (128
+validators × 16 MiB proposal × 30s), leader uplink fits under
+~600 Mbps. The comment explicitly notes: **"These helpers do
+not replace real公网 stress testing"** — they encode the
+algebra; real-network throughput evidence still has to come
+from live load.
+
+The "10 M nodes, 30 s finality" model is **128-validator BFT
+committee + arbitrary observer-sync pool**. Active voting
+participates only in the committee; the rest sync via block
+gossip outside the quorum.
+
+#### `aii-node::validator_registry` (new, 118 lines)
+
+Persistent K/V mapping `Address → (BlsPubKey, VrfPubKey)`. Lets
+DPoS epoch transitions materialise a runtime-ready validator
+set from the on-chain stake table, by joining stake records
+with the registered runtime keys. Without it, the validator
+set would be genesis-locked. 2 tests (round-trip, missing-key
+returns None).
+
+#### Wiring & integration changes
+
+- `aii-node::lib.rs` — module declarations + re-exports for
+  `discovery_bootstrap` and `validator_registry`. New
+  `elect_registered_active_set` exposed from `dpos`. New const
+  `BFT_STAKE_WEIGHT_UNIT_WEI = 10^18`.
+- `aii-node::main.rs` — +428 lines: 9 new CLI flags, the
+  discovery startup block (seed resolution → key load → first
+  query → responder spawn), the post-startup refresh loop (60s
+  default cadence).
+- `aii-node::bft_p2p.rs` — +232 lines: transport accepts
+  runtime `add_peer` calls from the discovery refresh loop;
+  dial path now extends rather than replaces the static peer
+  set.
+- `aii-node::dpos.rs` — +170 lines: `elect_registered_active_set`
+  filters elected validators by registry presence so an
+  unregistered staker can't be voted into the active set.
+- `aii-consensus-bft::engine.rs` — +129 lines: capacity-cap
+  enforcement in `rotate_validator_set`, plus a clippy
+  redundant-clone fix.
+- `aii-cli::lib.rs` — +400 lines: validator-registry CLI plus
+  a couple of supporting helpers.
+- `aii-mcp::lib.rs` — +147 lines: MCP tool surface for the new
+  validator + discovery operations.
+- `aii-node::precompile.rs` — +115 lines: presumed registry
+  precompile (used by staking flows to register validator
+  keys on-chain).
+
+### Real-condition verification status
+
+Code merged + 450 tests pass / clippy clean. **But**: production
+nodes JP+CN (last deployed v0.0.90 binary, built at 06:17
+today) PREDATE the discovery_bootstrap.rs file appearing on
+disk (10:41 today). `ss -uln` on JP+CN confirms NO UDP 30310
+listener — the v0.0.90 binary running in production does NOT
+have this code. v0.0.91 deploy + a `ss -uln | grep 30310`
+check is the first real-condition gate.
+
+### Scope discipline
+
+Out of scope for v0.0.91:
+
+- **Recursive DHT walks.** `discover_once_full` queries each
+  seed once and accepts `Neighbours` once. A real DHT would
+  iteratively FindNode against discovered peers to expand the
+  table. Adequate for a 3-validator testnet; will be the
+  next gating issue at 10+ validators.
+- **ENR (EIP-778).** Current implementation is older devp2p v4
+  packet format. ENRs add signed endpoint records with richer
+  metadata. Compatible-but-not-implemented.
+- **NAT-PMP / UPnP / hole-punch.** Goal 2. Still gated on
+  separate work.
+- **`bootnodes.aii.network` DNS** is referenced in the
+  mainnet seed list but the domain registration is independent
+  operator work.
+
 ## [0.0.90] — 2026-05-28
 
 ### Added — `eth_getTransactionByHash` + `eth_getBlock{ByHash,ByNumber}`

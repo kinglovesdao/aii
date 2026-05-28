@@ -19,6 +19,7 @@
 //! | `0x3ccfd60b` | `withdraw()` | (no args) |
 //! | `0x37038a1d` | `propose(uint64,string)` | `voting_ends_at_be8 ‖ title_len_be4 ‖ title_utf8` |
 //! | `0xc7f21560` | `vote(uint64,bool)` | `proposal_id_be8 ‖ support_byte (0/1)` |
+//! | `0x226f2645` | `registerValidator(bytes,bytes)` | `bls_pubkey[48] ‖ vrf_pubkey[32]` |
 //!
 //! A unit test (`selectors_match_keccak_signatures`) asserts the
 //! constants stay aligned with the canonical Solidity signature
@@ -26,8 +27,9 @@
 //! `status = false`.
 
 use crate::staking::StakeTable;
+use crate::validator_registry::{ValidatorKeys, ValidatorRegistry};
 use crate::Governance;
-use aii_types::{Address, U256};
+use aii_types::{Address, BlsPubKey, VrfPubKey, U256};
 
 /// Precompile destination address. Equal to
 /// `0x0000000000000000000000000000000000000099` — the AII mainnet
@@ -47,6 +49,8 @@ pub const OP_WITHDRAW: [u8; 4] = [0x3c, 0xcf, 0xd6, 0x0b];
 pub const OP_PROPOSE: [u8; 4] = [0x37, 0x03, 0x8a, 0x1d];
 /// `keccak256("vote(uint64,bool)")[..4]` (`0xc7f21560`).
 pub const OP_VOTE: [u8; 4] = [0xc7, 0xf2, 0x15, 0x60];
+/// `keccak256("registerValidator(bytes,bytes)")[..4]` (`0x226f2645`).
+pub const OP_REGISTER_VALIDATOR: [u8; 4] = [0x22, 0x6f, 0x26, 0x45];
 
 /// Outcome of executing one precompile call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +86,11 @@ pub enum PrecompileOutcome {
         /// Yes / no.
         support: bool,
     },
+    /// `registerValidator` — staker attached BFT runtime keys.
+    ValidatorRegistered {
+        /// Staker.
+        staker: Address,
+    },
 }
 
 /// Errors produced by the precompile dispatcher.
@@ -105,8 +114,10 @@ pub enum PrecompileError {
 /// # Errors
 /// Returns a typed error if the calldata is malformed or the
 /// underlying store rejects the operation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn dispatch(
     table: &StakeTable,
+    registry: &ValidatorRegistry,
     gov: &Governance,
     sender: Address,
     value: U256,
@@ -190,6 +201,36 @@ pub fn dispatch(
                 support,
             })
         }
+        OP_REGISTER_VALIDATOR => {
+            if !value.is_zero() {
+                return Err(PrecompileError::InvalidArgs(
+                    "registerValidator value must be zero".into(),
+                ));
+            }
+            if args.len() != 48 + 32 {
+                return Err(PrecompileError::InvalidArgs(
+                    "registerValidator args must be 80 bytes".into(),
+                ));
+            }
+            let mut bls = [0u8; 48];
+            bls.copy_from_slice(&args[..48]);
+            let mut vrf = [0u8; 32];
+            vrf.copy_from_slice(&args[48..]);
+            aii_crypto::bls::PublicKey::from_compressed(&bls)
+                .map_err(|e| PrecompileError::InvalidArgs(format!("bls_pubkey: {e}")))?;
+            aii_crypto::vrf::PublicKey::from_bytes(&vrf)
+                .map_err(|e| PrecompileError::InvalidArgs(format!("vrf_pubkey: {e}")))?;
+            registry
+                .register(
+                    &sender,
+                    ValidatorKeys {
+                        bls_pubkey: BlsPubKey::new(bls),
+                        vrf_pubkey: VrfPubKey::new(vrf),
+                    },
+                )
+                .map_err(|e| PrecompileError::Backend(e.to_string()))?;
+            Ok(PrecompileOutcome::ValidatorRegistered { staker: sender })
+        }
         _ => Err(PrecompileError::InvalidOpcode),
     }
 }
@@ -202,19 +243,30 @@ mod tests {
     use aii_storage::RocksDbBackend;
     use std::sync::Arc;
 
-    fn fresh() -> (StakeTable, Governance) {
+    fn fresh() -> (StakeTable, ValidatorRegistry, Governance) {
         let backend = Arc::new(RocksDbBackend::open_in_temp().unwrap());
         let table = StakeTable::new(Arc::clone(&backend));
+        let registry = ValidatorRegistry::new(Arc::clone(&backend));
         let gov = Governance::new(Arc::clone(&backend));
-        (table, gov)
+        (table, registry, gov)
     }
 
     #[test]
     fn bond_via_precompile_records_stake() {
-        let (table, gov) = fresh();
+        let (table, registry, gov) = fresh();
         let alice = Address::new([0xa1; 20]);
         let data = OP_BOND.to_vec();
-        let out = dispatch(&table, &gov, alice, U256::from(1_000u64), &data, 1, 100).unwrap();
+        let out = dispatch(
+            &table,
+            &registry,
+            &gov,
+            alice,
+            U256::from(1_000u64),
+            &data,
+            1,
+            100,
+        )
+        .unwrap();
         assert!(matches!(out, PrecompileOutcome::Bonded { .. }));
         let rec = table.get(&alice).unwrap().unwrap();
         assert_eq!(rec.amount_wei, U256::from(1_000u64));
@@ -222,20 +274,60 @@ mod tests {
 
     #[test]
     fn unbond_then_withdraw_round_trips_through_precompile() {
-        let (table, gov) = fresh();
+        let (table, registry, gov) = fresh();
         let alice = Address::new([0xa1; 20]);
         // Bond.
-        dispatch(&table, &gov, alice, U256::from(500u64), &OP_BOND, 1, 10).unwrap();
+        dispatch(
+            &table,
+            &registry,
+            &gov,
+            alice,
+            U256::from(500u64),
+            &OP_BOND,
+            1,
+            10,
+        )
+        .unwrap();
         // Begin unbond.
-        dispatch(&table, &gov, alice, U256::ZERO, &OP_BEGIN_UNBOND, 5, 10).unwrap();
+        dispatch(
+            &table,
+            &registry,
+            &gov,
+            alice,
+            U256::ZERO,
+            &OP_BEGIN_UNBOND,
+            5,
+            10,
+        )
+        .unwrap();
         // Withdraw too early: returns Withdrawn with amount 0.
-        let early = dispatch(&table, &gov, alice, U256::ZERO, &OP_WITHDRAW, 6, 10).unwrap();
+        let early = dispatch(
+            &table,
+            &registry,
+            &gov,
+            alice,
+            U256::ZERO,
+            &OP_WITHDRAW,
+            6,
+            10,
+        )
+        .unwrap();
         match early {
             PrecompileOutcome::Withdrawn { amount, .. } => assert_eq!(amount, U256::ZERO),
             _ => panic!("expected Withdrawn"),
         }
         // Withdraw after unbond elapsed (5 + 10 = 15).
-        let late = dispatch(&table, &gov, alice, U256::ZERO, &OP_WITHDRAW, 16, 10).unwrap();
+        let late = dispatch(
+            &table,
+            &registry,
+            &gov,
+            alice,
+            U256::ZERO,
+            &OP_WITHDRAW,
+            16,
+            10,
+        )
+        .unwrap();
         match late {
             PrecompileOutcome::Withdrawn { amount, .. } => assert_eq!(amount, U256::from(500u64)),
             _ => panic!("expected Withdrawn"),
@@ -244,7 +336,7 @@ mod tests {
 
     #[test]
     fn propose_via_precompile_records_governance_entry() {
-        let (table, gov) = fresh();
+        let (table, registry, gov) = fresh();
         let alice = Address::new([0xa1; 20]);
         // voting_ends_at_be8 ‖ title_len_be4 ‖ title_utf8
         let title = b"raise gas limit";
@@ -252,7 +344,7 @@ mod tests {
         data.extend_from_slice(&100u64.to_be_bytes());
         data.extend_from_slice(&u32::try_from(title.len()).unwrap().to_be_bytes());
         data.extend_from_slice(title);
-        let out = dispatch(&table, &gov, alice, U256::ZERO, &data, 1, 100).unwrap();
+        let out = dispatch(&table, &registry, &gov, alice, U256::ZERO, &data, 1, 100).unwrap();
         match out {
             PrecompileOutcome::Proposed { id } => {
                 assert_eq!(id, 1);
@@ -266,7 +358,7 @@ mod tests {
 
     #[test]
     fn vote_via_precompile_records_vote_weight() {
-        let (table, gov) = fresh();
+        let (table, registry, gov) = fresh();
         let alice = Address::new([0xa1; 20]);
         // Bond + propose first.
         table.bond(&alice, U256::from(1_000u64)).unwrap();
@@ -275,8 +367,32 @@ mod tests {
         let mut data = OP_VOTE.to_vec();
         data.extend_from_slice(&id.to_be_bytes());
         data.push(1);
-        let out = dispatch(&table, &gov, alice, U256::ZERO, &data, 5, 100).unwrap();
+        let out = dispatch(&table, &registry, &gov, alice, U256::ZERO, &data, 5, 100).unwrap();
         assert_eq!(out, PrecompileOutcome::Voted { id, support: true });
+    }
+
+    #[test]
+    fn register_validator_via_precompile_records_runtime_keys() {
+        let (table, registry, gov) = fresh();
+        let alice = Address::new([0xa1; 20]);
+        let bls_sk = aii_crypto::bls::SecretKey::from_ikm(&[0x11; 32], b"aii-register-test")
+            .expect("bls keygen");
+        let vrf_sk = aii_crypto::vrf::SecretKey::generate();
+        let bls = bls_sk.public_key().to_compressed();
+        let vrf = vrf_sk.public_key().to_bytes();
+        let mut data = OP_REGISTER_VALIDATOR.to_vec();
+        data.extend_from_slice(&bls);
+        data.extend_from_slice(&vrf);
+
+        let out = dispatch(&table, &registry, &gov, alice, U256::ZERO, &data, 5, 100).unwrap();
+
+        assert_eq!(
+            out,
+            PrecompileOutcome::ValidatorRegistered { staker: alice }
+        );
+        let keys = registry.get(&alice).unwrap().unwrap();
+        assert_eq!(keys.bls_pubkey, BlsPubKey::new(bls));
+        assert_eq!(keys.vrf_pubkey, VrfPubKey::new(vrf));
     }
 
     #[test]
@@ -293,15 +409,16 @@ mod tests {
         assert_eq!(OP_WITHDRAW, sel("withdraw()"));
         assert_eq!(OP_PROPOSE, sel("propose(uint64,string)"));
         assert_eq!(OP_VOTE, sel("vote(uint64,bool)"));
+        assert_eq!(OP_REGISTER_VALIDATOR, sel("registerValidator(bytes,bytes)"));
     }
 
     #[test]
     fn unknown_opcode_rejected() {
-        let (table, gov) = fresh();
+        let (table, registry, gov) = fresh();
         let alice = Address::new([0xa1; 20]);
         let data = [0u8, 0, 0, 0xff];
         assert!(matches!(
-            dispatch(&table, &gov, alice, U256::ZERO, &data, 1, 100),
+            dispatch(&table, &registry, &gov, alice, U256::ZERO, &data, 1, 100),
             Err(PrecompileError::InvalidOpcode)
         ));
     }

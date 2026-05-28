@@ -600,6 +600,43 @@ mod tests {
     }
 
     #[test]
+    fn single_validator_gossip_finalises_without_peers() {
+        let bls = bls_sk(1);
+        let vrf = vrf_sk();
+        let vs = ValidatorSet::new(vec![Validator {
+            bls_pubkey: bls.public_key(),
+            vrf_pubkey: vrf.public_key(),
+            stake: 100,
+        }])
+        .unwrap();
+        let g = genesis();
+        let e = build_engine(0, &vs, &[(bls, vrf)], &g);
+        e.set_pending_txs(vec![dummy_signed_tx(0)]);
+        let (t, _peer) = MemoryTransport::pair();
+        let gossip = BftGossip::new(e.clone(), t);
+
+        let mut committed: Option<Block> = None;
+        for _ in 0..10 {
+            gossip.tick();
+            if committed.is_none() {
+                committed = gossip
+                    .drain_harvested()
+                    .into_iter()
+                    .next()
+                    .or_else(|| e.try_harvest_committed());
+            }
+            if committed.is_some() {
+                break;
+            }
+        }
+
+        let block = committed.expect("single validator gossip should self-finalise");
+        assert_eq!(block.header.number, 1);
+        assert_eq!(block.body.transactions.len(), 1);
+        assert_eq!(e.head().1, 1);
+    }
+
+    #[test]
     fn two_node_gossip_finalises_block_carrying_txs() {
         // 2-validator BFT (quorum = 2 of 2). Leader stages two txs;
         // proposal carries the body; follower reconstructs the same

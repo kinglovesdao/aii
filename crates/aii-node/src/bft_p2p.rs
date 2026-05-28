@@ -54,6 +54,12 @@ const OUTBOUND_ONLY_BIND: &str = "127.0.0.1:0";
 /// relevant.
 const GOSSIP_DEDUP_CAPACITY: usize = 4096;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireMode {
+    Plain,
+    Noise,
+}
+
 /// Hash-based dedup for gossip relay.
 ///
 /// Bounded by [`GOSSIP_DEDUP_CAPACITY`]. Insertions return `true` if
@@ -120,9 +126,13 @@ pub struct TcpBftTransport {
     dedup: Arc<Mutex<GossipDedup>>,
     /// Address the listener bound to.
     local_addr: SocketAddr,
+    /// Whether outbound dialers wrap sockets in Noise.
+    wire_mode: WireMode,
+    /// Remote addresses with active retry dialers.
+    dial_targets: Arc<Mutex<HashSet<SocketAddr>>>,
     /// Handles to the spawned acceptor + dialer tasks (kept so the
     /// transport's `Drop` can abort them).
-    _tasks: Vec<JoinHandle<()>>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TcpBftTransport {
@@ -139,15 +149,15 @@ impl TcpBftTransport {
         let (out_tx, _) = broadcast::channel::<Vec<u8>>(1024);
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let dedup = Arc::new(Mutex::new(GossipDedup::new()));
-
-        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        let dial_targets = Arc::new(Mutex::new(HashSet::new()));
+        let tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
 
         // Acceptor: every inbound TcpStream gets a reader + writer pair.
         {
             let out_tx = out_tx.clone();
             let inbox = inbox.clone();
             let dedup = dedup.clone();
-            tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
@@ -159,39 +169,25 @@ impl TcpBftTransport {
                         }
                     }
                 }
-            }));
+            });
+            if let Ok(mut guard) = tasks.lock() {
+                guard.push(task);
+            }
         }
 
-        // Dialer: one per remote address, with infinite retry.
-        for addr in peer_addrs {
-            let out_tx = out_tx.clone();
-            let inbox = inbox.clone();
-            let dedup = dedup.clone();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    match TcpStream::connect(addr).await {
-                        Ok(stream) => {
-                            let inbox = inbox.clone();
-                            let out_tx = out_tx.clone();
-                            let dedup = dedup.clone();
-                            // Block until this connection dies, then retry.
-                            run_peer(stream, out_tx, inbox, dedup).await;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-            }));
-        }
-
-        Ok(Self {
+        let transport = Self {
             out_tx,
             inbox,
             dedup,
             local_addr,
-            _tasks: tasks,
-        })
+            wire_mode: WireMode::Plain,
+            dial_targets,
+            tasks,
+        };
+        for addr in peer_addrs {
+            let _ = transport.add_peer(addr);
+        }
+        Ok(transport)
     }
 
     /// Like [`Self::new`] but every accepted / dialed connection is
@@ -214,13 +210,14 @@ impl TcpBftTransport {
         let (out_tx, _) = broadcast::channel::<Vec<u8>>(1024);
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let dedup = Arc::new(Mutex::new(GossipDedup::new()));
-        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        let dial_targets = Arc::new(Mutex::new(HashSet::new()));
+        let tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
 
         {
             let out_tx = out_tx.clone();
             let inbox = inbox.clone();
             let dedup = dedup.clone();
-            tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
@@ -237,41 +234,25 @@ impl TcpBftTransport {
                         }
                     }
                 }
-            }));
+            });
+            if let Ok(mut guard) = tasks.lock() {
+                guard.push(task);
+            }
         }
 
-        for addr in peer_addrs {
-            let out_tx = out_tx.clone();
-            let inbox = inbox.clone();
-            let dedup = dedup.clone();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    match TcpStream::connect(addr).await {
-                        Ok(stream) => {
-                            run_peer_noise(
-                                stream,
-                                true,
-                                out_tx.clone(),
-                                inbox.clone(),
-                                dedup.clone(),
-                            )
-                            .await;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-            }));
-        }
-
-        Ok(Self {
+        let transport = Self {
             out_tx,
             inbox,
             dedup,
             local_addr,
-            _tasks: tasks,
-        })
+            wire_mode: WireMode::Noise,
+            dial_targets,
+            tasks,
+        };
+        for addr in peer_addrs {
+            let _ = transport.add_peer(addr);
+        }
+        Ok(transport)
     }
 
     /// BTC-style outbound-only constructor (v0.0.68).
@@ -310,6 +291,87 @@ impl TcpBftTransport {
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
+
+    /// Start a retrying outbound dialer for `addr` if one is not
+    /// already active.
+    ///
+    /// Returns `true` when a new dialer was spawned. This is used by
+    /// runtime Discovery v4 refreshes so newly found peers join the
+    /// live BFT fanout immediately instead of waiting for a process
+    /// restart.
+    #[must_use]
+    pub fn add_peer(&self, addr: SocketAddr) -> bool {
+        if addr == self.local_addr {
+            return false;
+        }
+        {
+            let Ok(mut targets) = self.dial_targets.lock() else {
+                return false;
+            };
+            if !targets.insert(addr) {
+                return false;
+            }
+        }
+        let task = match self.wire_mode {
+            WireMode::Plain => spawn_plain_dialer(
+                addr,
+                self.out_tx.clone(),
+                self.inbox.clone(),
+                self.dedup.clone(),
+            ),
+            WireMode::Noise => spawn_noise_dialer(
+                addr,
+                self.out_tx.clone(),
+                self.inbox.clone(),
+                self.dedup.clone(),
+            ),
+        };
+        if let Ok(mut guard) = self.tasks.lock() {
+            guard.push(task);
+        }
+        true
+    }
+}
+
+fn spawn_plain_dialer(
+    addr: SocketAddr,
+    out_tx: broadcast::Sender<Vec<u8>>,
+    inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    dedup: Arc<Mutex<GossipDedup>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    run_peer(stream, out_tx.clone(), inbox.clone(), dedup.clone()).await;
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_noise_dialer(
+    addr: SocketAddr,
+    out_tx: broadcast::Sender<Vec<u8>>,
+    inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    dedup: Arc<Mutex<GossipDedup>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    run_peer_noise(stream, true, out_tx.clone(), inbox.clone(), dedup.clone())
+                        .await;
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    })
 }
 
 impl BftTransport for TcpBftTransport {
@@ -581,6 +643,34 @@ mod tests {
         panic!("never received broadcast");
     }
 
+    /// Runtime peer addition: a node can learn a peer after startup
+    /// (via Discovery v4) and begin dialing it without rebuilding the
+    /// transport.
+    #[tokio::test]
+    async fn add_peer_dials_runtime_plaintext_peer() {
+        let a = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let b = TcpBftTransport::new("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+
+        assert!(b.add_peer(a.local_addr()));
+        assert!(
+            !b.add_peer(a.local_addr()),
+            "duplicate peer must be ignored"
+        );
+
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.broadcast(vec![0x11, 0x22, 0x33]);
+            if a.try_recv().is_some() {
+                return;
+            }
+        }
+        panic!("runtime-added plaintext peer never received broadcast");
+    }
+
     /// Two transports exchange a payload over a Noise XX handshake
     /// (encrypted BFT gossip — v0.0.64). Same shape as the plaintext
     /// test, just with `new_encrypted`.
@@ -601,6 +691,27 @@ mod tests {
             }
         }
         panic!("never received broadcast over Noise transport");
+    }
+
+    #[tokio::test]
+    async fn add_peer_dials_runtime_noise_peer() {
+        let a = TcpBftTransport::new_encrypted("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let b = TcpBftTransport::new_encrypted("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+
+        assert!(b.add_peer(a.local_addr()));
+
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.broadcast(vec![0x44, 0x55, 0x66]);
+            if a.try_recv().is_some() {
+                return;
+            }
+        }
+        panic!("runtime-added noise peer never received broadcast");
     }
 
     /// Outbound-only mode (v0.0.68) — B dials A using
