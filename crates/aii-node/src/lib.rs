@@ -1894,6 +1894,59 @@ impl RpcState for NodeState {
         self.update_peers()
     }
 
+    async fn code_at(&self, addr: &Address) -> Vec<u8> {
+        // v0.0.89: look up the account's code_hash, then resolve
+        // the runtime bytes via the Code CF. EOAs and
+        // non-existent accounts return empty.
+        let Ok(Some(acc)) = self.state.account(addr) else {
+            return Vec::new();
+        };
+        match self.state.code_get(&acc.code_hash) {
+            Ok(Some(bytes)) => bytes,
+            _ => Vec::new(),
+        }
+    }
+
+    async fn storage_at(&self, addr: &Address, slot: &aii_types::H256) -> aii_types::H256 {
+        // v0.0.89: pass through to StateDb. Unset slots return
+        // H256::ZERO at the storage layer; we propagate.
+        self.state
+            .storage_get(addr, slot)
+            .unwrap_or(aii_types::H256::ZERO)
+    }
+
+    async fn estimate_gas(
+        &self,
+        req: aii_rpc::SimulateCallParams,
+    ) -> Result<u64, aii_rpc::SimulateCallError> {
+        // v0.0.89: same simulation path as eth_call, but we
+        // report the gas counter instead of the return bytes.
+        // For a reverting tx we still propagate the revert
+        // reason — matches geth's behaviour (estimateGas
+        // surfaces reverts so wallets show the right error).
+        match aii_evm::simulate_with_revm(
+            &self.state,
+            req.from,
+            Some(req.to),
+            req.value,
+            req.data,
+            req.gas_limit,
+            req.gas_price,
+        ) {
+            Ok(sim) => {
+                if sim.success {
+                    Ok(sim.gas_used)
+                } else {
+                    Err(aii_rpc::SimulateCallError::Reverted(
+                        sim.revert_reason
+                            .unwrap_or_else(|| "execution failed".to_string()),
+                    ))
+                }
+            }
+            Err(e) => Err(aii_rpc::SimulateCallError::Evm(e.to_string())),
+        }
+    }
+
     async fn simulate_call(
         &self,
         req: aii_rpc::SimulateCallParams,
@@ -2196,6 +2249,214 @@ mod tests {
             bob_after.is_none() || bob_after.unwrap().balance == aii_types::U256::ZERO,
             "eth_call must not modify recipient balance",
         );
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.89 eth_estimateGas for a value transfer should
+    /// be exactly 21,000 (intrinsic gas, no execution beyond
+    /// the transfer itself).
+    #[tokio::test]
+    async fn eth_estimate_gas_value_transfer_is_21000() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa2; 20]);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: aii_types::U256::from(1_000_000_000_000_000_000_u128),
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let req = serde_json::json!({
+            "from": format!("0x{}", hex::encode(alice.as_bytes())),
+            "to": "0x000000000000000000000000000000000000bbbb",
+        });
+        let gas_hex: String = client
+            .request("eth_estimateGas", rpc_params![req, "latest"])
+            .await
+            .unwrap();
+        let gas = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(
+            gas, 21_000,
+            "value transfer must be exactly 21k intrinsic gas"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.89 eth_getCode against an EOA returns "0x"
+    /// (empty). Against a deployed contract, returns the
+    /// runtime bytecode.
+    #[tokio::test]
+    async fn eth_get_code_eoa_and_contract() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa3; 20]);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: aii_types::U256::from(1_000_000_000_000_000_000_u128),
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // Deploy a tiny contract whose runtime is just 0x6077 (PUSH1 0x77 — incomplete but parseable as bytes).
+        let runtime: Vec<u8> = vec![0x60, 0x77, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            None,
+            aii_types::U256::ZERO,
+            init,
+            500_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+        let contract = deploy.deployed_contract.unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        // EOA → "0x".
+        let eoa_code: String = client
+            .request(
+                "eth_getCode",
+                rpc_params![format!("0x{}", hex::encode(alice.as_bytes())), "latest"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(eoa_code, "0x", "EOA must have empty code");
+
+        // Contract → runtime bytes hex.
+        let contract_code: String = client
+            .request(
+                "eth_getCode",
+                rpc_params![format!("0x{}", hex::encode(contract.as_bytes())), "latest"],
+            )
+            .await
+            .unwrap();
+        let bytes = hex::decode(contract_code.trim_start_matches("0x")).unwrap();
+        assert_eq!(bytes, runtime, "contract code must round-trip exactly");
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.89 eth_getStorageAt: unset slot returns
+    /// `0x000…000`; after a write via revm, the slot returns
+    /// the committed value.
+    #[tokio::test]
+    async fn eth_get_storage_at_returns_committed_value() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa4; 20]);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: aii_types::U256::from(1_000_000_000_000_000_000_u128),
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // Deploy a contract whose runtime SSTOREs 0xdead to
+        // slot 0 then returns. Init wraps + CODECOPY.
+        // Runtime:
+        //   PUSH2 0xde 0xad → wait, simpler to PUSH2 0xdead then SSTORE
+        // Use: PUSH2 0xdead PUSH1 0x00 SSTORE STOP
+        let runtime: Vec<u8> = vec![
+            0x61, 0xde, 0xad, // PUSH2 0xdead
+            0x60, 0x00, // PUSH1 0x00
+            0x55, //       SSTORE
+            0x00, //       STOP
+        ];
+        let len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            None,
+            aii_types::U256::ZERO,
+            init,
+            500_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+        let contract = deploy.deployed_contract.unwrap();
+
+        // Run the contract once so it SSTOREs.
+        let _ = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            Some(contract),
+            aii_types::U256::ZERO,
+            vec![],
+            100_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        // Slot 0 → 0xdead (left-padded to 32 bytes).
+        let v0: String = client
+            .request(
+                "eth_getStorageAt",
+                rpc_params![
+                    format!("0x{}", hex::encode(contract.as_bytes())),
+                    "0x0",
+                    "latest"
+                ],
+            )
+            .await
+            .unwrap();
+        let mut expected = [0u8; 32];
+        expected[30] = 0xde;
+        expected[31] = 0xad;
+        assert_eq!(v0, format!("0x{}", hex::encode(expected)));
+
+        // Slot 1 (unset) → all zeros.
+        let v1: String = client
+            .request(
+                "eth_getStorageAt",
+                rpc_params![
+                    format!("0x{}", hex::encode(contract.as_bytes())),
+                    "0x1",
+                    "latest"
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(v1, format!("0x{}", "00".repeat(32)));
         handle.stop().unwrap();
     }
 
