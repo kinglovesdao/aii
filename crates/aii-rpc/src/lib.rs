@@ -100,6 +100,61 @@ pub struct HeaderView {
     pub extra_data_hex: String,
 }
 
+/// Ethereum-JSON-RPC-shaped transaction response (v0.0.90).
+///
+/// Used by `eth_getTransactionByHash` and as the
+/// full-transaction variant inside [`EthBlockResponse`].
+/// Carries the same body as [`TxView`] (via flatten) plus the
+/// three "where did this tx land" fields a MetaMask /
+/// ethers.js client expects: block hash, block number, and
+/// in-block index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EthTxResponse {
+    /// Inlined TxView fields (`hash`, `from`, `to`, `value`,
+    /// `nonce`, `gas_limit`, fee fields, `tx_type`).
+    #[serde(flatten)]
+    pub tx: TxView,
+    /// `0x…` 32-byte hex of the containing block's hash.
+    pub block_hash: String,
+    /// `0x…` hex of the containing block's number.
+    pub block_number: String,
+    /// `0x…` hex of the tx's index within the block.
+    pub transaction_index: String,
+}
+
+/// Ethereum-JSON-RPC-shaped block response (v0.0.90).
+///
+/// Used by `eth_getBlockByHash` / `eth_getBlockByNumber`.
+/// Carries every field from [`HeaderView`] (via flatten) plus
+/// a `transactions` array — either a list of tx hashes
+/// (`full = false`, default for cheap explorer queries) or a
+/// list of full [`EthTxResponse`] objects (`full = true`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EthBlockResponse {
+    /// Inlined HeaderView fields.
+    #[serde(flatten)]
+    pub header: HeaderView,
+    /// Either tx hashes (`["0x…", "0x…", …]`) or full tx
+    /// objects, depending on the `full_transactions` arg
+    /// passed by the caller.
+    pub transactions: EthBlockTxs,
+}
+
+/// `transactions` payload of an [`EthBlockResponse`] — either
+/// hashes or full objects.
+///
+/// `#[serde(untagged)]` so the JSON wire shape is just a plain
+/// array of strings or a plain array of objects (no enum
+/// discriminator). Matches the Ethereum spec.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EthBlockTxs {
+    /// `full_transactions = false`: array of `0x…` tx hashes.
+    Hashes(Vec<String>),
+    /// `full_transactions = true`: array of full tx objects.
+    Full(Vec<EthTxResponse>),
+}
+
 /// Read-only state the RPC server consumes.
 #[async_trait]
 pub trait RpcState: Send + Sync + 'static {
@@ -172,6 +227,36 @@ pub trait RpcState: Send + Sync + 'static {
     /// the block number it landed in (or `None` if unknown). Default
     /// returns `None`; node impls override.
     async fn transaction_by_hash(&self, _hash: &str) -> Option<(TxView, u64)> {
+        None
+    }
+
+    /// Ethereum-shaped tx lookup (v0.0.90). Same data as
+    /// [`Self::transaction_by_hash`] plus the block hash and
+    /// in-block index that an `eth_getTransactionByHash`
+    /// caller expects. Default returns `None`.
+    async fn eth_transaction_by_hash(&self, _hash: &str) -> Option<EthTxResponse> {
+        None
+    }
+
+    /// Ethereum-shaped block lookup by number (v0.0.90). When
+    /// `full_transactions` is `false`, the response's `transactions`
+    /// field is a list of tx hashes; when `true`, it's a list of
+    /// full [`EthTxResponse`] objects. Default returns `None`.
+    async fn eth_block_by_number(
+        &self,
+        _n: u64,
+        _full_transactions: bool,
+    ) -> Option<EthBlockResponse> {
+        None
+    }
+
+    /// Ethereum-shaped block lookup by hash (v0.0.90). Same shape
+    /// as [`Self::eth_block_by_number`]. Default returns `None`.
+    async fn eth_block_by_hash(
+        &self,
+        _hash: &str,
+        _full_transactions: bool,
+    ) -> Option<EthBlockResponse> {
         None
     }
 
@@ -543,6 +628,34 @@ pub trait EthRpc {
         slot: String,
         block_tag: Option<String>,
     ) -> RpcResult<String>;
+
+    /// `eth_getTransactionByHash(hash)` — return the tx body
+    /// + block location for a finalised tx, or `null` if
+    /// unknown (v0.0.90).
+    #[method(name = "getTransactionByHash")]
+    async fn get_transaction_by_hash(&self, hash: String) -> RpcResult<Option<EthTxResponse>>;
+
+    /// `eth_getBlockByNumber(numberOrTag, fullTransactions)` —
+    /// returns the block header + transactions for the given
+    /// block (v0.0.90). `numberOrTag` accepts hex (`0x…`),
+    /// decimal, or `"latest" | "earliest"`. `null` if the
+    /// block doesn't exist.
+    #[method(name = "getBlockByNumber")]
+    async fn get_block_by_number(
+        &self,
+        number_or_tag: String,
+        full_transactions: bool,
+    ) -> RpcResult<Option<EthBlockResponse>>;
+
+    /// `eth_getBlockByHash(hash, fullTransactions)` — same
+    /// shape as [`Self::get_block_by_number`], looked up by
+    /// 32-byte block hash. `null` if unknown.
+    #[method(name = "getBlockByHash")]
+    async fn get_block_by_hash(
+        &self,
+        hash: String,
+        full_transactions: bool,
+    ) -> RpcResult<Option<EthBlockResponse>>;
 }
 
 /// Request body for the v0.0.88 `eth_call` JSON-RPC method.
@@ -1084,6 +1197,53 @@ impl<S: RpcState> EthRpcServer for EthRpcImpl<S> {
         let value = self.state.storage_at(&addr, &slot_h).await;
         Ok(format!("0x{}", hex::encode(value.as_bytes())))
     }
+
+    async fn get_transaction_by_hash(&self, hash: String) -> RpcResult<Option<EthTxResponse>> {
+        Ok(self.state.eth_transaction_by_hash(&hash).await)
+    }
+
+    async fn get_block_by_number(
+        &self,
+        number_or_tag: String,
+        full_transactions: bool,
+    ) -> RpcResult<Option<EthBlockResponse>> {
+        let head = self.state.head_block_number().await;
+        let Some(n) = parse_block_number_or_tag(&number_or_tag, head) else {
+            return Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32602,
+                format!("invalid block number/tag: {number_or_tag}"),
+                None::<()>,
+            ));
+        };
+        Ok(self.state.eth_block_by_number(n, full_transactions).await)
+    }
+
+    async fn get_block_by_hash(
+        &self,
+        hash: String,
+        full_transactions: bool,
+    ) -> RpcResult<Option<EthBlockResponse>> {
+        Ok(self.state.eth_block_by_hash(&hash, full_transactions).await)
+    }
+}
+
+/// Parse an Ethereum-JSON-RPC block-number argument.
+///
+/// Accepts:
+/// - `"latest"` / `"pending"` / `"safe"` / `"finalized"` → `head`
+/// - `"earliest"` → `0`
+/// - `"0x…"` hex → decoded number
+/// - decimal digits → parsed as base-10
+///
+/// Returns `None` on parse failure. Unlike Ethereum, "pending"
+/// is treated as "latest" — AII has no separate pending block.
+fn parse_block_number_or_tag(s: &str, head: u64) -> Option<u64> {
+    match s {
+        "latest" | "pending" | "safe" | "finalized" => Some(head),
+        "earliest" => Some(0),
+        s if s.starts_with("0x") || s.starts_with("0X") => u64::from_str_radix(&s[2..], 16).ok(),
+        s => s.parse::<u64>().ok(),
+    }
 }
 
 /// Parse a `0x…` 32-byte hex string into an `H256`. Accepts
@@ -1528,6 +1688,39 @@ mod tests {
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
+
+    // ──────────────── v0.0.90: block-tag parser unit tests ────────────────
+
+    #[test]
+    fn block_tag_parser_handles_named_tags() {
+        assert_eq!(parse_block_number_or_tag("latest", 100), Some(100));
+        assert_eq!(parse_block_number_or_tag("pending", 100), Some(100));
+        assert_eq!(parse_block_number_or_tag("safe", 100), Some(100));
+        assert_eq!(parse_block_number_or_tag("finalized", 100), Some(100));
+        assert_eq!(parse_block_number_or_tag("earliest", 100), Some(0));
+    }
+
+    #[test]
+    fn block_tag_parser_handles_hex() {
+        assert_eq!(parse_block_number_or_tag("0x0", 100), Some(0));
+        assert_eq!(parse_block_number_or_tag("0x1", 100), Some(1));
+        assert_eq!(parse_block_number_or_tag("0xff", 100), Some(255));
+        assert_eq!(parse_block_number_or_tag("0X10", 100), Some(16));
+    }
+
+    #[test]
+    fn block_tag_parser_handles_decimal() {
+        assert_eq!(parse_block_number_or_tag("0", 100), Some(0));
+        assert_eq!(parse_block_number_or_tag("42", 100), Some(42));
+        assert_eq!(parse_block_number_or_tag("1000", 100), Some(1000));
+    }
+
+    #[test]
+    fn block_tag_parser_rejects_garbage() {
+        assert_eq!(parse_block_number_or_tag("garbage", 100), None);
+        assert_eq!(parse_block_number_or_tag("0xZZ", 100), None);
+        assert_eq!(parse_block_number_or_tag("", 100), None);
+    }
 
     struct TestState {
         chain_id: u64,

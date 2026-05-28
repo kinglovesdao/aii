@@ -5,6 +5,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.90] — 2026-05-28
+
+### Added — `eth_getTransactionByHash` + `eth_getBlock{ByHash,ByNumber}`
+
+Closes the read-side gap that block explorers and indexers
+need. With v0.0.88-89's `eth_call` / `eth_estimateGas` /
+`eth_getCode` / `eth_getStorageAt` already wired, dApps work.
+This release adds the tx-lookup and block-lookup methods
+explorers (Etherscan-style) and indexers (subgraph-style)
+hit constantly.
+
+#### `aii-rpc`
+
+- New `eth_getTransactionByHash(hash)` — returns the tx body
+  + its location: `EthTxResponse { …TxView, block_hash,
+  block_number, transaction_index }`. `null` if unknown.
+- New `eth_getBlockByNumber(numberOrTag, fullTransactions)` —
+  returns `EthBlockResponse { …HeaderView, transactions }`.
+  `numberOrTag` accepts hex (`0x…`), decimal, or any of
+  `"latest" | "pending" | "safe" | "finalized" | "earliest"`.
+  AII has no separate pending state today, so `pending`
+  resolves to head. `null` if unknown.
+- New `eth_getBlockByHash(hash, fullTransactions)` — same
+  shape, looked up by 32-byte block hash.
+- New wire types: `EthTxResponse` (flatten of `TxView`),
+  `EthBlockResponse` (flatten of `HeaderView`), and
+  `EthBlockTxs` (untagged enum: array of tx hashes or array
+  of full tx objects, depending on the boolean flag).
+- New `RpcState` trait methods: `eth_transaction_by_hash`,
+  `eth_block_by_number`, `eth_block_by_hash`. All default
+  `None`; `aii-node::NodeState` overrides.
+- New private `parse_block_number_or_tag` parser; 4 unit
+  tests cover named tags, hex, decimal, and garbage rejection.
+
+#### `aii-node::NodeState`
+
+- `eth_transaction_by_hash` reuses the existing `tx_index +
+  by_number + body_by_hash` triple-lookup that
+  `transaction_by_hash` already does, and additionally
+  reports the block hash + in-block index.
+- New `eth_block_response_from_indices` helper composes
+  HeaderView + transactions list (hashes or full) from a
+  read-locked `BlockStore`. Used by both lookup paths.
+- 5 new integration tests: commit + lookup by number,
+  lookup by `"latest"` tag, lookup by hash, unknown tx hash
+  returns null, unknown block number returns null.
+
+### Wallet/explorer eth_* RPC surface — now complete
+
+```
+✓ eth_chainId               ✓ eth_call                  (v0.0.88)
+✓ eth_blockNumber           ✓ eth_estimateGas           (v0.0.89)
+✓ eth_gasPrice              ✓ eth_getCode               (v0.0.89)
+✓ eth_getBalance            ✓ eth_getStorageAt          (v0.0.89)
+✓ eth_sendRawTransaction    ✓ eth_getTransactionByHash  (v0.0.90)
+✓ eth_getTransactionReceipt ✓ eth_getBlockByNumber      (v0.0.90)
+✓ eth_getLogs               ✓ eth_getBlockByHash        (v0.0.90)
+```
+
+A stock Etherscan-clone pointed at an `aiid` endpoint can
+now render: chain stats, account balances + nonces + code,
+block listings with full or compact tx lists, transaction
+detail pages, log filters, and gas estimates for pending
+operations.
+
+### Scope discipline
+
+Out of scope for v0.0.90:
+
+- **`eth_getBlockTransactionCountByX`** — derivable from
+  `eth_getBlockByX(…, false).transactions.len()`. Cheap to
+  add when an explorer asks for it.
+- **`eth_getTransactionByBlockHashAndIndex`** — composable
+  from existing methods. Not strictly needed by current
+  clients.
+- **Block-tag historical lookup.** `eth_call`,
+  `eth_estimateGas`, `eth_getCode`, `eth_getStorageAt`,
+  `eth_getBalance` still ignore the `blockTag` argument —
+  every read runs against head state. Historical-state
+  queries need MPT + state-root pinning; separately scoped.
+- **`eth_newBlockFilter` / `eth_newPendingTransactionFilter`** —
+  push-style subscriptions. Need WebSocket transport
+  (jsonrpsee supports it; currently we only bind HTTP).
+
+Tests: +5 RPC integration + 4 block-tag parser unit. 868
+tests pass / clippy clean.
+
 ## [0.0.89] — 2026-05-28
 
 ### Added — `eth_estimateGas` + `eth_getCode` + `eth_getStorageAt`

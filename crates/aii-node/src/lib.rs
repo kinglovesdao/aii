@@ -1341,6 +1341,50 @@ fn parse_hash_h256(s: &str) -> Option<H256> {
     parse_hash_str(s)
 }
 
+/// Build an [`aii_rpc::EthBlockResponse`] from already-read
+/// `BlockStore` indices (v0.0.90 helper, used by both
+/// `eth_block_by_number` and `eth_block_by_hash`).
+///
+/// Caller holds the `RwLockReadGuard<BlockStore>` so we
+/// don't take a second lock.
+fn eth_block_response_from_indices(
+    chain_id: u64,
+    store: &BlockStore,
+    block_hash: H256,
+    full_transactions: bool,
+) -> Option<aii_rpc::EthBlockResponse> {
+    let header = store.by_hash.get(&block_hash)?;
+    let body = store.body_by_hash.get(&block_hash)?;
+    let header_view = header_to_view(block_hash, header);
+    let block_number_hex = format!("0x{:x}", header.number);
+    let block_hash_hex = format!("0x{}", hex::encode(block_hash.as_bytes()));
+    let transactions = if full_transactions {
+        let full: Vec<aii_rpc::EthTxResponse> = body
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(idx, tx)| aii_rpc::EthTxResponse {
+                tx: tx_to_view(tx, chain_id),
+                block_hash: block_hash_hex.clone(),
+                block_number: block_number_hex.clone(),
+                transaction_index: format!("0x{idx:x}"),
+            })
+            .collect();
+        aii_rpc::EthBlockTxs::Full(full)
+    } else {
+        let hashes: Vec<String> = body
+            .transactions
+            .iter()
+            .map(|tx| format!("0x{}", hex::encode(tx.hash().as_bytes())))
+            .collect();
+        aii_rpc::EthBlockTxs::Hashes(hashes)
+    };
+    Some(aii_rpc::EthBlockResponse {
+        header: header_view,
+        transactions,
+    })
+}
+
 fn tx_to_view(tx: &Tx, chain_id: u64) -> TxView {
     use aii_block::tx::{TxEip1559, TxEip4844, TxLegacy};
     let hash = format!("0x{}", hex::encode(tx.hash().as_bytes()));
@@ -1519,6 +1563,46 @@ impl RpcState for NodeState {
         let body = s.body_by_hash.get(&block_hash)?;
         let tx = body.transactions.get(idx)?;
         Some((tx_to_view(tx, chain_id), block_number))
+    }
+
+    async fn eth_transaction_by_hash(&self, hash_hex: &str) -> Option<aii_rpc::EthTxResponse> {
+        // v0.0.90: same lookup as transaction_by_hash, but
+        // expose the in-block index + block hash too.
+        let chain_id = self.spec.chain_id;
+        let h = parse_hash_h256(hash_hex)?;
+        let s = self.blocks.read().ok()?;
+        let (block_number, idx) = *s.tx_index.get(&h)?;
+        let block_hash = *s.by_number.get(&block_number)?;
+        let body = s.body_by_hash.get(&block_hash)?;
+        let tx = body.transactions.get(idx)?;
+        Some(aii_rpc::EthTxResponse {
+            tx: tx_to_view(tx, chain_id),
+            block_hash: format!("0x{}", hex::encode(block_hash.as_bytes())),
+            block_number: format!("0x{block_number:x}"),
+            transaction_index: format!("0x{idx:x}"),
+        })
+    }
+
+    async fn eth_block_by_number(
+        &self,
+        n: u64,
+        full_transactions: bool,
+    ) -> Option<aii_rpc::EthBlockResponse> {
+        // Resolve number → hash → header → body, then build the
+        // composite eth_getBlockByX response.
+        let s = self.blocks.read().ok()?;
+        let block_hash = *s.by_number.get(&n)?;
+        eth_block_response_from_indices(self.spec.chain_id, &s, block_hash, full_transactions)
+    }
+
+    async fn eth_block_by_hash(
+        &self,
+        hash_hex: &str,
+        full_transactions: bool,
+    ) -> Option<aii_rpc::EthBlockResponse> {
+        let block_hash = parse_hash_h256(hash_hex)?;
+        let s = self.blocks.read().ok()?;
+        eth_block_response_from_indices(self.spec.chain_id, &s, block_hash, full_transactions)
     }
 
     async fn logs_in_range(&self, filter: &LogFilter) -> Vec<LogEntryView> {
@@ -2249,6 +2333,129 @@ mod tests {
             bob_after.is_none() || bob_after.unwrap().balance == aii_types::U256::ZERO,
             "eth_call must not modify recipient balance",
         );
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByNumber for a committed block:
+    /// returns the header + an empty tx list (when the body
+    /// has no transactions).
+    #[tokio::test]
+    async fn eth_get_block_by_number_committed_block_returns_header_and_empty_txs() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let block = fake_block(7, H256::ZERO);
+        let expected_hash = block.hash();
+        state.commit_block(&block);
+
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByNumber", rpc_params!["0x7", false])
+            .await
+            .unwrap();
+        let resp = resp.expect("block must exist");
+        assert_eq!(resp.header.number, "0x7");
+        assert_eq!(
+            resp.header.hash,
+            format!("0x{}", hex::encode(expected_hash.as_bytes()))
+        );
+        match resp.transactions {
+            aii_rpc::EthBlockTxs::Hashes(h) => assert!(h.is_empty()),
+            aii_rpc::EthBlockTxs::Full(_) => panic!("full_transactions=false must yield hashes"),
+        }
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByNumber with the "latest" tag
+    /// resolves to the highest committed block.
+    #[tokio::test]
+    async fn eth_get_block_by_number_latest_tag_returns_head() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        for n in 1..=4 {
+            // parent_hash is irrelevant for this test — we only
+            // care that "latest" resolves to the highest height.
+            state.commit_block(&fake_block(n, H256::ZERO));
+        }
+        state.set_head(4);
+
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByNumber", rpc_params!["latest", false])
+            .await
+            .unwrap();
+        let resp = resp.expect("latest tag must resolve");
+        assert_eq!(resp.header.number, "0x4");
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByHash mirrors eth_getBlockByNumber.
+    #[tokio::test]
+    async fn eth_get_block_by_hash_returns_block() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let block = fake_block(3, H256::ZERO);
+        let block_hash = block.hash();
+        state.commit_block(&block);
+
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        let hash_hex = format!("0x{}", hex::encode(block_hash.as_bytes()));
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByHash", rpc_params![hash_hex.clone(), false])
+            .await
+            .unwrap();
+        let resp = resp.expect("block must exist");
+        assert_eq!(resp.header.number, "0x3");
+        assert_eq!(resp.header.hash, hash_hex);
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getTransactionByHash on an unknown hash
+    /// returns null.
+    #[tokio::test]
+    async fn eth_get_transaction_by_hash_unknown_returns_null() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let resp: Option<aii_rpc::EthTxResponse> = client
+            .request(
+                "eth_getTransactionByHash",
+                rpc_params![format!("0x{}", "ab".repeat(32))],
+            )
+            .await
+            .unwrap();
+        assert!(resp.is_none());
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByNumber against an unknown block
+    /// returns null (not an error).
+    #[tokio::test]
+    async fn eth_get_block_by_number_unknown_returns_null() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByNumber", rpc_params!["0x999", false])
+            .await
+            .unwrap();
+        assert!(resp.is_none());
         handle.stop().unwrap();
     }
 
