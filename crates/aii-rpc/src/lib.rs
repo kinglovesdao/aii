@@ -1075,11 +1075,24 @@ impl<S: RpcState> AiiRpcServer for AiiRpcImpl<S> {
                 })
             }
         };
-        let pubkey = aii_crypto::release::pinned_release_pubkey();
-        if pubkey.verify(&payload, &sig).is_err() {
+        // v0.0.87: verify against the FULL pinned-pubkey set
+        // (multi-key rotation support). A manifest signed by any
+        // key in the compile-time list is accepted.
+        let pubkeys = aii_crypto::release::pinned_release_pubkeys();
+        let mut sig_ok = false;
+        for pk in &pubkeys {
+            if pk.verify(&payload, &sig).is_ok() {
+                sig_ok = true;
+                break;
+            }
+        }
+        if !sig_ok {
             return Ok(AnnounceReleaseResult {
                 accepted: false,
-                reason: "signature does not verify against pinned pubkey".into(),
+                reason: format!(
+                    "signature does not verify against any of the {} pinned pubkeys",
+                    pubkeys.len()
+                ),
             });
         }
         // 3. Hand off to the host. Implementations decide whether

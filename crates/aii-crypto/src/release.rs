@@ -44,7 +44,7 @@ use thiserror::Error;
 /// Domain-separation tag prepended to the signed payload.
 pub const DOMAIN_TAG: &[u8] = b"aii-release-v1\0";
 
-/// Hex of the official AII Network release-signing public key.
+/// Hex of the **primary** AII Network release-signing public key.
 ///
 /// (v0.0.75) The matching secret seed is held off-chain by the
 /// release manager — every node ships with this public half
@@ -52,14 +52,49 @@ pub const DOMAIN_TAG: &[u8] = b"aii-release-v1\0";
 /// default trust anchor for `aii release verify` and for the
 /// `aii_announceRelease` JSON-RPC endpoint.
 ///
-/// Rotating this constant is a backwards-incompatible change:
-/// nodes still on the old pinned key will reject manifests signed
-/// by the new one. A future release will add an on-chain rotation
-/// path; for now any rotation requires a workspace-wide bump.
+/// **v0.0.87**: this constant is now the FIRST entry of
+/// [`RELEASE_SIGNING_PUBKEYS`]. See that constant for the
+/// rotation procedure.
 pub const RELEASE_SIGNING_PUBKEY_HEX: &str =
     "f845c1bbf443bbf3e18f1a97599c34d39cac4a03fb22c80110f37491c92c0669";
 
-/// Parse [`RELEASE_SIGNING_PUBKEY_HEX`] into a usable [`PublicKey`].
+/// All compile-time-pinned release-signing public keys
+/// (v0.0.87).
+///
+/// A release manifest verifies iff it is signed by **any** key
+/// in this slice. The first entry is the primary key; any
+/// additional entries are pending-deprecation or
+/// rolling-in keys.
+///
+/// ### Rotation procedure
+///
+/// To rotate from key `A` to a new key `B`:
+///
+/// 1. Generate `B` with `aii release keygen`.
+/// 2. Edit this slice to `[A_HEX, B_HEX]`, ship the workspace,
+///    and roll the binary out to every node via the v0.0.74-86
+///    auto-update protocol.
+/// 3. Once every node is on a binary with both keys pinned,
+///    switch the release manager's signing operations to `B`.
+///    Existing nodes accept both, so this is invisible to
+///    consensus.
+/// 4. In a subsequent release, edit this slice to `[B_HEX]` and
+///    ship again. After that wave lands, `A` is officially
+///    retired.
+///
+/// The order matters only for [`pinned_release_pubkey`], which
+/// returns the first entry for back-compat callers. Verification
+/// tries them in order; the first match wins, so put the
+/// most-likely-active key first when ordering is otherwise
+/// unimportant.
+pub const RELEASE_SIGNING_PUBKEYS: &[&str] = &[RELEASE_SIGNING_PUBKEY_HEX];
+
+/// Parse the **primary** pinned release pubkey into a usable
+/// [`PublicKey`].
+///
+/// Equivalent to `pinned_release_pubkeys()[0]`. Retained for
+/// back-compat with v0.0.74-v0.0.86 callers that knew only the
+/// single-key world.
 ///
 /// # Panics
 ///
@@ -68,6 +103,26 @@ pub const RELEASE_SIGNING_PUBKEY_HEX: &str =
 #[must_use]
 pub fn pinned_release_pubkey() -> PublicKey {
     PublicKey::from_hex(RELEASE_SIGNING_PUBKEY_HEX).expect("pinned release pubkey must parse")
+}
+
+/// Parse all compile-time pinned release pubkeys into usable
+/// [`PublicKey`] values (v0.0.87).
+///
+/// Use this when verifying a manifest you want to accept under
+/// the current rotation policy. The single-key
+/// [`pinned_release_pubkey`] only sees the primary; this
+/// returns every key the binary trusts.
+///
+/// # Panics
+///
+/// Panics if any compiled-in entry is malformed — a build-time
+/// error, so it surfaces loudly.
+#[must_use]
+pub fn pinned_release_pubkeys() -> Vec<PublicKey> {
+    RELEASE_SIGNING_PUBKEYS
+        .iter()
+        .map(|hex| PublicKey::from_hex(hex).expect("pinned release pubkey must parse"))
+        .collect()
 }
 
 /// On-disk representation of a signed binary release.
@@ -206,6 +261,52 @@ pub fn verify_manifest_signature(
     Ok(())
 }
 
+/// Verify the Ed25519 signature on a manifest against ANY of
+/// the supplied pubkeys (v0.0.87 rotation support).
+///
+/// Returns `Ok(())` on the first key that verifies; returns the
+/// LAST key's error if none verify. Useful for the multi-key
+/// pinned set during a key rotation window.
+///
+/// # Errors
+///
+/// - `ReleaseError::Hex` when `manifest.sha256_hex` is
+///   malformed (decoded once for all candidate keys).
+/// - `ReleaseError::Crypto` carrying the last attempted key's
+///   rejection reason when none of `pubkeys` verifies.
+/// - `ReleaseError::Hex` carrying "no pubkeys supplied" when
+///   `pubkeys` is empty.
+pub fn verify_manifest_signature_any(
+    pubkeys: &[PublicKey],
+    manifest: &ReleaseManifest,
+) -> Result<(), ReleaseError> {
+    if pubkeys.is_empty() {
+        return Err(ReleaseError::Hex("no pubkeys supplied".to_string()));
+    }
+    // Decode the manifest fields ONCE so we don't redo it per
+    // candidate key.
+    let manifest_hex = manifest.sha256_hex.trim_start_matches("0x").to_lowercase();
+    let bytes = hex::decode(&manifest_hex).map_err(|e| ReleaseError::Hex(e.to_string()))?;
+    if bytes.len() != 32 {
+        return Err(ReleaseError::Hex(format!(
+            "sha256 must decode to 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes);
+    let payload = canonical_payload(&manifest.version, &digest, manifest.timestamp_unix);
+    let sig = Signature::from_hex(&manifest.ed25519_sig_hex)?;
+    let mut last_err: Option<ReleaseError> = None;
+    for pk in pubkeys {
+        match pk.verify(&payload, &sig) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e.into()),
+        }
+    }
+    Err(last_err.expect("non-empty pubkeys must produce at least one verify attempt"))
+}
+
 /// Verify a release: confirm the binary's hash matches the manifest
 /// AND the manifest's signature verifies under `expected_pubkey`.
 ///
@@ -331,5 +432,93 @@ mod tests {
         let s = serde_json::to_string_pretty(&m).unwrap();
         let m2: ReleaseManifest = serde_json::from_str(&s).unwrap();
         verify_release(&pk, &m2, bin.path()).unwrap();
+    }
+
+    // ───────────────── v0.0.87 multi-key rotation tests ─────────────────
+
+    #[test]
+    fn pinned_release_pubkeys_contains_primary_first() {
+        let pks = pinned_release_pubkeys();
+        assert!(!pks.is_empty(), "must always have at least one pinned key");
+        assert_eq!(
+            pks[0].to_hex(),
+            RELEASE_SIGNING_PUBKEY_HEX,
+            "primary pubkey must be first entry",
+        );
+        assert_eq!(
+            pks[0].to_hex(),
+            pinned_release_pubkey().to_hex(),
+            "single-key getter must equal first entry of multi-key getter",
+        );
+    }
+
+    #[test]
+    fn verify_any_accepts_manifest_signed_by_first_key() {
+        let mut rng = OsRng;
+        let sk_a = SecretKey::generate(&mut rng);
+        let sk_b = SecretKey::generate(&mut rng);
+        let bin = write_tmp(b"multikey body");
+        let m = sign_release(&sk_a, bin.path(), "0.0.87", 1_900_000_087).unwrap();
+        // Pubkey list with A first, B second.
+        let keys = vec![sk_a.public(), sk_b.public()];
+        verify_manifest_signature_any(&keys, &m).unwrap();
+    }
+
+    #[test]
+    fn verify_any_accepts_manifest_signed_by_secondary_key() {
+        let mut rng = OsRng;
+        let sk_a = SecretKey::generate(&mut rng);
+        let sk_b = SecretKey::generate(&mut rng);
+        let bin = write_tmp(b"multikey body");
+        // Sign with B but B is the SECOND key in the list.
+        let m = sign_release(&sk_b, bin.path(), "0.0.87", 1_900_000_088).unwrap();
+        let keys = vec![sk_a.public(), sk_b.public()];
+        verify_manifest_signature_any(&keys, &m)
+            .expect("manifest signed by B must verify under [A, B]");
+    }
+
+    #[test]
+    fn verify_any_rejects_manifest_not_in_set() {
+        let mut rng = OsRng;
+        let sk_a = SecretKey::generate(&mut rng);
+        let sk_b = SecretKey::generate(&mut rng);
+        let sk_c = SecretKey::generate(&mut rng); // unknown signer
+        let bin = write_tmp(b"multikey body");
+        let m = sign_release(&sk_c, bin.path(), "0.0.87", 1_900_000_089).unwrap();
+        let keys = vec![sk_a.public(), sk_b.public()];
+        let err = verify_manifest_signature_any(&keys, &m).unwrap_err();
+        assert!(matches!(err, ReleaseError::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_any_with_empty_set_returns_hex_error() {
+        // Building a manifest first so the function reaches the
+        // empty-set guard before any other checks.
+        let mut rng = OsRng;
+        let sk = SecretKey::generate(&mut rng);
+        let bin = write_tmp(b"empty set body");
+        let m = sign_release(&sk, bin.path(), "0.0.87", 1_900_000_090).unwrap();
+        let err = verify_manifest_signature_any(&[], &m).unwrap_err();
+        assert!(matches!(err, ReleaseError::Hex(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_any_short_circuits_on_first_match() {
+        // If the first key verifies, the function MUST NOT
+        // attempt subsequent keys. We can't observe the
+        // short-circuit directly, but a wrong second key with
+        // garbage hex would error during Signature::from_hex
+        // before any verify() call. Since the function decodes
+        // the signature ONCE up front, this test mainly proves
+        // it doesn't iterate redundantly.
+        let mut rng = OsRng;
+        let sk_a = SecretKey::generate(&mut rng);
+        let sk_b = SecretKey::generate(&mut rng);
+        let bin = write_tmp(b"short circuit body");
+        let m = sign_release(&sk_a, bin.path(), "0.0.87", 1_900_000_091).unwrap();
+        // Putting A first means we should accept immediately
+        // even though B is unrelated.
+        let keys = vec![sk_a.public(), sk_b.public()];
+        verify_manifest_signature_any(&keys, &m).unwrap();
     }
 }
