@@ -157,6 +157,24 @@ struct Cli {
     /// no effect when `--update-peers` is empty.
     #[arg(long, default_value = "60")]
     release_poll_secs: u64,
+
+    /// v0.0.84 runtime head-stall watchdog: when the head block
+    /// number does not advance for this many seconds, the node
+    /// calls `exec_self()` for a kernel-level same-PID restart.
+    /// The restarted process then cold-syncs via the v0.0.83
+    /// implicit-bootnode fallback (`--update-peers[0]`) and
+    /// rejoins consensus. Default 0 (disabled). Recommend a
+    /// value at least 5× the BFT slot interval so single-slot
+    /// hiccups don't trigger restarts.
+    #[arg(long, default_value = "0")]
+    stall_recover_secs: u64,
+
+    /// v0.0.84 head-watchdog poll cadence. The watchdog wakes
+    /// every N seconds to read the head; finer granularity
+    /// means faster stall detection but more wakeups. Default
+    /// 10 s. Ignored when `--stall-recover-secs` is 0.
+    #[arg(long, default_value = "10")]
+    stall_poll_secs: u64,
 }
 
 /// Resolve the effective bootnode URL for cold-sync and follow-loop
@@ -781,6 +799,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    // v0.0.84 runtime head watchdog. Off when stall_recover_secs == 0.
+    // When armed, the watchdog calls release_install::exec_self()
+    // on stall — the new process image cold-syncs via the v0.0.83
+    // implicit-bootnode fallback and rejoins consensus.
+    let watchdog_handle = aii_node::head_watchdog::start_head_watchdog(
+        Arc::clone(&node_state),
+        cli.stall_recover_secs,
+        cli.stall_poll_secs,
+    );
+
     let (bound, handle) = aii_rpc::serve(cli.rpc, node_state).await?;
     tracing::info!(addr = %bound, "rpc server listening");
 
@@ -797,6 +825,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(h) = poller_handle {
         h.abort();
     }
+    watchdog_handle.abort();
     Ok(())
 }
 

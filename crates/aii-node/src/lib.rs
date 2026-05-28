@@ -13,6 +13,8 @@ pub mod bft_p2p;
 pub mod bft_state;
 pub mod dpos;
 pub mod governance;
+#[cfg(unix)]
+pub mod head_watchdog;
 pub mod peer_cache;
 pub mod precompile;
 #[cfg(unix)]
