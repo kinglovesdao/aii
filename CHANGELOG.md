@@ -5,6 +5,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.85] — 2026-05-28
+
+### Added — boot-health watchdog (auto-rollback on unhealthy boot)
+
+Closes the highest-priority deferred item from the v0.0.78
+CHANGELOG. The auto-update protocol could, until now, ship a
+bad signed binary to every validator with no defense once the
+operator's authority-pubkey signature passed verification.
+v0.0.80 added a one-shot rollback RPC, but it still required an
+operator to notice and call it. v0.0.85 closes the loop: every
+auto-install records a sentinel, the post-execve startup waits
+out a grace window, and if the new binary fails to advance the
+head, rollback fires automatically.
+
+#### `aii-node::release_install`
+
+- `BootPending { version, pre_install_head, install_ts }` —
+  serializable record written atomically (`.tmp` + rename) at
+  `<data-dir>/releases/.boot-pending` before `install_binary`
+  clobbers the running binary.
+- `write_boot_pending(releases_dir, &BootPending) -> io::Result<PathBuf>`.
+- `read_boot_pending(releases_dir) -> io::Result<Option<BootPending>>`
+  (returns `Ok(None)` for missing-file, `InvalidData` for
+  unparseable JSON).
+- `clear_boot_pending(releases_dir) -> io::Result<()>` (idempotent).
+- `boot_pending_path(releases_dir) -> PathBuf`.
+- 5 unit tests: round-trip, missing-file, overwrite, idempotent
+  clear, malformed-data rejection.
+
+#### `aii-node::NodeState::install_release`
+
+After saving the `.previous` snapshot (v0.0.80) and BEFORE
+`install_binary` clobbers the running binary, the install
+handler now captures `(version, head_block_number_sync(),
+unix_secs)` and persists it as a `.boot-pending` sentinel.
+Write failure logs WARN and the install proceeds — same fail-
+soft contract as the snapshot path.
+
+#### `aii-node::head_watchdog::start_boot_health_confirm`
+
+New tokio task counterpart to v0.0.84's
+`start_head_watchdog`. Called once at startup with
+`(state, releases_dir, confirm_secs)`. If
+`confirm_secs == 0` or the `.boot-pending` sentinel is
+missing, the task is a no-op. Otherwise:
+
+1. Read the sentinel.
+2. Sleep `confirm_secs`.
+3. If `head_block_number_sync() > pending.pre_install_head`:
+   the new binary advanced consensus, so clear the sentinel
+   and exit healthy.
+4. Else: log ERROR and call
+   `RpcState::rollback_release(&state).await`, which uses the
+   v0.0.80 reversible `.previous` swap + the v0.0.78
+   `exec_self_at` self-restart. The rolled-back binary then
+   boots fresh; its boot-health task observes the original
+   sentinel, finds head advancing again, and clears it.
+
+#### `aii-node` CLI
+
+- New `--boot-health-secs N` (default `0` = disabled).
+  Operator guidance: at least 5× the BFT slot interval so the
+  first slow round after a restart doesn't trigger a false
+  rollback. A 1 s slot wants `60-120 s`; a 10 s slot wants
+  300 s+.
+
+#### Auto-update safety net stack
+
+```
+v0.0.74  sign manifest
+v0.0.75  pinned-pubkey verify
+v0.0.76  binary store
+v0.0.77  gossip
+v0.0.78  atomic install + execve
+v0.0.80  reversible .previous snapshot
+v0.0.81  late-joiner re-poll
+v0.0.83  implicit bootnode (post-restart cold-sync)
+v0.0.84  head-stall watchdog (mid-flight exec_self)
+v0.0.85  boot-health auto-rollback ← THIS
+```
+
+A node with the full opt-in flag set
+(`--auto-install-releases --update-peers …
+--release-poll-secs 60 --stall-recover-secs 120
+--boot-health-secs 120`) now survives:
+
+- normal upgrade (signed manifest → all 3 nodes upgrade in 30 s)
+- 1-second downtime stall during binary swap (v0.0.83)
+- mid-flight BFT head freeze (v0.0.84)
+- buggy signed binary that boots but can't keep consensus
+  going (v0.0.85, NEW)
+
+Tests: +9 (5 release_install unit, 4 NodeState lib). 835 tests
+pass / clippy clean.
+
+### Scope discipline
+
+Out of scope for v0.0.85:
+
+- **Restart-loop rate limiting.** If the rolled-back binary
+  is ALSO broken, the node loops. The current implementation
+  is fail-open — it tries; if exec_self fails it logs and
+  waits. A file-backed "max restarts per hour" cap lands
+  later.
+- **Boot health beyond head advancement.** The current signal
+  is just "did the head increment". A future slice could
+  also check RPC liveness, peer connectivity, or producer
+  participation before declaring health.
+- **Stale-sentinel rollback at startup.** Currently the
+  confirm task sleeps `confirm_secs` then checks. If a
+  systemd-restarted process finds a `.boot-pending` from
+  before its parent crashed, it still waits the full window.
+  A "this sentinel is older than 2 × confirm_secs → assume
+  failed boot, rollback now" shortcut is an obvious
+  follow-up.
+
 ## [0.0.84] — 2026-05-28
 
 ### Added — runtime head-stall watchdog

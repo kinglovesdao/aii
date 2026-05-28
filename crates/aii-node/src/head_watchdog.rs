@@ -209,6 +209,110 @@ pub fn start_head_watchdog(
     })
 }
 
+// ─────────────────────────── v0.0.85: boot-health ───────────────────────────
+
+/// Spawn the boot-health confirm task (v0.0.85).
+///
+/// Pairs with the boot-pending sentinel written by
+/// [`crate::release_install::write_boot_pending`]. The new
+/// process — booted via `execve` after an install — calls this
+/// once at startup. The task then:
+///
+/// 1. Reads `<data-dir>/releases/.boot-pending`. Returns
+///    immediately if the sentinel is missing (no install
+///    happened — this is a normal startup).
+/// 2. Sleeps `confirm_secs` (configurable via
+///    `--boot-health-secs`).
+/// 3. Reads the head block number. If it advanced past
+///    `pending.pre_install_head`, the new binary is healthy:
+///    clear the sentinel and exit.
+/// 4. If the head did NOT advance, the new binary failed to
+///    rejoin consensus. Log ERROR and call
+///    `RpcState::rollback_release` to restore `.previous` +
+///    execve into it. The restored binary's startup will then
+///    pass through this same function — if it's also unhealthy
+///    we'd loop, but that's outside this slice's scope (rate
+///    limiting lands in v0.0.86+).
+///
+/// Off by default; spawning with `confirm_secs == 0` is a
+/// no-op (the task logs and returns).
+#[cfg(unix)]
+#[must_use]
+pub fn start_boot_health_confirm(
+    state: Arc<NodeState>,
+    releases_dir: std::path::PathBuf,
+    confirm_secs: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if confirm_secs == 0 {
+            tracing::info!("boot-health confirm no-op (disabled by config)");
+            return;
+        }
+        let pending = match crate::release_install::read_boot_pending(&releases_dir) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                // No install in flight; this is just a normal startup.
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read .boot-pending sentinel; skipping boot-health confirm");
+                return;
+            }
+        };
+        tracing::info!(
+            version = %pending.version,
+            pre_install_head = pending.pre_install_head,
+            install_ts = pending.install_ts,
+            confirm_secs,
+            "boot-health confirm armed; will check head advancement after grace window",
+        );
+        tokio::time::sleep(Duration::from_secs(confirm_secs)).await;
+        let head = state.head_block_number_sync();
+        if head > pending.pre_install_head {
+            tracing::info!(
+                head,
+                pre_install_head = pending.pre_install_head,
+                version = %pending.version,
+                "boot-health confirm: head advanced; clearing .boot-pending",
+            );
+            if let Err(e) = crate::release_install::clear_boot_pending(&releases_dir) {
+                tracing::warn!(error = %e, "boot-health confirm: clear failed (file may linger)");
+            }
+            return;
+        }
+        // Unhealthy boot — trigger rollback. Use the trait
+        // method on RpcState so the rollback + execve path is
+        // exactly the same one operators get via the RPC.
+        tracing::error!(
+            head,
+            pre_install_head = pending.pre_install_head,
+            version = %pending.version,
+            "boot-health confirm: head did NOT advance within {confirm_secs}s; triggering rollback",
+        );
+        let outcome = <NodeState as aii_rpc::RpcState>::rollback_release(&state).await;
+        if outcome.scheduled {
+            tracing::error!(
+                version = %pending.version,
+                restart_in_secs = outcome.restart_in_secs,
+                "boot-health confirm: rollback scheduled; node will restart shortly",
+            );
+            // Leave .boot-pending in place — the rolled-back
+            // binary's next startup will see it, but since
+            // the rollback restored the previous bytes,
+            // head advancement should succeed and the
+            // sentinel will be cleared on that pass.
+            // (If you'd rather not loop the watchdog on the
+            // restored binary, clear it here. We choose
+            // observability over a clean slate.)
+        } else {
+            tracing::error!(
+                reason = %outcome.reason,
+                "boot-health confirm: rollback rejected; manual intervention required",
+            );
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

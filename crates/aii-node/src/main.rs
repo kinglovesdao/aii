@@ -175,6 +175,17 @@ struct Cli {
     /// 10 s. Ignored when `--stall-recover-secs` is 0.
     #[arg(long, default_value = "10")]
     stall_poll_secs: u64,
+
+    /// v0.0.85 boot-health confirm window. After an
+    /// auto-install, the new process image waits this many
+    /// seconds and then checks whether the head advanced past
+    /// the pre-install head. If yes, the `.boot-pending`
+    /// sentinel is cleared. If no, `aii_rollbackRelease` fires
+    /// automatically. Default 0 (disabled). Recommend at
+    /// least 5× the BFT slot interval so a slow first round
+    /// after restart doesn't trigger an unnecessary rollback.
+    #[arg(long, default_value = "0")]
+    boot_health_secs: u64,
 }
 
 /// Resolve the effective bootnode URL for cold-sync and follow-loop
@@ -809,6 +820,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cli.stall_poll_secs,
     );
 
+    // v0.0.85 boot-health confirm. Off when boot_health_secs == 0.
+    // When armed, reads .boot-pending sentinel (written by
+    // install_release before execve); after the grace window,
+    // either clears the sentinel (head advanced) or triggers
+    // rollback_release (head still stuck → bad new binary).
+    let boot_health_handle = aii_node::head_watchdog::start_boot_health_confirm(
+        Arc::clone(&node_state),
+        cli.data_dir.join(aii_node::release_store::RELEASES_SUBDIR),
+        cli.boot_health_secs,
+    );
+
     let (bound, handle) = aii_rpc::serve(cli.rpc, node_state).await?;
     tracing::info!(addr = %bound, "rpc server listening");
 
@@ -826,6 +848,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         h.abort();
     }
     watchdog_handle.abort();
+    boot_health_handle.abort();
     Ok(())
 }
 
