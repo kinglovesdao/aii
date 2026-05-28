@@ -5,6 +5,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.81] — 2026-05-27
+
+### Added — late-joiner release re-poll
+
+Closes the last gap in the auto-update protocol's coverage: a
+node that was offline during the v0.0.77 manifest gossip wave
+now catches up on its own, on a configurable cadence, without
+the operator having to re-broadcast. Every validator that comes
+back online learns about pending releases within one poll
+interval and walks the same trust-bounded
+record → import → maybe-install path as the gossip flow.
+
+#### `aii-crypto::release`
+
+- New `verify_manifest_signature(pubkey, manifest) -> Result<()>`
+  that re-verifies the Ed25519 signature WITHOUT requiring the
+  binary on disk. The full `verify_release` is still the right
+  call before trusting the binary; this one is for the gap
+  between "got a manifest from a peer" and "have the binary
+  in hand."
+- `ReleaseManifest` now derives `PartialEq + Eq` so tests and
+  diff-style logging can compare manifests directly.
+
+#### `aii-rpc::release_poller` (new module)
+
+- `poll_once(state, peers) -> PollOutcome` — single best-effort
+  pass: for each peer, fetch `aii_latestRelease`, compare via
+  strict `(timestamp, version)` ordering, re-verify the
+  signature locally, then drive the host's
+  `record_release_announcement` + (when the binary is missing)
+  `aii_getReleaseBinary` → `import_release_binary` path. Same
+  trust boundary as the announce / gossip flows; never trusts
+  the peer.
+- `start_release_poller(state, peers, interval) -> JoinHandle<()>` —
+  spawns a tokio task that calls `poll_once` every `interval`.
+  Burns the first immediate `tick()` so a fast restart loop
+  doesn't slam peers with cold-start traffic; logs catch-up
+  events at INFO when either a manifest or a binary lands.
+- `PeerPollOutcome` / `PollOutcome` envelopes for callers that
+  want observability. 5 unit tests cover the strict-newer
+  comparator + a two-node integration test where node A starts
+  empty and pulls B's signed manifest + binary in a single
+  tick, plus an idempotency test (second poll is a no-op).
+
+#### `aii-node` CLI
+
+- New `--release-poll-secs N` flag (default `60`, `0` disables).
+  Only fires when `--update-peers` is also non-empty. When
+  enabled, the poller spawn happens just before the RPC server
+  starts, and the join handle is aborted alongside the producer
+  + follow handles on Ctrl-C.
+
+### End-to-end coverage (v0.0.74 → v0.0.81)
+
+The auto-update protocol now closes every reasonable failure
+mode the operator might hit:
+
+1. **Sign** (v0.0.74) — Ed25519 manifest.
+2. **Announce** (v0.0.75) — pinned-pubkey verify on any one node.
+3. **Store** (v0.0.76) — `<data-dir>/releases/<version>` cache.
+4. **Gossip** (v0.0.77) — push/pull binary across `--update-peers`.
+5. **Install** (v0.0.78) — atomic rename + execve same-PID restart.
+6. **Hotfix** (v0.0.79) — 128 MiB body cap + `exec_self_at(target)`.
+7. **Rollback** (v0.0.80) — reversible `.previous` snapshot.
+8. **Re-poll** (v0.0.81) — late-joiner catch-up cadence.
+
+A node that was offline at announce time can come back, and
+within `--release-poll-secs` it discovers the manifest, pulls
+the binary, optionally auto-installs, and (if anything goes
+wrong) the operator's recovery path is `aii release rollback`.
+
+### Scope discipline
+
+Out of scope for v0.0.81, explicitly:
+
+- **Boot-health watchdog** — auto-rollback if the new binary
+  fails to come up within N seconds. Still operator-driven.
+- **Pubkey rotation** — still pinned at compile time.
+
 ## [0.0.80] — 2026-05-27
 
 ### Added — pre-install snapshot + rollback safety net

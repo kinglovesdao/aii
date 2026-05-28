@@ -149,6 +149,14 @@ struct Cli {
     /// `aii_installRelease` once they've reviewed the manifest.
     #[arg(long, default_value = "false")]
     auto_install_releases: bool,
+
+    /// v0.0.81 late-joiner re-poll: every N seconds, query each
+    /// `--update-peers` URL's `aii_latestRelease` and catch up
+    /// (verify signature, record manifest, pull binary) if a
+    /// peer is ahead. Default 60 s. Set to 0 to disable. Has
+    /// no effect when `--update-peers` is empty.
+    #[arg(long, default_value = "60")]
+    release_poll_secs: u64,
 }
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + Sync>> {
@@ -706,6 +714,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // v0.0.81: spawn the late-joiner release poller. Only fires
+    // when `--update-peers` is non-empty AND `--release-poll-secs`
+    // is non-zero; both checks live inside `start_release_poller`
+    // for a single source of truth.
+    let poller_handle = {
+        let peers = node_state.update_peers();
+        if !peers.is_empty() && cli.release_poll_secs > 0 {
+            tracing::info!(
+                interval_secs = cli.release_poll_secs,
+                peers = peers.len(),
+                "release poller scheduled",
+            );
+            Some(aii_rpc::release_poller::start_release_poller(
+                Arc::clone(&node_state),
+                peers,
+                std::time::Duration::from_secs(cli.release_poll_secs),
+            ))
+        } else {
+            None
+        }
+    };
+
     let (bound, handle) = aii_rpc::serve(cli.rpc, node_state).await?;
     tracing::info!(addr = %bound, "rpc server listening");
 
@@ -717,6 +747,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         h.abort();
     }
     if let Some(h) = follow_handle {
+        h.abort();
+    }
+    if let Some(h) = poller_handle {
         h.abort();
     }
     Ok(())

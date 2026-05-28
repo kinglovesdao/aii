@@ -74,7 +74,7 @@ pub fn pinned_release_pubkey() -> PublicKey {
 ///
 /// All hex fields are lowercase, no `0x` prefix on read (input may
 /// include `0x`, output never does).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseManifest {
     /// Semver-style version string identifying this binary build
     /// (e.g. `"0.0.74"`).
@@ -168,6 +168,42 @@ pub fn sign_release(
         timestamp_unix,
         ed25519_sig_hex: sig.to_hex(),
     })
+}
+
+/// Verify the Ed25519 signature on a manifest WITHOUT requiring
+/// the binary on disk (v0.0.81).
+///
+/// Useful when a node has received a manifest via gossip /
+/// periodic poll but doesn't yet have the binary bytes to
+/// re-hash. The full [`verify_release`] is still the right call
+/// before trusting the binary itself — this only proves "the
+/// pinned holder of `expected_pubkey` claimed this
+/// `(version, sha256, timestamp)` tuple."
+///
+/// # Errors
+///
+/// - `ReleaseError::Hex` when `manifest.sha256_hex` doesn't
+///   decode to exactly 32 bytes.
+/// - `ReleaseError::Crypto` on bad signature hex or signature
+///   that doesn't verify under `expected_pubkey`.
+pub fn verify_manifest_signature(
+    expected_pubkey: &PublicKey,
+    manifest: &ReleaseManifest,
+) -> Result<(), ReleaseError> {
+    let manifest_hex = manifest.sha256_hex.trim_start_matches("0x").to_lowercase();
+    let bytes = hex::decode(&manifest_hex).map_err(|e| ReleaseError::Hex(e.to_string()))?;
+    if bytes.len() != 32 {
+        return Err(ReleaseError::Hex(format!(
+            "sha256 must decode to 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes);
+    let payload = canonical_payload(&manifest.version, &digest, manifest.timestamp_unix);
+    let sig = Signature::from_hex(&manifest.ed25519_sig_hex)?;
+    expected_pubkey.verify(&payload, &sig)?;
+    Ok(())
 }
 
 /// Verify a release: confirm the binary's hash matches the manifest

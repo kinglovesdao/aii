@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 pub mod release_gossip;
+pub mod release_poller;
 
 use aii_types::{Address, U256};
 use async_trait::async_trait;
@@ -1897,5 +1898,103 @@ mod tests {
         assert!(!r.scheduled);
         assert!(r.reason.contains("snapshot") || r.reason.contains("rollback"));
         h.stop().unwrap();
+    }
+
+    /// v0.0.81 late-joiner re-poll — two-node integration:
+    /// Node B is ahead (already has a signed manifest + the
+    /// binary). Node A has nothing. After a single `poll_once`
+    /// against B's URL, A ends up with the manifest accepted
+    /// AND the binary imported, all via re-verification of the
+    /// pinned Ed25519 signature on A's side.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn release_poller_pulls_manifest_and_binary_from_peer() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+
+        // Boot peer B with a signed manifest + binary already in place.
+        let payload = b"v0.0.81 late-joiner pulled body";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(payload).unwrap();
+        let manifest = sign_release(&sk, tmp.path(), "0.0.81", 1_900_000_081).unwrap();
+        let state_b = release_fixture();
+        *state_b.latest.lock().unwrap() = Some(manifest.clone());
+        state_b
+            .binaries
+            .lock()
+            .unwrap()
+            .insert("0.0.81".to_string(), payload.to_vec());
+        let (addr_b, handle_b) = serve("127.0.0.1:0".parse().unwrap(), state_b.clone())
+            .await
+            .unwrap();
+        let url_b = format!("http://{addr_b}");
+
+        // Node A starts empty.
+        let state_a = release_fixture();
+        assert!(state_a.latest.lock().unwrap().is_none());
+
+        // Single-tick poll against B.
+        let out =
+            crate::release_poller::poll_once(state_a.clone(), std::slice::from_ref(&url_b)).await;
+        assert_eq!(out.peers.len(), 1);
+        let p = &out.peers[0];
+        assert_eq!(p.peer, url_b);
+        assert!(
+            p.accepted_manifest,
+            "A should accept B's manifest after sig verify: {p:?}"
+        );
+        assert!(p.imported_binary, "A should pull the binary: {p:?}");
+
+        // A's view now matches B.
+        let a_latest = state_a.latest.lock().unwrap().clone();
+        assert_eq!(a_latest.as_ref(), Some(&manifest));
+        let a_bin = state_a.binaries.lock().unwrap().get("0.0.81").cloned();
+        assert_eq!(a_bin.as_deref(), Some(payload.as_ref()));
+
+        handle_b.stop().unwrap();
+    }
+
+    /// v0.0.81 — second poll over the same peer should be a no-op
+    /// (manifest already known, binary already present).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn release_poller_is_idempotent_after_first_catch_up() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let payload = b"v0.0.81 idempotent body";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(payload).unwrap();
+        let manifest = sign_release(&sk, tmp.path(), "0.0.81", 1_900_000_082).unwrap();
+
+        let state_b = release_fixture();
+        *state_b.latest.lock().unwrap() = Some(manifest.clone());
+        state_b
+            .binaries
+            .lock()
+            .unwrap()
+            .insert("0.0.81".to_string(), payload.to_vec());
+        let (addr_b, handle_b) = serve("127.0.0.1:0".parse().unwrap(), state_b)
+            .await
+            .unwrap();
+        let url_b = format!("http://{addr_b}");
+
+        let state_a = release_fixture();
+        let peers = std::slice::from_ref(&url_b);
+        let _ = crate::release_poller::poll_once(state_a.clone(), peers).await;
+        let out = crate::release_poller::poll_once(state_a.clone(), peers).await;
+        let p = &out.peers[0];
+        assert!(!p.accepted_manifest, "second poll must not re-accept");
+        assert!(!p.imported_binary, "second poll must not re-import");
+        assert_eq!(p.note, "not newer than local");
+
+        handle_b.stop().unwrap();
     }
 }
