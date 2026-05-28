@@ -186,6 +186,26 @@ struct Cli {
     /// after restart doesn't trigger an unnecessary rollback.
     #[arg(long, default_value = "0")]
     boot_health_secs: u64,
+
+    /// v0.0.86 watchdog restart rate-limit window (seconds).
+    /// The head-stall + boot-health watchdogs share a rolling
+    /// log at `<data-dir>/releases/.restart-log`; an
+    /// auto-restart only fires if fewer than
+    /// `--restart-max-per-window` events occurred in the
+    /// trailing `--restart-window-secs`. Default `3600` (1 h).
+    #[arg(long, default_value = "3600")]
+    restart_window_secs: u64,
+
+    /// v0.0.86 watchdog restart rate-limit cap. The trailing
+    /// `--restart-window-secs` may hold at most this many
+    /// auto-restart events. Set to `0` to disable
+    /// rate-limiting entirely (every stall / unhealthy boot
+    /// triggers a restart, no matter how many came before).
+    /// Default `3` — enough to recover from a transient
+    /// stall + a flaky restart, low enough to give an
+    /// operator a chance to intervene on a real crash-loop.
+    #[arg(long, default_value = "3")]
+    restart_max_per_window: u32,
 }
 
 /// Resolve the effective bootnode URL for cold-sync and follow-loop
@@ -810,14 +830,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    // v0.0.86: shared release-store dir for both watchdog
+    // tasks (.restart-log + .boot-pending live here).
+    let releases_dir = cli.data_dir.join(aii_node::release_store::RELEASES_SUBDIR);
+
     // v0.0.84 runtime head watchdog. Off when stall_recover_secs == 0.
     // When armed, the watchdog calls release_install::exec_self()
     // on stall — the new process image cold-syncs via the v0.0.83
     // implicit-bootnode fallback and rejoins consensus.
+    // v0.0.86: gated by the shared restart rate-limit.
     let watchdog_handle = aii_node::head_watchdog::start_head_watchdog(
         Arc::clone(&node_state),
         cli.stall_recover_secs,
         cli.stall_poll_secs,
+        releases_dir.clone(),
+        cli.restart_window_secs,
+        cli.restart_max_per_window,
     );
 
     // v0.0.85 boot-health confirm. Off when boot_health_secs == 0.
@@ -825,10 +853,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // install_release before execve); after the grace window,
     // either clears the sentinel (head advanced) or triggers
     // rollback_release (head still stuck → bad new binary).
+    // v0.0.86: stale-sentinel shortcut + shared rate-limit.
     let boot_health_handle = aii_node::head_watchdog::start_boot_health_confirm(
         Arc::clone(&node_state),
-        cli.data_dir.join(aii_node::release_store::RELEASES_SUBDIR),
+        releases_dir,
         cli.boot_health_secs,
+        cli.restart_window_secs,
+        cli.restart_max_per_window,
     );
 
     let (bound, handle) = aii_rpc::serve(cli.rpc, node_state).await?;

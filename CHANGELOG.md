@@ -5,6 +5,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.86] — 2026-05-28
+
+### Added — restart rate limit + stale-sentinel shortcut
+
+Closes the two scope-discipline items called out in the
+v0.0.85 CHANGELOG: a crash-loop guard for the auto-restart
+paths, and a fast-path for boot-health when the previous
+incarnation crashed before confirming.
+
+#### `aii-node::release_install` — rolling restart log
+
+- `RestartLog { events: Vec<u64> }` — serializable on-disk
+  log of recent auto-restart timestamps at
+  `<data-dir>/releases/.restart-log`.
+- `restart_log_path(releases_dir) -> PathBuf`.
+- `read_restart_log(releases_dir) -> RestartLog` — permissive
+  read: missing-file and unparseable-JSON both return an
+  empty log, so a fresh node always gets its first
+  auto-restart attempt.
+- `append_restart_event(releases_dir, ts, window_secs)` —
+  atomic via `.tmp` + rename, prunes to the trailing window
+  on every write.
+- `restart_allowed(log, now, window_secs, max_in_window) ->
+  bool` — pure decision function. `max_in_window == 0`
+  disables the gate (always allow). 5 unit tests on the
+  decision function + 3 on the I/O helpers.
+
+#### `aii-node::head_watchdog` — both watchdogs honor the gate
+
+- `start_head_watchdog` signature now takes
+  `(releases_dir, restart_window_secs, restart_max_per_window)`.
+  Before calling `exec_self()` on a stall, it consults the
+  shared restart log; if the rolling window is full, the
+  watchdog backs off (logs ERROR, resets its detector) and
+  leaves the operator to investigate.
+- `start_boot_health_confirm` signature gains the same two
+  rate-limit params. The same gate now guards the unhealthy-
+  boot rollback path — a binary that keeps failing won't
+  loop rollback → bad → rollback forever.
+
+#### `aii-node::head_watchdog::start_boot_health_confirm` — stale-sentinel shortcut
+
+When the boot-health task wakes and finds a `.boot-pending`
+sentinel whose `install_ts` is older than `2 ×
+confirm_secs`, the task assumes the previous incarnation
+crashed before clearing it. Rather than wait another full
+confirm window (the head wouldn't move during the parent's
+crash anyway), it skips the sleep and goes straight to the
+rate-limit gate + rollback. Cuts mean-time-to-recovery from
+`~2 × confirm_secs` to seconds when systemd respawns the
+node after a hard crash.
+
+#### `aii-node` CLI
+
+- New `--restart-window-secs N` (default `3600` = 1 h).
+- New `--restart-max-per-window N` (default `3`,
+  `0` disables the gate).
+- Operator guidance: leave the defaults unless you
+  understand the failure mode you're tuning for. The
+  defaults allow recovery from a transient stall plus one
+  retry, then bail out and wait for a human.
+
+### Full auto-update safety net (v0.0.74 → v0.0.86)
+
+```
+SIGN (74) → VERIFY (75) → STORE (76) → GOSSIP (77) → INSTALL (78)
+    └ HOTFIX (79: server body cap)
+    └ SNAPSHOT (80: .previous, reversible)
+    └ POLL (81: late-joiner re-poll)
+    └ HOTFIX (82: client body cap)
+    └ IMPLICIT-BOOTNODE (83: post-restart cold-sync)
+    └ HEAD-WATCHDOG (84: mid-flight exec_self)
+    └ BOOT-HEALTH (85: auto-rollback on unhealthy boot)
+    └ RATE-LIMIT + STALE-SHORTCUT (86: crash-loop guard + fast recovery)
+```
+
+A fully-opted-in node now survives every scenario observed
+in the cross-pacific production deploy AND every scenario the
+deferred-scope notes flagged as possible.
+
+### Scope discipline
+
+Out of scope for v0.0.86:
+
+- **Per-action rate limits** — the rolling window counts all
+  auto-restarts together; stall recoveries and rollbacks
+  share the cap. A future slice could segregate them.
+- **`aii_watchdogStatus` RPC** — restart-log + sentinel
+  state are file-only today.
+- **Release-signing pubkey rotation** — still pinned at
+  compile time.
+
+Tests: +10 (5 rate-limit unit, 3 restart-log I/O, 2 boot-health
+integration). 845 tests pass / clippy clean.
+
 ## [0.0.85] — 2026-05-28
 
 ### Added — boot-health watchdog (auto-rollback on unhealthy boot)

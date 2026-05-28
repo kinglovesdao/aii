@@ -2832,10 +2832,15 @@ mod tests {
         state.set_data_dir(data_dir.clone());
 
         // Seed the sentinel as if a prior install had written it.
+        // install_ts = "now" so v0.0.86 stale-shortcut doesn't fire.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let pending = crate::release_install::BootPending {
             version: "0.0.85-test".into(),
             pre_install_head: 0,
-            install_ts: 1,
+            install_ts: now,
         };
         crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
         assert!(crate::release_install::boot_pending_path(&releases_dir).exists());
@@ -2847,7 +2852,9 @@ mod tests {
         let h = crate::head_watchdog::start_boot_health_confirm(
             Arc::clone(&state),
             releases_dir.clone(),
-            1, // 1 second grace window
+            1,    // 1 second grace window
+            3600, // restart_window_secs
+            999,  // restart_max_per_window (effectively unlimited)
         );
         // Wait long enough for the task to complete the sleep
         // + the sentinel-clear.
@@ -2886,7 +2893,10 @@ mod tests {
         let pending = crate::release_install::BootPending {
             version: "0.0.85-bad".into(),
             pre_install_head: 0,
-            install_ts: 1,
+            install_ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         };
         crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
 
@@ -2894,6 +2904,8 @@ mod tests {
             Arc::clone(&state),
             releases_dir.clone(),
             1,
+            3600,
+            999,
         );
         h.await.unwrap();
 
@@ -2920,6 +2932,8 @@ mod tests {
             Arc::clone(&state),
             releases_dir.clone(),
             1,
+            3600,
+            999,
         );
         h.await.unwrap();
         // Nothing should have been created.
@@ -2949,10 +2963,128 @@ mod tests {
             Arc::clone(&state),
             releases_dir.clone(),
             0, // disabled
+            3600,
+            999,
         );
         h.await.unwrap();
         // Sentinel still present — confirm task didn't run.
         assert!(sentinel.exists());
+    }
+
+    /// v0.0.86: stale-sentinel shortcut. When the sentinel's
+    /// install_ts is well in the past (>= 2× confirm_secs ago),
+    /// the boot-health task skips the sleep and triggers
+    /// rollback immediately — a node that was systemd-respawned
+    /// after the previous boot crashed shouldn't wait another
+    /// full confirm window before recovering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_stale_sentinel_triggers_immediate_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_NEW_INSTALLED").unwrap();
+        std::fs::write(
+            releases_dir.join(crate::release_install::PREVIOUS_NAME),
+            b"V_PREVIOUS",
+        )
+        .unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // install_ts = 1 (epoch+1); confirm_secs = 60 ⇒ stale
+        // threshold = 120s. Today's clock minus 1 is *way*
+        // past 120s, so the shortcut MUST fire.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.86-stale".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+
+        let start = std::time::Instant::now();
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            60, // big confirm window — proving the shortcut skipped it
+            3600,
+            999,
+        );
+        h.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V_PREVIOUS",
+            "stale-sentinel must trigger rollback even with a big confirm window",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "stale-sentinel shortcut must skip the 60s sleep (took {elapsed:?})",
+        );
+    }
+
+    /// v0.0.86: restart rate limit blocks rollback when the
+    /// rolling window is full. The target binary should be
+    /// left untouched and the operator gets an ERROR log line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_rate_limit_blocks_rollback_when_window_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_NEW_INSTALLED").unwrap();
+        std::fs::write(
+            releases_dir.join(crate::release_install::PREVIOUS_NAME),
+            b"V_PREVIOUS",
+        )
+        .unwrap();
+
+        // Pre-seed the restart log with 3 events at "now" so
+        // the cap (3) is already full.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        crate::release_install::append_restart_event(&releases_dir, now, 3600).unwrap();
+        crate::release_install::append_restart_event(&releases_dir, now, 3600).unwrap();
+        crate::release_install::append_restart_event(&releases_dir, now, 3600).unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Stale sentinel ⇒ would normally rollback immediately.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.86-stuck".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            10,
+            3600,
+            3, // cap matches the pre-seeded events
+        );
+        h.await.unwrap();
+
+        // Rate limit blocked the rollback — target untouched.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V_NEW_INSTALLED",
+            "rate-limited rollback must NOT modify the target",
+        );
     }
 
     /// v0.0.80 explicit rollback: after one install the snapshot
