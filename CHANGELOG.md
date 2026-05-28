@@ -5,6 +5,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.84] — 2026-05-28
+
+### Added — runtime head-stall watchdog
+
+Closes the last hole in the BFT-recovery story. The v0.0.83
+implicit bootnode lets a node recover at **startup** when it
+fell behind during a binary swap. The watchdog in this release
+handles the symmetric case: a node that was running fine for
+hours and then loses head progress (transient network
+partition, peer outage, BFT engine state divergence) is now
+self-healing too.
+
+#### `aii-node::head_watchdog` (new `cfg(unix)` module)
+
+- `StallDetector` — pure state machine: tracks `(last_head,
+  stalled_for_secs)` across `observe(current_head)` calls;
+  returns `Healthy` / `StalledBelowThreshold` / `StallTriggered`
+  depending on how long the head has been frozen. Defensive
+  guards against `stall_recover_secs == 0` (never triggers) and
+  `poll_secs == 0` (counter never advances).
+- `start_head_watchdog(state, stall_recover_secs, poll_secs)
+  -> JoinHandle<()>` — tokio task that polls the head each
+  `poll_secs`, feeds the detector, and on `StallTriggered`
+  calls `release_install::exec_self()` for a kernel-level
+  same-PID restart. The new process image then cold-syncs via
+  the v0.0.83 implicit-bootnode fallback (first
+  `--update-peers` URL) and rejoins consensus.
+- 7 unit tests cover the state machine: seed + healthy,
+  reset on advance, threshold crossing, post-trigger persistence,
+  recovery via head advance, plus both zero-input guards.
+
+#### `aii-node` CLI
+
+- New `--stall-recover-secs N` flag (default `0` = disabled).
+  When set, every `--stall-poll-secs` (default `10`) the
+  watchdog wakes, reads the head, and triggers
+  `exec_self()` if the head hasn't moved in `N` seconds.
+- Operator guidance: set `N` to **at least 5× the BFT slot
+  interval**. With a 1 s slot, `60-120 s` is a reasonable
+  starting point. Too aggressive and a slow tick triggers an
+  unnecessary restart; too loose and a true stall ties up the
+  node for minutes.
+
+### How v0.0.83 + v0.0.84 compose
+
+```
+node restarts                 node already running, head freezes
+       │                                │
+       │ (v0.0.83 fallback)             │ (v0.0.84 watchdog)
+       │                                │
+       ▼                                ▼
+bootstrap_sync_from_peer        exec_self() ──► (new process)
+       │                                                 │
+       └─────── back into BFT consensus ─────────────────┘
+```
+
+A node configured with `--update-peers http://peer:8545
+--stall-recover-secs 120` now self-heals from both
+restart-window stalls (v0.0.83) AND mid-flight stalls (v0.0.84)
+without operator intervention.
+
+### Scope discipline
+
+Out of scope for v0.0.84, explicitly:
+
+- **In-place re-sync without exec_self.** The watchdog uses
+  the heavy-but-simple "restart the process" recovery. A
+  cleaner approach would call `bootstrap_sync_from_peer` in
+  place and reset the BFT engine via `from_recovered`, but the
+  engine is owned by a producer task with no externally-exposed
+  reset hook. Adding one is a bigger refactor; the exec_self
+  path leverages the existing well-tested startup recovery.
+- **Restart-rate limiting / cooldown.** If exec_self
+  fails (which it can on some hardened kernels), the watchdog
+  resets its detector and waits for the next stall window — it
+  does NOT loop calling exec_self. But there's no file-backed
+  "max restarts per hour" cap; that lands later.
+- **Watchdog-aware metrics.** The current observability is
+  WARN/ERROR log lines. A future slice could expose
+  `aii_watchdogStatus` over RPC.
+
 ## [0.0.83] — 2026-05-28
 
 ### Fixed — implicit bootnode fallback from `--update-peers`
