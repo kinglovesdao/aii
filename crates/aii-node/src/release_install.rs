@@ -92,9 +92,8 @@ pub fn current_aiid_path() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
-/// `execve(2)` the current process with its original args, env,
-/// and CWD, replacing the running image with whatever binary now
-/// lives at [`current_aiid_path`].
+/// `execve(2)` the current process with its original args and
+/// env, using `exe` as the new program image.
 ///
 /// On success this function does NOT return — the process is
 /// replaced. On failure the returned [`io::Error`] describes
@@ -106,22 +105,48 @@ pub fn current_aiid_path() -> io::Result<PathBuf> {
 /// respawn the unit. From the supervisor's perspective the
 /// upgrade is invisible.
 ///
+/// **Why explicit `exe`**: after [`install_binary`] replaces
+/// the running binary via `rename(2)`, the kernel marks
+/// `/proc/self/exe` with a `" (deleted)"` suffix (because the
+/// originally-loaded inode is detached from its directory
+/// entry). [`current_aiid_path`] then returns a literal path
+/// ending in `" (deleted)"`, which `execve` rejects with
+/// `ENOENT`. The install path is the one place that already
+/// holds the correct on-disk path, so it passes it in
+/// directly.
+///
 /// # Errors
 ///
 /// `execve` failure: missing binary, non-executable file,
 /// ENOMEM, etc.
-pub fn exec_self() -> io::Error {
+pub fn exec_self_at(exe: &Path) -> io::Error {
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
+    let mut args = std::env::args_os();
+    args.next();
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    cmd.exec()
+}
+
+/// Convenience wrapper around [`exec_self_at`] that resolves
+/// the target path via [`current_aiid_path`].
+///
+/// Safe to call BEFORE [`install_binary`] runs. Once the
+/// running binary has been replaced via rename, prefer
+/// [`exec_self_at`] with the install-time target path —
+/// `/proc/self/exe` may then resolve with a `" (deleted)"`
+/// suffix that `execve` rejects.
+///
+/// # Errors
+///
+/// `current_exe()` failure or `execve` failure.
+pub fn exec_self() -> io::Error {
     let exe = match current_aiid_path() {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let mut args = std::env::args_os();
-    args.next();
-    let mut cmd = Command::new(&exe);
-    cmd.args(args);
-    cmd.exec()
+    exec_self_at(&exe)
 }
 
 #[cfg(test)]

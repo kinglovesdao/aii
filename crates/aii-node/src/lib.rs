@@ -1951,10 +1951,21 @@ impl RpcState for NodeState {
             "release installed; self-restart scheduled",
         );
         if override_target.is_none() {
+            // IMPORTANT: pass `target` into the spawn instead of
+            // re-resolving via current_exe() inside the closure.
+            // After `rename(2)`, `/proc/self/exe` carries a
+            // literal " (deleted)" suffix that `execve` rejects
+            // with ENOENT — see `release_install::exec_self_at`
+            // for the full rationale.
+            let exec_target = target;
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
-                let err = crate::release_install::exec_self();
-                tracing::error!(error = %err, "execve self failed; node continues on old binary");
+                let err = crate::release_install::exec_self_at(&exec_target);
+                tracing::error!(
+                    error = %err,
+                    target = %exec_target.display(),
+                    "execve self failed; node continues on old binary",
+                );
             });
         }
         aii_rpc::InstallOutcome {
