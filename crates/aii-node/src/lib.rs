@@ -1895,6 +1895,7 @@ impl RpcState for NodeState {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_lines)] // v0.0.78-v0.0.85 layered safety checks
     async fn install_release(&self, version: &str) -> aii_rpc::InstallOutcome {
         const RESTART_DELAY_SECS: u64 = 2;
 
@@ -1957,6 +1958,36 @@ impl RpcState for NodeState {
                 tracing::warn!(
                     error = %e,
                     "pre-install snapshot failed; rollback will be unavailable for this install",
+                );
+            }
+        }
+        // v0.0.85 boot-health record: capture current head + version
+        // so the post-execve startup path can check the new binary
+        // actually reached a healthy state. Cleared on confirm,
+        // consumed for rollback on failure. Write failure is
+        // non-fatal (same rationale as save_previous).
+        let install_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let pre_install_head = self.head_block_number_sync();
+        let pending = crate::release_install::BootPending {
+            version: version.to_string(),
+            pre_install_head,
+            install_ts,
+        };
+        match crate::release_install::write_boot_pending(&releases_dir, &pending) {
+            Ok(path) => {
+                tracing::info!(
+                    sentinel = %path.display(),
+                    pre_install_head,
+                    "boot-pending sentinel written",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "boot-pending sentinel write failed; auto-rollback will be unavailable for this install",
                 );
             }
         }
@@ -2784,6 +2815,144 @@ mod tests {
         assert!(!outcome.scheduled);
         assert!(outcome.reason.contains("no cached binary"));
         assert_eq!(std::fs::read(&target).unwrap(), b"UNCHANGED");
+    }
+
+    /// v0.0.85 boot-health: when head ADVANCES past the recorded
+    /// pre_install_head within the confirm window, the sentinel
+    /// is cleared and no rollback fires.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_clears_sentinel_when_head_advances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+
+        // Seed the sentinel as if a prior install had written it.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.85-test".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+        assert!(crate::release_install::boot_pending_path(&releases_dir).exists());
+
+        // Advance head BEFORE the confirm task runs, so its
+        // post-sleep check sees an advanced head.
+        state.set_head(42);
+
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            1, // 1 second grace window
+        );
+        // Wait long enough for the task to complete the sleep
+        // + the sentinel-clear.
+        h.await.unwrap();
+        assert!(
+            !crate::release_install::boot_pending_path(&releases_dir).exists(),
+            "healthy boot must clear .boot-pending"
+        );
+    }
+
+    /// v0.0.85 boot-health: when head does NOT advance, the
+    /// confirm task fires rollback_release. The override
+    /// install target gets the `.previous` bytes swapped in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_triggers_rollback_when_head_stuck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_NEW_INSTALLED").unwrap();
+        // .previous holds the bytes we'd roll back TO.
+        std::fs::write(
+            releases_dir.join(crate::release_install::PREVIOUS_NAME),
+            b"V_PREVIOUS",
+        )
+        .unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Seed the sentinel; head stays at 0.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.85-bad".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            1,
+        );
+        h.await.unwrap();
+
+        // Rollback fired ⇒ target has the .previous bytes now.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V_PREVIOUS",
+            "rollback must restore the .previous snapshot onto the target",
+        );
+    }
+
+    /// v0.0.85 boot-health: when the sentinel is absent, the
+    /// confirm task is a no-op (typical normal-startup case).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_noop_when_no_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            1,
+        );
+        h.await.unwrap();
+        // Nothing should have been created.
+        assert!(!crate::release_install::boot_pending_path(&releases_dir).exists(),);
+    }
+
+    /// v0.0.85 boot-health: confirm_secs == 0 is a no-op even
+    /// when a sentinel is present (operator hasn't opted in).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_disabled_when_secs_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+        let pending = crate::release_install::BootPending {
+            version: "0.0.85".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+        let sentinel = crate::release_install::boot_pending_path(&releases_dir);
+        assert!(sentinel.exists());
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            0, // disabled
+        );
+        h.await.unwrap();
+        // Sentinel still present — confirm task didn't run.
+        assert!(sentinel.exists());
     }
 
     /// v0.0.80 explicit rollback: after one install the snapshot

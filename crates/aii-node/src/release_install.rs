@@ -249,6 +249,104 @@ pub fn exec_self() -> io::Error {
     exec_self_at(&exe)
 }
 
+// ─────────────────────────── v0.0.85: boot-health ───────────────────────────
+
+/// File name of the boot-health sentinel inside the release store.
+///
+/// Written by [`write_boot_pending`] just before `install_binary`
+/// clobbers the running binary; consumed by the post-execve
+/// startup path. Presence of this file means "a previous
+/// incarnation triggered an install but the post-install boot
+/// has not yet confirmed it reached a healthy state".
+pub const BOOT_PENDING_NAME: &str = ".boot-pending";
+
+/// On-disk record of an in-flight binary install.
+///
+/// Written atomically (`.tmp` + rename) by [`write_boot_pending`]
+/// before the install completes; cleared by [`clear_boot_pending`]
+/// once the new process confirms it reached a healthy state
+/// (head advanced past `pre_install_head`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BootPending {
+    /// Version string from the manifest that drove this install
+    /// (purely diagnostic — the rollback path doesn't compare
+    /// version strings).
+    pub version: String,
+    /// Head block number captured right before the install. The
+    /// boot-health confirm task watches for the head to advance
+    /// past this; if it doesn't within the grace window, the
+    /// boot is considered failed and rollback is triggered.
+    pub pre_install_head: u64,
+    /// Unix-seconds timestamp the install was initiated. Lets
+    /// downstream tooling decide whether a long-lingering
+    /// `.boot-pending` represents a crash loop or a slow boot.
+    pub install_ts: u64,
+}
+
+/// Resolve the on-disk path of the boot-pending sentinel.
+#[must_use]
+pub fn boot_pending_path(releases_dir: &Path) -> PathBuf {
+    releases_dir.join(BOOT_PENDING_NAME)
+}
+
+/// Atomically write a boot-pending sentinel at
+/// `<releases_dir>/<BOOT_PENDING_NAME>`.
+///
+/// Always overwrites any existing sentinel (a new install
+/// always supersedes the previous one).
+///
+/// # Errors
+///
+/// I/O failures from mkdir, JSON serialize, write, or rename.
+pub fn write_boot_pending(releases_dir: &Path, record: &BootPending) -> io::Result<PathBuf> {
+    fs::create_dir_all(releases_dir)?;
+    let target = boot_pending_path(releases_dir);
+    let json =
+        serde_json::to_vec(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let staging = path_with_suffix(&target, NEW_SUFFIX);
+    if staging.exists() {
+        fs::remove_file(&staging)?;
+    }
+    fs::write(&staging, &json)?;
+    fs::rename(&staging, &target)?;
+    Ok(target)
+}
+
+/// Read the boot-pending sentinel at
+/// `<releases_dir>/<BOOT_PENDING_NAME>`, returning `Ok(None)`
+/// if it doesn't exist.
+///
+/// # Errors
+///
+/// True I/O failures bubble up; missing-file is `Ok(None)`.
+/// A malformed sentinel returns an I/O error (treat as
+/// "unparseable, leave it for an operator to inspect").
+pub fn read_boot_pending(releases_dir: &Path) -> io::Result<Option<BootPending>> {
+    let path = boot_pending_path(releases_dir);
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<BootPending>(&bytes)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the boot-pending sentinel. Idempotent — succeeds
+/// even if the file is already gone.
+///
+/// # Errors
+///
+/// True I/O failures bubble up; missing-file is silent success.
+pub fn clear_boot_pending(releases_dir: &Path) -> io::Result<()> {
+    let path = boot_pending_path(releases_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +536,83 @@ mod tests {
             b"UNCHANGED",
             "target must not be touched when there's nothing to roll back to"
         );
+    }
+
+    #[test]
+    fn boot_pending_write_then_read_round_trip() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let record = BootPending {
+            version: "0.0.85".into(),
+            pre_install_head: 12345,
+            install_ts: 1_900_000_085,
+        };
+        let path = write_boot_pending(&releases, &record).unwrap();
+        assert_eq!(path, releases.join(BOOT_PENDING_NAME));
+        assert!(path.exists());
+        let got = read_boot_pending(&releases).unwrap().unwrap();
+        assert_eq!(got, record);
+    }
+
+    #[test]
+    fn boot_pending_read_missing_returns_none() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        fs::create_dir_all(&releases).unwrap();
+        assert_eq!(read_boot_pending(&releases).unwrap(), None);
+    }
+
+    #[test]
+    fn boot_pending_write_overwrites_prior_record() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        let first = BootPending {
+            version: "0.0.85".into(),
+            pre_install_head: 100,
+            install_ts: 100,
+        };
+        let second = BootPending {
+            version: "0.0.86".into(),
+            pre_install_head: 200,
+            install_ts: 200,
+        };
+        write_boot_pending(&releases, &first).unwrap();
+        write_boot_pending(&releases, &second).unwrap();
+        let got = read_boot_pending(&releases).unwrap().unwrap();
+        assert_eq!(got, second);
+    }
+
+    #[test]
+    fn boot_pending_clear_is_idempotent() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        fs::create_dir_all(&releases).unwrap();
+        // Clearing a non-existent file succeeds.
+        clear_boot_pending(&releases).unwrap();
+        // After write + clear, the file is gone.
+        write_boot_pending(
+            &releases,
+            &BootPending {
+                version: "0.0.85".into(),
+                pre_install_head: 1,
+                install_ts: 1,
+            },
+        )
+        .unwrap();
+        assert!(boot_pending_path(&releases).exists());
+        clear_boot_pending(&releases).unwrap();
+        assert!(!boot_pending_path(&releases).exists());
+        // A second clear is still a success.
+        clear_boot_pending(&releases).unwrap();
+    }
+
+    #[test]
+    fn boot_pending_read_rejects_garbage_with_invalid_data() {
+        let dir = tempdir();
+        let releases = dir.join("releases");
+        fs::create_dir_all(&releases).unwrap();
+        fs::write(boot_pending_path(&releases), b"not valid json").unwrap();
+        let err = read_boot_pending(&releases).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
