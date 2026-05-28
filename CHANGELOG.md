@@ -5,6 +5,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.88] — 2026-05-28
+
+### Added — `eth_call` read-only revm simulation
+
+Before this release, wallets and explorers had no way to ask
+the node "what would this transaction return / revert with
+if I submitted it right now?" The full revm execution path
+existed since v0.0.20 (and was wired into commit at
+`crates/aii-node/src/lib.rs` line ~766) — but it always
+committed state changes, so it couldn't serve as the eth_call
+backend.
+
+v0.0.88 adds the missing read-only counterpart. Wallet
+balance queries, explorer view-function calls, and dApp
+`callStatic` requests now work against an AII node like they
+would against any Ethereum endpoint.
+
+#### `aii-evm`
+
+- New `SimulationResult { success, gas_used, return_data,
+  revert_reason, logs }` — same shape as `ExecutionSummary`
+  minus the CREATE deployment artifact, plus a `revert_reason`
+  field populated on `Revert` / `Halt`.
+- New `simulate_with_revm(state, sender, to, value, data,
+  gas_limit, gas_price) -> Result<SimulationResult, ExecError>` —
+  builds the same revm session as `execute_with_revm` and
+  calls `evm.transact()`, but **discards** the post-tx state
+  diff. The `RevmDb` adapter is read-only, so the underlying
+  `Arc<StateDb<B>>` is guaranteed untouched.
+- 3 unit tests: state-unchanged invariant under value transfer,
+  over-budget transfer doesn't silently succeed, deployed-
+  contract call returns its constant via simulation while the
+  sender's nonce stays put.
+
+#### `aii-rpc`
+
+- New `eth_call(req, blockTag)` JSON-RPC method. Returns the
+  hex-encoded return data on success; error on revert /
+  unsupported / bad input.
+- New `EthCallRequest` wire struct mirroring the Ethereum
+  JSON-RPC `eth_call` transaction object (`from`, `to`,
+  `value`, `data`, `gas`, `gasPrice` — all optional except
+  `to`).
+- New typed `SimulateCallParams` + `SimulateCallError` for the
+  trait surface. `RpcState::simulate_call` defaults to
+  `Err(SimulateCallError::Unsupported)`.
+- Hex-parsing helpers (`parse_hex_u64`, `parse_hex_u256`) for
+  the wire-level field conversions.
+
+#### `aii-node::NodeState`
+
+- Overrides `RpcState::simulate_call` to route through
+  `aii_evm::simulate_with_revm`. Reverts surface as
+  `SimulateCallError::Reverted`; revm errors as `Evm`.
+- 2 lib-level integration tests boot the full RPC server and
+  exercise the round-trip: a value-transfer call returns `0x`
+  with state unchanged, and a deployed-contract call returns
+  the 32-byte constant the contract is wired to emit.
+
+### Scope discipline
+
+Out of scope for v0.0.88:
+
+- **`eth_estimateGas`.** Lands next — it's basically
+  `simulate_with_revm` returning `gas_used` instead of
+  `return_data`. Wallet UX wants both.
+- **`eth_getCode` / `eth_getStorageAt`.** Mainly cosmetic
+  (we already store both); needs minor RPC wiring + tests.
+- **Block-tag handling.** `eth_call`'s second arg is ignored
+  today — every simulation runs against the head state.
+  Historical-state simulation needs MPT support, which is
+  separately scoped.
+- **Gas limit per simulation.** The default 30 M cap is
+  reasonable but not enforced as a node-wide policy. A
+  future slice could refuse very-high-gas eth_calls at the
+  RPC layer.
+
+Tests: +5 (3 aii-evm unit, 2 aii-node integration). 856 tests
+pass / clippy clean.
+
 ## [0.0.87] — 2026-05-28
 
 ### Added — multi-key release signing (pubkey rotation)

@@ -312,6 +312,53 @@ pub trait RpcState: Send + Sync + 'static {
             restart_in_secs: 0,
         }
     }
+
+    /// Simulate a transaction via the EVM (v0.0.88 `eth_call`
+    /// support). Returns the return bytes on success, an
+    /// [`SimulateCallError`] otherwise. The default returns
+    /// `Unsupported` — `aii-node::NodeState` overrides this to
+    /// route through `aii_evm::simulate_with_revm`.
+    async fn simulate_call(&self, _req: SimulateCallParams) -> Result<Vec<u8>, SimulateCallError> {
+        Err(SimulateCallError::Unsupported)
+    }
+}
+
+/// Parsed `eth_call` request handed to [`RpcState::simulate_call`].
+///
+/// The wire-shape [`EthCallRequest`] uses hex strings; this is
+/// the typed form with everything decoded.
+#[derive(Debug, Clone)]
+pub struct SimulateCallParams {
+    /// Caller address (decoded from `from`, defaults to all-zero).
+    pub from: Address,
+    /// Target contract address (decoded from `to`).
+    pub to: Address,
+    /// Wei value.
+    pub value: U256,
+    /// Call data.
+    pub data: Vec<u8>,
+    /// Gas limit for the simulation.
+    pub gas_limit: u64,
+    /// Gas price (mostly cosmetic in a simulation).
+    pub gas_price: U256,
+}
+
+/// Errors from [`RpcState::simulate_call`].
+#[derive(Debug, thiserror::Error)]
+pub enum SimulateCallError {
+    /// Host has no EVM wired up.
+    #[error("eth_call not supported by this node")]
+    Unsupported,
+    /// Hex decode failure on one of the request fields.
+    #[error("invalid hex in eth_call request: {0}")]
+    Hex(String),
+    /// EVM ran but the transaction reverted or halted.
+    #[error("execution reverted: {0}")]
+    Reverted(String),
+    /// revm internal error (bad transaction shape, state lookup
+    /// failure, etc.).
+    #[error("evm: {0}")]
+    Evm(String),
 }
 
 /// Result type carried back from [`RpcState::install_release`].
@@ -432,6 +479,48 @@ pub trait EthRpc {
     /// linearly. An empty `address` / `topics` matches everything.
     #[method(name = "getLogs")]
     async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<LogEntryView>>;
+
+    /// `eth_call(req, blockTag)` — execute a transaction as a
+    /// read-only simulation against the head state via revm
+    /// (v0.0.88). State changes are discarded. Returns the
+    /// hex-encoded return data on success. `blockTag` is
+    /// currently ignored (only head-state is supported).
+    #[method(name = "call")]
+    async fn call(&self, req: EthCallRequest, block_tag: Option<String>) -> RpcResult<String>;
+}
+
+/// Request body for the v0.0.88 `eth_call` JSON-RPC method.
+///
+/// Mirrors the Ethereum JSON-RPC `eth_call` "transaction
+/// object" — every field is optional except `to` (which is
+/// required for a CALL; a CREATE simulation is not yet
+/// exposed). All hex fields accept `0x…` or bare hex.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EthCallRequest {
+    /// Caller address (`0x…` hex, 20 bytes). Defaults to all
+    /// zeros — fine for view-function calls that don't read
+    /// `msg.sender`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Target contract address (`0x…` hex). Required.
+    pub to: String,
+    /// Wei value (`0x…` hex). Defaults to `0x0`.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Call data (`0x…` hex). Defaults to empty.
+    #[serde(default)]
+    pub data: Option<String>,
+    /// Gas limit (`0x…` hex). Defaults to a generous
+    /// `0x1c9c380` (30 M gas) — `eth_call` doesn't charge gas
+    /// against any account, so the cap is just to prevent
+    /// runaway execution.
+    #[serde(default)]
+    pub gas: Option<String>,
+    /// Gas price (`0x…` hex Wei). Defaults to `0x0` — revm
+    /// won't actually debit anything in a simulation, but
+    /// some contracts read `tx.gasprice`.
+    #[serde(default, rename = "gasPrice")]
+    pub gas_price: Option<String>,
 }
 
 /// `eth_getLogs` request filter (subset of the Ethereum spec — block
@@ -893,6 +982,68 @@ impl<S: RpcState> EthRpcServer for EthRpcImpl<S> {
     async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<LogEntryView>> {
         Ok(self.state.logs_in_range(&filter).await)
     }
+
+    async fn call(&self, req: EthCallRequest, _block_tag: Option<String>) -> RpcResult<String> {
+        let params = parse_eth_call_request(&req)?;
+        match self.state.simulate_call(params).await {
+            Ok(bytes) => Ok(format!("0x{}", hex::encode(bytes))),
+            Err(e) => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32000,
+                e.to_string(),
+                None::<()>,
+            )),
+        }
+    }
+}
+
+/// Decode an [`EthCallRequest`] (hex strings) into a typed
+/// [`SimulateCallParams`] for the host.
+fn parse_eth_call_request(req: &EthCallRequest) -> RpcResult<SimulateCallParams> {
+    let to = parse_address(&req.to)?;
+    let from = match req.from.as_deref() {
+        Some(s) => parse_address(s)?,
+        None => Address::new([0u8; 20]),
+    };
+    let value = parse_hex_u256(req.value.as_deref().unwrap_or("0x0"))?;
+    let data = match req.data.as_deref() {
+        Some(s) => {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            hex::decode(s).map_err(|e| {
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32602,
+                    format!("data: bad hex: {e}"),
+                    None::<()>,
+                )
+            })?
+        }
+        None => Vec::new(),
+    };
+    let gas_limit = parse_hex_u64(req.gas.as_deref().unwrap_or("0x1c9c380"))?;
+    let gas_price = parse_hex_u256(req.gas_price.as_deref().unwrap_or("0x0"))?;
+    Ok(SimulateCallParams {
+        from,
+        to,
+        value,
+        data,
+        gas_limit,
+        gas_price,
+    })
+}
+
+fn parse_hex_u256(s: &str) -> RpcResult<U256> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let s = if s.is_empty() { "0" } else { s };
+    U256::from_str_radix(s, 16).map_err(|e| {
+        jsonrpsee::types::ErrorObjectOwned::owned(-32602, format!("u256 hex: {e}"), None::<()>)
+    })
+}
+
+fn parse_hex_u64(s: &str) -> RpcResult<u64> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let s = if s.is_empty() { "0" } else { s };
+    u64::from_str_radix(s, 16).map_err(|e| {
+        jsonrpsee::types::ErrorObjectOwned::owned(-32602, format!("u64 hex: {e}"), None::<()>)
+    })
 }
 
 struct AiiRpcImpl<S: RpcState> {
