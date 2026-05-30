@@ -5,6 +5,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.92] — 2026-05-30
+
+### Fixed — discovery refresh no longer stalls BFT consensus
+
+v0.0.91 ran the periodic Discovery v4 refresh **inline inside the BFT
+consensus producer loop**. `discover_once_full` is time-bounded by
+`--discovery-timeout-ms`, but while it awaited, `gossip.tick()` could
+not run — so every `--discovery-refresh-secs` the consensus engine
+stopped advancing for the whole discovery window.
+
+Reproduced with a local 2-validator A/B cluster (`aii validator keygen`
++ `aii genesis init`, distinct ports, a black-hole discovery seed so
+`discover_once_full` waits its full timeout):
+
+- **control** (`--no-discovery`): steady production, longest
+  consecutive zero-advance run = **0 s**.
+- **treatment** (discovery on, `--discovery-timeout-ms 6000
+  --discovery-refresh-secs 8`): periodic **~3–4 s consensus freeze
+  recurring ~every 7 s** (sawtooth height curve).
+
+**Fix:** the discovery refresh now runs in its own `tokio::spawn`
+task, decoupled from the consensus loop. `gossip.tick()` is never
+blocked by network discovery; discovered peers still flow back via
+`transport.add_peer` + the shared peer view + the on-disk peer cache,
+exactly as before. After the fix the treatment run also shows a
+**0 s** longest zero-advance run — identical to the control.
+
+This was NOT the cause of the earlier production chain stall (that was
+a quorum-of-3 testnet with one wedged node; only a node restart
+recovered it). It is a latent liveness tax that would matter under the
+30 s-finality / high-load target.
+
+#### Scope discipline
+
+Out of scope: the discovery wire protocol, seed lists, and the startup
+discovery pass are unchanged; only *where* the periodic refresh runs
+moved. No consensus, RPC, or storage behavior changed.
+
 ## [0.0.91] — 2026-05-28
 
 ### Added — public-internet discovery glue + BFT capacity budget + validator registry

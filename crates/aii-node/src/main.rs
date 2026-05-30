@@ -760,11 +760,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // tracked tuple actually changes.
             let bft_state_path_for_loop = bft_state_path;
             let cache_path_for_loop = cache_path.clone();
-            let mut known_bft_peers = merged_peers.clone();
+            let known_bft_peers = merged_peers.clone();
             let discovery_key_for_loop = discovery_key.clone();
-            let mut known_discovery_peers = discovery_query_peers.clone();
+            let known_discovery_peers = discovery_query_peers.clone();
             let discovery_query_listen_for_loop = discovery_query_listen;
-            let mut discovery_advertise_for_loop = discovery_advertise;
+            let discovery_advertise_for_loop = discovery_advertise;
             let discovery_peer_view_for_loop = discovery_peer_view.clone();
             let advertised_bft_listen = cli.bft_listen;
             let advertise_bft_in_refresh = !cli.bft_outbound_only;
@@ -774,6 +774,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else {
                 Some(Duration::from_secs(cli.discovery_refresh_secs))
             };
+            // v0.0.92: Discovery v4 refresh runs in its OWN task — never
+            // inline in the consensus producer loop. The prior design
+            // awaited `discover_once_full` (bounded by --discovery-
+            // timeout-ms) directly inside the loop, so every
+            // --discovery-refresh-secs the BFT engine stopped ticking
+            // for the whole discovery window. A local 2-validator A/B
+            // repro proved it: control (--no-discovery) never stalled
+            // (max 0s zero-advance); treatment (discovery on, 6s
+            // timeout / 8s refresh) froze ~3-4s every ~7s. Decoupling
+            // keeps gossip.tick() hot; discovered peers still flow back
+            // via transport.add_peer + the shared peer view + the
+            // on-disk cache exactly as before.
+            let _discovery_refresh_handle = tokio::spawn(async move {
+                let (Some(discovery_key), Some(refresh)) =
+                    (discovery_key_for_loop, discovery_refresh)
+                else {
+                    return;
+                };
+                let transport_for_disc = transport_for_loop;
+                let discovery_peer_view_for_disc = discovery_peer_view_for_loop;
+                let cache_path_for_disc = cache_path_for_loop;
+                let mut known_discovery_peers = known_discovery_peers;
+                let mut known_bft_peers = known_bft_peers;
+                let mut discovery_advertise = discovery_advertise_for_loop;
+                let mut ticker = tokio::time::interval(refresh);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await; // first tick fires immediately — skip it
+                loop {
+                    ticker.tick().await;
+                    match aii_node::discovery_bootstrap::discover_once_full(
+                        discovery_query_listen_for_loop,
+                        discovery_key.clone(),
+                        &known_discovery_peers,
+                        advertised_bft_listen,
+                        discovery_advertise,
+                        &known_bft_peers,
+                        discovery_timeout,
+                    )
+                    .await
+                    {
+                        Ok(discovered) => {
+                            let next_advertise =
+                                aii_node::discovery_bootstrap::advertisement_with_observed_endpoint(
+                                    discovery_advertise,
+                                    advertised_bft_listen,
+                                    discovered.observed_discovery,
+                                    advertise_bft_in_refresh,
+                                );
+                            if next_advertise != discovery_advertise {
+                                tracing::info!(
+                                    observed_discovery = ?discovered.observed_discovery,
+                                    advertise = ?next_advertise,
+                                    "discovery refresh updated inferred public advertisement",
+                                );
+                                discovery_advertise = next_advertise;
+                            }
+                            let mut added = 0usize;
+                            for peer in &discovered.bft_peers {
+                                if transport_for_disc.add_peer(*peer) {
+                                    added += 1;
+                                }
+                            }
+                            if !discovered.discovery_peers.is_empty() {
+                                known_discovery_peers = aii_node::peer_cache::merge(
+                                    &known_discovery_peers,
+                                    &discovered.discovery_peers,
+                                );
+                            }
+                            if !discovered.bft_peers.is_empty() {
+                                known_bft_peers = aii_node::peer_cache::merge(
+                                    &known_bft_peers,
+                                    &discovered.bft_peers,
+                                );
+                                aii_node::discovery_bootstrap::set_shared_peers(
+                                    &discovery_peer_view_for_disc,
+                                    &known_bft_peers,
+                                );
+                                if let Err(e) = aii_node::peer_cache::save(
+                                    &cache_path_for_disc,
+                                    &known_bft_peers,
+                                ) {
+                                    tracing::warn!(
+                                        ?e,
+                                        path = %cache_path_for_disc.display(),
+                                        "peer cache save failed after discovery refresh"
+                                    );
+                                }
+                                tracing::info!(
+                                    discovered = discovered.bft_peers.len(),
+                                    added,
+                                    total = known_bft_peers.len(),
+                                    discovery_targets = known_discovery_peers.len(),
+                                    "discovery refresh updated BFT peer set",
+                                );
+                            } else if !discovered.discovery_peers.is_empty() {
+                                tracing::info!(
+                                    discovery_targets = known_discovery_peers.len(),
+                                    "discovery refresh learned additional discovery peers",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "discovery refresh failed");
+                        }
+                    }
+                }
+            });
             let last_persisted_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let last_persisted_round = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
             // Drain the mempool into the engine's pending-txs queue
@@ -785,7 +892,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // v0.0.39).
             Some(tokio::spawn(async move {
                 let mut last_rotation_checked_epoch: Option<u64> = None;
-                let mut last_discovery_refresh = tokio::time::Instant::now();
                 loop {
                     gossip.tick();
                     let txs = state_for_pool.tx_pool().drain_up_to(max_txs_per_block);
@@ -910,88 +1016,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     .store(height, std::sync::atomic::Ordering::Relaxed);
                                 last_persisted_round
                                     .store(round as u64, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    if let (Some(discovery_key), Some(refresh)) =
-                        (discovery_key_for_loop.as_ref(), discovery_refresh)
-                    {
-                        if last_discovery_refresh.elapsed() >= refresh {
-                            last_discovery_refresh = tokio::time::Instant::now();
-                            match aii_node::discovery_bootstrap::discover_once_full(
-                                discovery_query_listen_for_loop,
-                                discovery_key.clone(),
-                                &known_discovery_peers,
-                                advertised_bft_listen,
-                                discovery_advertise_for_loop,
-                                &known_bft_peers,
-                                discovery_timeout,
-                            )
-                            .await
-                            {
-                                Ok(discovered) => {
-                                    let next_advertise = aii_node::discovery_bootstrap::advertisement_with_observed_endpoint(
-                                        discovery_advertise_for_loop,
-                                        advertised_bft_listen,
-                                        discovered.observed_discovery,
-                                        advertise_bft_in_refresh,
-                                    );
-                                    if next_advertise != discovery_advertise_for_loop {
-                                        tracing::info!(
-                                            observed_discovery = ?discovered.observed_discovery,
-                                            advertise = ?next_advertise,
-                                            "discovery refresh updated inferred public advertisement",
-                                        );
-                                        discovery_advertise_for_loop = next_advertise;
-                                    }
-                                    let mut added = 0usize;
-                                    for peer in &discovered.bft_peers {
-                                        if transport_for_loop.add_peer(*peer) {
-                                            added += 1;
-                                        }
-                                    }
-                                    if !discovered.discovery_peers.is_empty() {
-                                        known_discovery_peers = aii_node::peer_cache::merge(
-                                            &known_discovery_peers,
-                                            &discovered.discovery_peers,
-                                        );
-                                    }
-                                    if !discovered.bft_peers.is_empty() {
-                                        known_bft_peers = aii_node::peer_cache::merge(
-                                            &known_bft_peers,
-                                            &discovered.bft_peers,
-                                        );
-                                        aii_node::discovery_bootstrap::set_shared_peers(
-                                            &discovery_peer_view_for_loop,
-                                            &known_bft_peers,
-                                        );
-                                        if let Err(e) = aii_node::peer_cache::save(
-                                            &cache_path_for_loop,
-                                            &known_bft_peers,
-                                        ) {
-                                            tracing::warn!(
-                                                ?e,
-                                                path = %cache_path_for_loop.display(),
-                                                "peer cache save failed after discovery refresh"
-                                            );
-                                        }
-                                        tracing::info!(
-                                            discovered = discovered.bft_peers.len(),
-                                            added,
-                                            total = known_bft_peers.len(),
-                                            discovery_targets = known_discovery_peers.len(),
-                                            "discovery refresh updated BFT peer set",
-                                        );
-                                    } else if !discovered.discovery_peers.is_empty() {
-                                        tracing::info!(
-                                            discovery_targets = known_discovery_peers.len(),
-                                            "discovery refresh learned additional discovery peers",
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "discovery refresh failed");
-                                }
                             }
                         }
                     }
