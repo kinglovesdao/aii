@@ -24,7 +24,7 @@
 //!
 //! No timers, no async. Hosts drive `tick()` from their own loop.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use alloy_rlp::{Decodable, Encodable};
 use parking_lot::Mutex;
@@ -73,6 +73,7 @@ struct RoundFlags {
     last_proposal: Option<Vec<u8>>,
     last_prevote: Option<Vec<u8>>,
     last_precommit: Option<Vec<u8>>,
+    requested_blocks: BTreeSet<u64>,
 }
 
 impl RoundFlags {
@@ -394,6 +395,9 @@ impl<T: BftTransport> BftGossip<T> {
                     body_len = body_bytes.len(),
                     "dispatch_inbound: Proposal"
                 );
+                if self.request_catchup_if_future_height(height) {
+                    return Ok(());
+                }
                 let r = self.handle_proposal_msg(
                     height,
                     round,
@@ -409,6 +413,9 @@ impl<T: BftTransport> BftGossip<T> {
             }
             BftMessage::Prevote(v) => {
                 tracing::debug!(?v, "dispatch_inbound: Prevote");
+                if self.request_catchup_if_future_height(v.height) {
+                    return Ok(());
+                }
                 let r = self.engine.submit_remote_prevote(v);
                 if let Err(ref e) = r {
                     tracing::warn!(?e, "submit_remote_prevote returned err");
@@ -417,13 +424,83 @@ impl<T: BftTransport> BftGossip<T> {
             }
             BftMessage::Precommit(v) => {
                 tracing::debug!(?v, "dispatch_inbound: Precommit");
+                if self.request_catchup_if_future_height(v.height) {
+                    return Ok(());
+                }
                 let r = self.engine.submit_remote_precommit(v);
                 if let Err(ref e) = r {
                     tracing::warn!(?e, "submit_remote_precommit returned err");
                 }
                 r
             }
+            BftMessage::BlockRequest { height } => {
+                tracing::debug!(height, "dispatch_inbound: BlockRequest");
+                if let Some((block, certificate)) = self.engine.committed_block_at(height) {
+                    let mut block_bytes = Vec::new();
+                    block.encode(&mut block_bytes);
+                    let bytes = BftMessage::BlockResponse {
+                        block_bytes,
+                        certificate,
+                    }
+                    .encode();
+                    self.transport.broadcast(bytes);
+                }
+                Ok(())
+            }
+            BftMessage::BlockResponse {
+                block_bytes,
+                certificate,
+            } => {
+                tracing::debug!(bytes = block_bytes.len(), "dispatch_inbound: BlockResponse");
+                self.handle_block_response(&block_bytes, certificate)
+            }
         }
+    }
+
+    fn request_catchup_if_future_height(&self, remote_height: u64) -> bool {
+        let next_height = self.engine.head_number().saturating_add(1);
+        if remote_height <= next_height {
+            return false;
+        }
+        let mut flags = self.flags.lock();
+        if !flags.requested_blocks.insert(next_height) {
+            return true;
+        }
+        drop(flags);
+        tracing::info!(
+            remote_height,
+            requested_height = next_height,
+            "gossip observed future BFT height; requesting missing block"
+        );
+        self.transport.broadcast(
+            BftMessage::BlockRequest {
+                height: next_height,
+            }
+            .encode(),
+        );
+        true
+    }
+
+    fn handle_block_response(
+        &self,
+        block_bytes: &[u8],
+        certificate: crate::bft::PrecommitCertificate,
+    ) -> Result<(), BftError> {
+        let mut slice = block_bytes;
+        let block = aii_block::Block::decode(&mut slice)
+            .map_err(|e| BftError::InvalidProposalBody(e.to_string()))?;
+        if !slice.is_empty() {
+            return Err(BftError::InvalidProposalBody(
+                "trailing bytes after synced block".to_string(),
+            ));
+        }
+        let adopted = self.engine.adopt_synced_block(block, certificate)?;
+        self.flags
+            .lock()
+            .requested_blocks
+            .remove(&adopted.header.number);
+        self.harvested_blocks.lock().push(adopted);
+        Ok(())
     }
 
     /// Reconstruct the proposed block from the engine's header view +
@@ -439,12 +516,22 @@ impl<T: BftTransport> BftGossip<T> {
     fn handle_proposal_msg(
         &self,
         height: u64,
-        _round: u32,
+        round: u32,
         block_hash: aii_types::H256,
         leader_proof: LeaderProof,
         coinbase: aii_types::Address,
         body_bytes: &[u8],
     ) -> Result<(), BftError> {
+        if height == self.engine.head_number().saturating_add(1) {
+            let should_fast_forward = self.engine.current_round_state().is_none_or(
+                |(active_height, active_round, _phase)| {
+                    active_height == height && round > active_round
+                },
+            );
+            if should_fast_forward && round > 0 {
+                self.engine.fast_forward_to_round(round)?;
+            }
+        }
         let body = decode_block_body(body_bytes)?;
         let block =
             self.engine
@@ -575,6 +662,30 @@ mod tests {
         Arc::new(BftEngine::new(cfg, g))
     }
 
+    fn single_validator_fixture(seed: u8) -> (ValidatorSet, Vec<(BlsSecretKey, VrfSecretKey)>) {
+        let bls = bls_sk(seed);
+        let vrf = vrf_sk();
+        let vs = ValidatorSet::new(vec![Validator {
+            bls_pubkey: bls.public_key(),
+            vrf_pubkey: vrf.public_key(),
+            stake: 100,
+        }])
+        .unwrap();
+        (vs, vec![(bls, vrf)])
+    }
+
+    fn commit_one_block(engine: Arc<BftEngine>) -> Block {
+        let (transport, _peer) = MemoryTransport::pair();
+        let gossip = BftGossip::new(engine, transport);
+        for _ in 0..10 {
+            gossip.tick();
+            if let Some(block) = gossip.drain_harvested().into_iter().next() {
+                return block;
+            }
+        }
+        panic!("single-validator source should commit one block");
+    }
+
     /// Build a synthetic EIP-1559 self-transfer tx — enough to be a
     /// real `Tx::Eip1559` variant that RLP-round-trips cleanly. Used
     /// purely to populate non-empty block bodies for the body-gossip
@@ -597,6 +708,100 @@ mod tests {
             s: H256::new([0u8; 32]),
             algo_id: AlgoId::Secp256k1,
         })
+    }
+
+    #[test]
+    fn single_validator_gossip_finalises_without_peers() {
+        let bls = bls_sk(1);
+        let vrf = vrf_sk();
+        let vs = ValidatorSet::new(vec![Validator {
+            bls_pubkey: bls.public_key(),
+            vrf_pubkey: vrf.public_key(),
+            stake: 100,
+        }])
+        .unwrap();
+        let g = genesis();
+        let e = build_engine(0, &vs, &[(bls, vrf)], &g);
+        e.set_pending_txs(vec![dummy_signed_tx(0)]);
+        let (t, _peer) = MemoryTransport::pair();
+        let gossip = BftGossip::new(e.clone(), t);
+
+        let mut committed: Option<Block> = None;
+        for _ in 0..10 {
+            gossip.tick();
+            if committed.is_none() {
+                committed = gossip
+                    .drain_harvested()
+                    .into_iter()
+                    .next()
+                    .or_else(|| e.try_harvest_committed());
+            }
+            if committed.is_some() {
+                break;
+            }
+        }
+
+        let block = committed.expect("single validator gossip should self-finalise");
+        assert_eq!(block.header.number, 1);
+        assert_eq!(block.body.transactions.len(), 1);
+        assert_eq!(e.head().1, 1);
+    }
+
+    #[test]
+    fn block_request_response_syncs_certified_missing_block() {
+        let (vs, keys) = single_validator_fixture(9);
+        let g = genesis();
+        let source_engine = build_engine(0, &vs, &keys, &g);
+        let target_engine = build_engine(0, &vs, &keys, &g);
+        let committed = commit_one_block(source_engine.clone());
+        assert_eq!(committed.header.number, 1);
+        assert!(source_engine.committed_block_at(1).is_some());
+
+        let (source_transport, target_transport) = MemoryTransport::pair();
+        let source_gossip = BftGossip::new(source_engine, source_transport);
+        let target_gossip = BftGossip::new(target_engine.clone(), target_transport);
+
+        target_gossip
+            .transport()
+            .broadcast(BftMessage::BlockRequest { height: 1 }.encode());
+        source_gossip.tick();
+        target_gossip.tick();
+
+        assert_eq!(target_engine.head().1, 1);
+        assert_eq!(target_engine.head().0, committed.hash());
+        let synced = target_gossip.drain_harvested();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].hash(), committed.hash());
+    }
+
+    #[test]
+    fn block_response_with_bad_certificate_is_rejected() {
+        let (vs, keys) = single_validator_fixture(10);
+        let g = genesis();
+        let source_engine = build_engine(0, &vs, &keys, &g);
+        let target_engine = build_engine(0, &vs, &keys, &g);
+        let committed = commit_one_block(source_engine.clone());
+        let mut block_bytes = Vec::new();
+        committed.encode(&mut block_bytes);
+        let (_, mut certificate) = source_engine
+            .committed_block_at(1)
+            .expect("source should cache committed certificate");
+        certificate.block_hash = H256::new([0x99; 32]);
+
+        let (source_transport, target_transport) = MemoryTransport::pair();
+        let source_gossip = BftGossip::new(source_engine, source_transport);
+        let target_gossip = BftGossip::new(target_engine.clone(), target_transport);
+        source_gossip.transport().broadcast(
+            BftMessage::BlockResponse {
+                block_bytes,
+                certificate,
+            }
+            .encode(),
+        );
+        target_gossip.tick();
+
+        assert_eq!(target_engine.head().1, 0);
+        assert!(target_gossip.drain_harvested().is_empty());
     }
 
     #[test]

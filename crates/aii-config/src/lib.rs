@@ -14,6 +14,6 @@ pub mod chain_spec;
 pub mod error;
 pub mod genesis;
 
-pub use chain_spec::{ChainSpec, AII_CHAIN_ID, AII_MAINNET, AII_TESTNET};
+pub use chain_spec::{ChainSpec, AII_CHAIN_ID, AII_MAINNET, AII_TESTNET, MAX_ACTIVE_VALIDATORS};
 pub use error::ConfigError;
 pub use genesis::{Genesis, GenesisAlloc, GenesisValidator};

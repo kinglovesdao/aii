@@ -1055,6 +1055,10 @@ pub struct ValidatorEntryView {
     pub address: String,
     /// Bonded stake at election time (`0x…` hex Wei).
     pub stake_wei: String,
+    /// Registered BLS pubkey, if the epoch record carries runtime keys.
+    pub bls_pubkey: Option<String>,
+    /// Registered VRF pubkey, if the epoch record carries runtime keys.
+    pub vrf_pubkey: Option<String>,
 }
 
 /// JSON-RPC view of a single staking record.

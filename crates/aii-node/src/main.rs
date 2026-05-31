@@ -8,8 +8,8 @@ use aii_consensus_poa::{PoaConfig, PoaEngine};
 use aii_node::bft_p2p::TcpBftTransport;
 use aii_node::{bft_bootstrap, NodeState};
 use aii_storage::{KvBackend, RocksDbBackend};
-use aii_types::{Address, H256, U256};
-use clap::Parser;
+use aii_types::{Address, BlsPubKey, VrfPubKey, H256, U256};
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,8 +84,10 @@ struct Cli {
     coinbase: Option<String>,
 
     /// TCP address to bind the BFT gossip listener to. Defaults to
-    /// `127.0.0.1:30311`. Only used when `--bft` is set.
-    #[arg(long, default_value = "127.0.0.1:30311")]
+    /// `0.0.0.0:30311` so public validators can be discovered and
+    /// dialed without extra listener configuration. Only used when
+    /// `--bft` is set.
+    #[arg(long, default_value = "0.0.0.0:30311")]
     bft_listen: SocketAddr,
 
     /// Comma-separated list of `host:port` addresses of peer BFT
@@ -93,6 +95,50 @@ struct Cli {
     /// failure. Example: `--peers 10.0.0.2:30311,10.0.0.3:30311`.
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
+
+    /// UDP discovery bind address. Used when automatic discovery is
+    /// enabled. The discovered neighbours' TCP ports are merged into
+    /// the BFT peer set before gossip starts.
+    #[arg(long, default_value = "0.0.0.0:30310")]
+    discovery_listen: SocketAddr,
+
+    /// Public UDP Discovery v4 address to advertise to seed nodes and
+    /// discovery callers. When omitted, the node uses the endpoint
+    /// observed by Discovery v4 seeds. Set this when NAT/port
+    /// forwarding maps to a different public port. Example:
+    /// `--discovery-advertise 203.0.113.10:30310`.
+    #[arg(long)]
+    discovery_advertise: Option<SocketAddr>,
+
+    /// Public BFT TCP gossip address to advertise through Discovery
+    /// v4. When omitted, the node infers the public IP from
+    /// Discovery v4 seed observations and combines it with
+    /// `--bft-listen`'s port. Set this when TCP is mapped to a
+    /// different public address/port. Example: `--bft-advertise
+    /// 203.0.113.10:30311`.
+    #[arg(long)]
+    bft_advertise: Option<SocketAddr>,
+
+    /// Comma-separated UDP Discovery v4 seed addresses. These are
+    /// merged with `AII_DISCOVERY_SEEDS` and built-in network seeds.
+    /// On startup the node pings each seed and asks for neighbours,
+    /// then persists any returned BFT TCP endpoints into
+    /// `<data-dir>/peers.json`.
+    #[arg(long, value_delimiter = ',')]
+    discovery_seeds: Vec<SocketAddr>,
+
+    /// Disable automatic Discovery v4 bootstrap entirely.
+    #[arg(long, default_value = "false")]
+    no_discovery: bool,
+
+    /// Milliseconds to wait for Discovery v4 replies during startup.
+    #[arg(long, default_value = "1500")]
+    discovery_timeout_ms: u64,
+
+    /// Seconds between background Discovery v4 refreshes while BFT is
+    /// running. Set to 0 to keep only the startup discovery pass.
+    #[arg(long, default_value = "60")]
+    discovery_refresh_secs: u64,
 
     /// Consensus algorithm to run for the main chain. `bft` (default)
     /// uses VRF-PoS + BLS finality; `poa` uses a fixed authority list
@@ -206,6 +252,26 @@ struct Cli {
     /// operator a chance to intervene on a real crash-loop.
     #[arg(long, default_value = "3")]
     restart_max_per_window: u32,
+
+    /// Maintenance command. When present, aiid performs the command and exits.
+    #[command(subcommand)]
+    command: Option<MaintenanceCmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintenanceCmd {
+    /// Persist a keyed DPoS active validator set into this node's RocksDB.
+    ///
+    /// Each --validator value is:
+    /// address,stake_wei,bls_pubkey,vrf_pubkey
+    DposSet {
+        /// Epoch number for the persisted validator set record.
+        #[arg(long)]
+        epoch: u64,
+        /// Validator tuple: address,stake_wei,bls_pubkey,vrf_pubkey.
+        #[arg(long = "validator")]
+        validators: Vec<String>,
+    },
 }
 
 /// Resolve the effective bootnode URL for cold-sync and follow-loop
@@ -240,6 +306,68 @@ fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + 
                 format!("coinbase: expected 20 bytes, got {}", v.len()).into()
             })?;
     Ok(Address::new(arr))
+}
+
+fn parse_fixed_hex<const N: usize>(
+    s: &str,
+    field: &str,
+) -> Result<[u8; N], Box<dyn std::error::Error + Send + Sync>> {
+    let raw = hex::decode(s.trim_start_matches("0x")).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("{field}: bad hex: {e}").into() },
+    )?;
+    raw.try_into()
+        .map_err(|v: Vec<u8>| format!("{field}: expected {N} bytes, got {}", v.len()).into())
+}
+
+fn parse_u256(s: &str) -> Result<U256, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        U256::from_str_radix(hex, 16)
+    } else {
+        U256::from_str_radix(s, 10)
+    }
+    .map_err(|e| format!("stake_wei: invalid integer: {e}").into())
+}
+
+fn parse_validator_entry(
+    input: &str,
+) -> Result<aii_node::ValidatorEntry, Box<dyn std::error::Error + Send + Sync>> {
+    let parts: Vec<&str> = input.split(',').collect();
+    if parts.len() != 4 {
+        return Err("validator must be address,stake_wei,bls_pubkey,vrf_pubkey".into());
+    }
+    Ok(aii_node::ValidatorEntry {
+        address: parse_address(parts[0])?,
+        stake_wei: parse_u256(parts[1])?,
+        bls_pubkey: Some(BlsPubKey::new(parse_fixed_hex::<48>(
+            parts[2],
+            "bls_pubkey",
+        )?)),
+        vrf_pubkey: Some(VrfPubKey::new(parse_fixed_hex::<32>(
+            parts[3],
+            "vrf_pubkey",
+        )?)),
+    })
+}
+
+fn persist_dpos_set_command(
+    backend: &Arc<RocksDbBackend>,
+    epoch: u64,
+    validators: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if validators.is_empty() {
+        return Err("at least one --validator is required".into());
+    }
+    let entries = validators
+        .iter()
+        .map(|v| parse_validator_entry(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bft_set = aii_node::bft_validator_set_from_entries(&entries)?;
+    aii_node::dpos::persist_validator_set(backend, epoch, &entries)?;
+    println!(
+        "persisted DPoS validator set epoch={epoch} validators={}",
+        bft_set.size()
+    );
+    Ok(())
 }
 
 /// Materialise every [`aii_config::GenesisAlloc`] entry from `genesis`
@@ -337,6 +465,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     std::fs::create_dir_all(&cli.data_dir)?;
     let backend: Arc<RocksDbBackend> = Arc::new(RocksDbBackend::open(&cli.data_dir)?);
+    if let Some(command) = &cli.command {
+        match command {
+            MaintenanceCmd::DposSet { epoch, validators } => {
+                persist_dpos_set_command(&backend, *epoch, validators)?;
+            }
+        }
+        return Ok(());
+    }
 
     // If the data dir already has a head marker, replay the indexed
     // chain off disk; otherwise stand up a fresh in-memory cache on
@@ -459,53 +595,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bft_bootstrap::boot_bft_engine(genesis_path, keystore_path, coinbase)?
         };
         apply_genesis_alloc(&node_state, &genesis)?;
+        match aii_node::rotate_bft_engine_to_latest_dpos(&engine, &node_state) {
+            Ok(aii_node::BftDposRotation::NoActiveSet) => {}
+            Ok(aii_node::BftDposRotation::LocalKeyMissing { epoch, validators }) => {
+                tracing::warn!(
+                    epoch,
+                    validators,
+                    "latest DPoS validator set does not include local BLS key; using genesis BFT set",
+                );
+            }
+            Ok(aii_node::BftDposRotation::Rotated {
+                epoch,
+                validators,
+                my_index,
+            }) => {
+                tracing::info!(
+                    epoch,
+                    validators,
+                    my_index,
+                    "BFT engine aligned to latest DPoS validator set at startup",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "startup DPoS-to-BFT validator-set alignment failed; using genesis BFT set",
+                );
+            }
+        }
         let engine = Arc::new(engine);
         let is_single = engine.is_single_validator();
         tracing::info!(
             single_validator = is_single,
-            validators = genesis.validators.len(),
+            validators = engine.validator_set_size(),
             coinbase = ?coinbase,
             recovered_head = recovered_head_number,
             "BftEngine ready"
         );
         let state_for_loop = node_state.clone();
-        let interval = Duration::from_secs(cli.slot_seconds);
-        if is_single {
-            let engine_for_loop = engine.clone();
-            let state_for_pool = node_state.clone();
-            let max_txs_per_block =
-                (spec.initial_gas_limit / aii_consensus_bft::PLACEHOLDER_TX_GAS) as usize;
-            Some(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    // Pull a batch of txs from the mempool, stage them on
-                    // the engine for inclusion in the next block.
-                    let txs = state_for_pool.tx_pool().drain_up_to(max_txs_per_block);
-                    let tx_count = txs.len();
-                    engine_for_loop.set_pending_txs(txs);
-                    match engine_for_loop.advance_single() {
-                        Ok(out) => {
-                            state_for_loop.commit_block(&out.block);
-                            state_for_loop.set_head(out.block.header.number);
-                            tracing::info!(
-                                number = out.block.header.number,
-                                hash = ?out.block_hash,
-                                round = out.certificate.round,
-                                txs = tx_count,
-                                gas_used = out.block.header.gas_used,
-                                "BFT block finalised"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(?e, "BFT advance failed");
-                            break;
-                        }
-                    }
-                }
-            }))
-        } else {
-            // Multi-validator: stand up the TCP gossip transport,
-            // then loop driving the gossip + harvest pair.
+        {
+            // Stand up the TCP gossip transport for every BFT node,
+            // including a one-validator bootstrap chain. That keeps
+            // discovery, peer cache, and dynamic `add_peer` active
+            // before DPoS expands the validator set; once the set
+            // rotates above one validator the same loop continues in
+            // networked BFT instead of requiring a restart.
             //
             // v0.0.69: merge the persistent peer cache with `--peers`
             // so a restart re-dials previously-known validators
@@ -514,7 +648,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // (best-effort; not on the critical path).
             let cache_path = aii_node::peer_cache::cache_path(&cli.data_dir);
             let cached_peers = aii_node::peer_cache::load(&cache_path).unwrap_or_default();
-            let merged_peers = aii_node::peer_cache::merge(&cached_peers, &cli.peers);
+            let mut configured_peers = cli.peers.clone();
+            let discovery_seed_specs = if cli.no_discovery {
+                Vec::new()
+            } else {
+                let env_seeds =
+                    std::env::var(aii_node::discovery_bootstrap::DISCOVERY_SEEDS_ENV).ok();
+                aii_node::discovery_bootstrap::seed_specs(
+                    &cli.discovery_seeds,
+                    env_seeds.as_deref(),
+                    aii_node::discovery_bootstrap::default_seed_specs(cli.testnet),
+                )
+            };
+            let discovery_seeds =
+                aii_node::discovery_bootstrap::resolve_seed_specs(&discovery_seed_specs);
+            if !discovery_seed_specs.is_empty() && discovery_seeds.is_empty() {
+                tracing::warn!(
+                    seeds = ?discovery_seed_specs,
+                    "all discovery seed specs failed to resolve"
+                );
+            }
+            let discovery_key = if cli.no_discovery {
+                None
+            } else {
+                let key_path = aii_node::discovery_bootstrap::key_path(&cli.data_dir);
+                match aii_node::discovery_bootstrap::load_or_create_key(&key_path) {
+                    Ok(discovery_key) => Some(discovery_key),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %key_path.display(),
+                            "discovery key load/create failed"
+                        );
+                        None
+                    }
+                }
+            };
+            let mut discovery_advertise = aii_node::discovery_bootstrap::DiscoveryAdvertisement {
+                discovery: cli.discovery_advertise,
+                bft: cli.bft_advertise,
+            };
+            let discovery_query_listen = SocketAddr::new(cli.discovery_listen.ip(), 0);
+            let mut discovery_query_peers = discovery_seeds.clone();
+            if let Some(discovery_key) = discovery_key.as_ref() {
+                let known = aii_node::peer_cache::merge(&cached_peers, &configured_peers);
+                match aii_node::discovery_bootstrap::discover_once_full(
+                    discovery_query_listen,
+                    discovery_key.clone(),
+                    &discovery_query_peers,
+                    cli.bft_listen,
+                    discovery_advertise,
+                    &known,
+                    Duration::from_millis(cli.discovery_timeout_ms),
+                )
+                .await
+                {
+                    Ok(discovered) => {
+                        let next_advertise =
+                            aii_node::discovery_bootstrap::advertisement_with_observed_endpoint(
+                                discovery_advertise,
+                                cli.bft_listen,
+                                discovered.observed_discovery,
+                                !cli.bft_outbound_only,
+                            );
+                        if next_advertise != discovery_advertise {
+                            tracing::info!(
+                                observed_discovery = ?discovered.observed_discovery,
+                                advertise = ?next_advertise,
+                                "discovery bootstrap inferred public advertisement from seed observation",
+                            );
+                            discovery_advertise = next_advertise;
+                        }
+                        if !discovered.discovery_peers.is_empty() {
+                            discovery_query_peers = aii_node::peer_cache::merge(
+                                &discovery_query_peers,
+                                &discovered.discovery_peers,
+                            );
+                        }
+                        if !discovered.bft_peers.is_empty() {
+                            tracing::info!(
+                                discovered = discovered.bft_peers.len(),
+                                discovery_targets = discovery_query_peers.len(),
+                                "discovery bootstrap found BFT peers",
+                            );
+                            configured_peers = aii_node::peer_cache::merge(
+                                &configured_peers,
+                                &discovered.bft_peers,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "discovery bootstrap failed");
+                    }
+                }
+            }
+            if !cli.no_discovery {
+                if let Some(boot_url) = effective_bootnode.as_deref() {
+                    match aii_node::fetch_bft_peers_from_peer(boot_url).await {
+                        Ok(rpc_peers) if !rpc_peers.is_empty() => {
+                            tracing::info!(
+                                discovered = rpc_peers.len(),
+                                bootnode = %boot_url,
+                                "HTTP bootnode peer fallback found BFT peers",
+                            );
+                            configured_peers =
+                                aii_node::peer_cache::merge(&configured_peers, &rpc_peers);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                bootnode = %boot_url,
+                                "HTTP bootnode peer fallback unavailable"
+                            );
+                        }
+                    }
+                }
+            }
+            let merged_peers = aii_node::peer_cache::merge(&cached_peers, &configured_peers);
+            node_state.set_bft_peers(&merged_peers);
             if !cached_peers.is_empty() {
                 tracing::info!(
                     cached = cached_peers.len(),
@@ -530,6 +782,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Err(e) = aii_node::peer_cache::save(&cache_path, &merged_peers) {
                 tracing::warn!(?e, path = %cache_path.display(), "peer cache save failed");
             }
+            let discovery_peer_view = aii_node::discovery_bootstrap::shared_peers(&merged_peers);
+            let _discovery_responder = if let Some(discovery_key) = discovery_key.as_ref() {
+                match aii_node::discovery_bootstrap::spawn_responder(
+                    cli.discovery_listen,
+                    discovery_key.clone(),
+                    cli.bft_listen,
+                    discovery_advertise,
+                    discovery_peer_view.clone(),
+                )
+                .await
+                {
+                    Ok((addr, handle)) => {
+                        let advertised_endpoint =
+                            aii_node::discovery_bootstrap::advertised_endpoint(
+                                addr,
+                                cli.bft_listen,
+                                discovery_advertise,
+                            );
+                        tracing::info!(
+                            listen = %addr,
+                            advertised_ip = %advertised_endpoint.ip,
+                            advertised_discovery_port = advertised_endpoint.udp_port,
+                            advertised_bft_port = advertised_endpoint.tcp_port,
+                            "Discovery v4 responder listening",
+                        );
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Discovery v4 responder failed to start");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let transport = Arc::new(match (cli.bft_outbound_only, cli.encrypt_gossip) {
                 (true, true) => {
                     TcpBftTransport::new_outbound_only_encrypted(merged_peers.clone()).await?
@@ -548,6 +835,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 outbound_only = cli.bft_outbound_only,
                 "BFT gossip transport listening"
             );
+            let transport_for_loop = transport.clone();
             // v0.0.71: restore in-flight BFT round state. If the
             // local node previously persisted a `(height, round)`
             // snapshot AND that snapshot is for the height we're
@@ -577,12 +865,139 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             let gossip = Arc::new(BftGossip::new(engine.clone(), transport));
             let engine_for_loop = engine.clone();
+            let local_bls_pubkey = engine.my_bls_pubkey();
             let state_for_pool = node_state.clone();
             let max_txs_per_block =
                 (spec.initial_gas_limit / aii_consensus_bft::PLACEHOLDER_TX_GAS) as usize;
+            let round_timeout = Duration::from_secs(cli.slot_seconds.max(1));
+            let slash_amount_wei = U256::from((spec.min_validator_stake_wei / 100).max(1));
             // Round-state persistence cadence — only write when the
             // tracked tuple actually changes.
             let bft_state_path_for_loop = bft_state_path;
+            let cache_path_for_loop = cache_path.clone();
+            let known_bft_peers = merged_peers.clone();
+            let discovery_key_for_loop = discovery_key.clone();
+            let known_discovery_peers = discovery_query_peers.clone();
+            let discovery_query_listen_for_loop = discovery_query_listen;
+            let discovery_advertise_for_loop = discovery_advertise;
+            let discovery_peer_view_for_loop = discovery_peer_view.clone();
+            let state_for_peer_rpc = node_state.clone();
+            let advertised_bft_listen = cli.bft_listen;
+            let advertise_bft_in_refresh = !cli.bft_outbound_only;
+            let discovery_timeout = Duration::from_millis(cli.discovery_timeout_ms);
+            let discovery_refresh = if cli.discovery_refresh_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(cli.discovery_refresh_secs))
+            };
+            // v0.0.92: Discovery v4 refresh runs in its OWN task — never
+            // inline in the consensus producer loop. The prior design
+            // awaited `discover_once_full` (bounded by --discovery-
+            // timeout-ms) directly inside the loop, so every
+            // --discovery-refresh-secs the BFT engine stopped ticking
+            // for the whole discovery window. A local 2-validator A/B
+            // repro proved it: control (--no-discovery) never stalled
+            // (max 0s zero-advance); treatment (discovery on, 6s
+            // timeout / 8s refresh) froze ~3-4s every ~7s. Decoupling
+            // keeps gossip.tick() hot; discovered peers still flow back
+            // via transport.add_peer + the shared peer view + the
+            // on-disk cache exactly as before.
+            let _discovery_refresh_handle = tokio::spawn(async move {
+                let (Some(discovery_key), Some(refresh)) =
+                    (discovery_key_for_loop, discovery_refresh)
+                else {
+                    return;
+                };
+                let transport_for_disc = transport_for_loop;
+                let discovery_peer_view_for_disc = discovery_peer_view_for_loop;
+                let cache_path_for_disc = cache_path_for_loop;
+                let mut known_discovery_peers = known_discovery_peers;
+                let mut known_bft_peers = known_bft_peers;
+                let mut discovery_advertise = discovery_advertise_for_loop;
+                let mut ticker = tokio::time::interval(refresh);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await; // first tick fires immediately — skip it
+                loop {
+                    ticker.tick().await;
+                    match aii_node::discovery_bootstrap::discover_once_full(
+                        discovery_query_listen_for_loop,
+                        discovery_key.clone(),
+                        &known_discovery_peers,
+                        advertised_bft_listen,
+                        discovery_advertise,
+                        &known_bft_peers,
+                        discovery_timeout,
+                    )
+                    .await
+                    {
+                        Ok(discovered) => {
+                            let next_advertise =
+                                aii_node::discovery_bootstrap::advertisement_with_observed_endpoint(
+                                    discovery_advertise,
+                                    advertised_bft_listen,
+                                    discovered.observed_discovery,
+                                    advertise_bft_in_refresh,
+                                );
+                            if next_advertise != discovery_advertise {
+                                tracing::info!(
+                                    observed_discovery = ?discovered.observed_discovery,
+                                    advertise = ?next_advertise,
+                                    "discovery refresh updated inferred public advertisement",
+                                );
+                                discovery_advertise = next_advertise;
+                            }
+                            let mut added = 0usize;
+                            for peer in &discovered.bft_peers {
+                                if transport_for_disc.add_peer(*peer) {
+                                    added += 1;
+                                }
+                            }
+                            if !discovered.discovery_peers.is_empty() {
+                                known_discovery_peers = aii_node::peer_cache::merge(
+                                    &known_discovery_peers,
+                                    &discovered.discovery_peers,
+                                );
+                            }
+                            if !discovered.bft_peers.is_empty() {
+                                known_bft_peers = aii_node::peer_cache::merge(
+                                    &known_bft_peers,
+                                    &discovered.bft_peers,
+                                );
+                                aii_node::discovery_bootstrap::set_shared_peers(
+                                    &discovery_peer_view_for_disc,
+                                    &known_bft_peers,
+                                );
+                                state_for_peer_rpc.set_bft_peers(&known_bft_peers);
+                                if let Err(e) = aii_node::peer_cache::save(
+                                    &cache_path_for_disc,
+                                    &known_bft_peers,
+                                ) {
+                                    tracing::warn!(
+                                        ?e,
+                                        path = %cache_path_for_disc.display(),
+                                        "peer cache save failed after discovery refresh"
+                                    );
+                                }
+                                tracing::info!(
+                                    discovered = discovered.bft_peers.len(),
+                                    added,
+                                    total = known_bft_peers.len(),
+                                    discovery_targets = known_discovery_peers.len(),
+                                    "discovery refresh updated BFT peer set",
+                                );
+                            } else if !discovered.discovery_peers.is_empty() {
+                                tracing::info!(
+                                    discovery_targets = known_discovery_peers.len(),
+                                    "discovery refresh learned additional discovery peers",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "discovery refresh failed");
+                        }
+                    }
+                }
+            });
             let last_persisted_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let last_persisted_round = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
             // Drain the mempool into the engine's pending-txs queue
@@ -593,6 +1008,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // accumulated and gossips the body to peers (since
             // v0.0.39).
             Some(tokio::spawn(async move {
+                let mut last_rotation_checked_epoch: Option<u64> = None;
+                let mut timeout_key: Option<(u64, u32)> = None;
+                let mut timeout_deadline = tokio::time::Instant::now() + round_timeout;
                 loop {
                     gossip.tick();
                     let txs = state_for_pool.tx_pool().drain_up_to(max_txs_per_block);
@@ -601,18 +1019,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         engine_for_loop.extend_pending_txs(txs);
                     }
                     // Drain any equivocation evidence the BFT detector
-                    // surfaced from peer votes and auto-persist via
-                    // `record_slashing`. Stake debit needs a
-                    // validator-index → stake-address map (not yet
-                    // in `GenesisValidator`); auto-debit lands once
-                    // DPoS rotation publishes that mapping per epoch.
+                    // surfaced from peer votes, persist it, and debit
+                    // the latest DPoS stake record that corresponds to
+                    // the offending validator index.
                     for ev in engine_for_loop.drain_evidence() {
                         state_for_loop.record_slashing(&ev);
-                        tracing::warn!(
-                            validator = ev.validator_index(),
-                            height = ev.height(),
-                            "equivocation evidence persisted via auto-trigger",
-                        );
+                        let offender =
+                            state_for_loop.latest_validator_address_by_index(ev.validator_index());
+                        if let Some((epoch, offender)) = offender {
+                            state_for_loop.debit_slash_stake(&offender, slash_amount_wei);
+                            tracing::warn!(
+                                validator = ev.validator_index(),
+                                offender = ?offender,
+                                epoch,
+                                slash_amount_wei = ?slash_amount_wei,
+                                height = ev.height(),
+                                "equivocation evidence persisted and stake debited",
+                            );
+                        } else {
+                            tracing::warn!(
+                                validator = ev.validator_index(),
+                                height = ev.height(),
+                                "equivocation evidence persisted without stake mapping",
+                            );
+                        }
                     }
                     // v0.0.73: gossip auto-harvests committed blocks
                     // between inbox messages so the engine head stays
@@ -639,6 +1069,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             gas_used,
                             "BFT block finalised (multi)",
                         );
+                        let latest_set = {
+                            let backend = state_for_loop.backend();
+                            aii_node::latest_validator_set(&backend).ok().flatten()
+                        };
+                        if let Some((epoch, entries)) = latest_set {
+                            if last_rotation_checked_epoch != Some(epoch) {
+                                last_rotation_checked_epoch = Some(epoch);
+                                if let Some(my_index) =
+                                    aii_node::bft_my_index_from_entries(&entries, &local_bls_pubkey)
+                                {
+                                    match aii_node::bft_validator_set_from_entries(&entries)
+                                        .and_then(|set| {
+                                            engine_for_loop.rotate_validator_set(set, my_index)
+                                        }) {
+                                        Ok(()) => tracing::info!(
+                                            epoch,
+                                            validators = engine_for_loop.validator_set_size(),
+                                            my_index,
+                                            "BFT validator set rotated from DPoS epoch record",
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            epoch,
+                                            error = %e,
+                                            "BFT validator set rotation failed",
+                                        ),
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        epoch,
+                                        validators = entries.len(),
+                                        "local validator key not present in DPoS epoch set",
+                                    );
+                                }
+                            }
+                        }
                         // v0.0.71: on every committed block reset the
                         // round snapshot to "(N+1, 0)" — the next
                         // coordinator will be created at round 0 of
@@ -648,6 +1113,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let snap = aii_node::bft_state::BftStateSnapshot::new(n + 1, 0);
                         if let Err(e) = aii_node::bft_state::save(&bft_state_path_for_loop, snap) {
                             tracing::warn!(?e, "bft_state.json save (post-commit) failed");
+                        }
+                    }
+                    let current_timeout_key =
+                        engine_for_loop.current_round_state().map_or_else(
+                            || {
+                                let (_, head_number) = engine_for_loop.head();
+                                (head_number.saturating_add(1), 0)
+                            },
+                            |(height, round, _phase)| (height, round),
+                        );
+                    if timeout_key != Some(current_timeout_key) {
+                        timeout_key = Some(current_timeout_key);
+                        timeout_deadline = tokio::time::Instant::now() + round_timeout;
+                    } else if tokio::time::Instant::now() >= timeout_deadline {
+                        match engine_for_loop.tick_timeout() {
+                            Ok(()) => {
+                                let after = engine_for_loop.current_round_state();
+                                tracing::warn!(
+                                    before_height = current_timeout_key.0,
+                                    before_round = current_timeout_key.1,
+                                    after = ?after,
+                                    timeout_ms = round_timeout.as_millis(),
+                                    "BFT round timeout fired"
+                                );
+                                timeout_key = after.map(|(height, round, _phase)| (height, round));
+                                timeout_deadline = tokio::time::Instant::now() + round_timeout;
+                                gossip.tick();
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "BFT round timeout failed");
+                                timeout_deadline = tokio::time::Instant::now() + round_timeout;
+                            }
                         }
                     }
                     // v0.0.71: persist the active round whenever it
@@ -766,7 +1263,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             loop {
                 tokio::time::sleep(interval).await;
                 match engine.produce_block() {
-                    Ok((hash, number, _block)) => {
+                    Ok((hash, number, block)) => {
+                        state_for_loop.commit_block(&block);
                         state_for_loop.set_head(number);
                         tracing::info!(number, ?hash, "block produced");
                     }

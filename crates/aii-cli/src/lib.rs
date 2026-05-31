@@ -544,6 +544,891 @@ fn compute_legacy_eip155_hash(t: &aii_block::tx::TxLegacy, chain_id: u64) -> aii
     aii_types::H256::new(keccak256(&buf).0)
 }
 
+// ──────────────────────── Local transfer load (test only) ──────────────────
+
+/// Per-account balance report from [`run_local_transfer_load`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalTransferAccountReport {
+    /// Stable test-account index.
+    pub index: usize,
+    /// ETH-compatible account address (`0x...`).
+    pub address: String,
+    /// Starting balance in Wei, decimal encoded.
+    pub initial_balance_wei: String,
+    /// Ending balance in Wei, decimal encoded.
+    pub final_balance_wei: String,
+    /// Account nonce after the test run.
+    pub nonce: u64,
+}
+
+/// Summary from `aii local-transfer-load`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalTransferLoadReport {
+    /// Chain id used in EIP-155 signing.
+    pub chain_id: u64,
+    /// Test account reports.
+    pub accounts: Vec<LocalTransferAccountReport>,
+    /// Requested transaction count.
+    pub total_requested: u64,
+    /// Transactions successfully executed against local state.
+    pub executed: u64,
+    /// Transactions that failed signing, recovery, or execution.
+    pub failed: u64,
+    /// Synthetic block count, calculated from `txs_per_block`.
+    pub simulated_blocks: u64,
+    /// Synthetic transaction capacity per simulated block.
+    pub txs_per_block: u64,
+    /// Minimum transfer amount in AII as supplied by the caller.
+    pub min_value_aii: String,
+    /// Maximum transfer amount in AII as supplied by the caller.
+    pub max_value_aii: String,
+    /// Minimum transfer amount in Wei, decimal encoded.
+    pub min_value_wei: String,
+    /// Maximum transfer amount in Wei, decimal encoded.
+    pub max_value_wei: String,
+    /// Sum of all successfully executed transfer values in Wei.
+    pub total_value_wei: String,
+    /// Sum of gas used by successful transfers.
+    pub total_gas_used: u64,
+    /// Gas price used in the signed test transactions.
+    pub gas_price_wei: String,
+    /// Wall-clock execution time in milliseconds.
+    pub elapsed_ms: u128,
+}
+
+/// Per-account report from [`run_live_transfer_load`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveTransferAccountReport {
+    /// Stable account index from the supplied key-file order.
+    pub index: usize,
+    /// ETH-compatible account address (`0x...`).
+    pub address: String,
+    /// Nonce read before submission.
+    pub initial_nonce: u64,
+    /// Balance read before submission, in Wei.
+    pub initial_balance_wei: String,
+    /// Balance read after the optional settle wait, in Wei.
+    pub final_balance_wei: String,
+    /// How many transactions this account signed.
+    pub signed_txs: u64,
+    /// Maximum pre-funded outgoing value required for this account.
+    pub planned_outgoing_value_wei: String,
+    /// Planned gas budget for this account.
+    pub planned_gas_budget_wei: String,
+}
+
+/// Summary from a real-chain transfer load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveTransferLoadReport {
+    /// JSON-RPC endpoint used.
+    pub rpc: String,
+    /// Chain id used in EIP-155 signing.
+    pub chain_id: u64,
+    /// Test account reports.
+    pub accounts: Vec<LiveTransferAccountReport>,
+    /// Requested transaction count.
+    pub total_requested: u64,
+    /// Transactions submitted to RPC.
+    pub submitted: u64,
+    /// Transactions accepted by RPC.
+    pub accepted: u64,
+    /// Transactions rejected by RPC.
+    pub rejected: u64,
+    /// Synthetic block count, calculated from `txs_per_block`.
+    pub simulated_blocks: u64,
+    /// Synthetic transaction capacity per simulated block.
+    pub txs_per_block: u64,
+    /// Minimum transfer amount in AII as supplied by the caller.
+    pub min_value_aii: String,
+    /// Maximum transfer amount in AII as supplied by the caller.
+    pub max_value_aii: String,
+    /// Minimum transfer amount in Wei.
+    pub min_value_wei: String,
+    /// Maximum transfer amount in Wei.
+    pub max_value_wei: String,
+    /// Sum of all submitted transfer values in Wei.
+    pub total_value_wei: String,
+    /// Gas price used in signed transactions.
+    pub gas_price_wei: String,
+    /// Seconds waited before reading final balances.
+    pub settle_sec: u64,
+    /// Accepted transaction hashes.
+    pub tx_hashes: Vec<String>,
+    /// Rejection summaries. Secrets are never included.
+    pub errors: Vec<String>,
+    /// Wall-clock execution time in milliseconds.
+    pub elapsed_ms: u128,
+}
+
+/// One recipient funded by [`run_fund_addresses`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FundRecipientReport {
+    /// Recipient index in command-line order.
+    pub index: usize,
+    /// Recipient address.
+    pub address: String,
+    /// Funded amount in Wei.
+    pub amount_wei: String,
+    /// Transaction hash if accepted by RPC.
+    pub tx_hash: Option<String>,
+    /// Error if rejected by RPC.
+    pub error: Option<String>,
+}
+
+/// Summary from `aii fund-addresses`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FundAddressesReport {
+    /// JSON-RPC endpoint used.
+    pub rpc: String,
+    /// Chain id used in EIP-155 signing.
+    pub chain_id: u64,
+    /// Funding account address.
+    pub from_address: String,
+    /// Funding account nonce before submission.
+    pub initial_nonce: u64,
+    /// Funding account balance before submission, in Wei.
+    pub initial_balance_wei: String,
+    /// Funding account balance after settle, in Wei.
+    pub final_balance_wei: String,
+    /// Amount sent to each recipient, in AII text form.
+    pub amount_aii: String,
+    /// Amount sent to each recipient, in Wei.
+    pub amount_wei: String,
+    /// Gas price used.
+    pub gas_price_wei: String,
+    /// Number of submitted funding txs.
+    pub submitted: u64,
+    /// Number of accepted funding txs.
+    pub accepted: u64,
+    /// Number of rejected funding txs.
+    pub rejected: u64,
+    /// Per-recipient result.
+    pub recipients: Vec<FundRecipientReport>,
+    /// Seconds waited before reading final balance.
+    pub settle_sec: u64,
+    /// Wall-clock execution time in milliseconds.
+    pub elapsed_ms: u128,
+}
+
+/// One account credited by [`run_state_credit`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateCreditAccountReport {
+    /// Recipient index in command-line order.
+    pub index: usize,
+    /// Recipient address.
+    pub address: String,
+    /// Balance before credit, in Wei.
+    pub before_balance_wei: String,
+    /// Balance after credit, in Wei.
+    pub after_balance_wei: String,
+    /// Account nonce preserved by the credit operation.
+    pub nonce: u64,
+}
+
+/// Summary from `aii state-credit`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateCreditReport {
+    /// RocksDB data directory opened.
+    pub data_dir: String,
+    /// Amount credited to each address, in AII text form.
+    pub amount_aii: String,
+    /// Amount credited to each address, in Wei.
+    pub amount_wei: String,
+    /// Per-account result.
+    pub accounts: Vec<StateCreditAccountReport>,
+}
+
+const WEI_PER_AII: u128 = 1_000_000_000_000_000_000;
+
+fn parse_aii_decimal_to_wei(input: &str) -> Result<u128, CliError> {
+    let s = input.trim();
+    if s.is_empty() || s.starts_with('-') || s.starts_with('+') {
+        return Err(CliError::Client(format!("bad AII amount: {input}")));
+    }
+    let mut parts = s.split('.');
+    let whole = parts
+        .next()
+        .ok_or_else(|| CliError::Client(format!("bad AII amount: {input}")))?;
+    let frac = parts.next();
+    if parts.next().is_some() || whole.is_empty() {
+        return Err(CliError::Client(format!("bad AII amount: {input}")));
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(CliError::Client(format!("bad AII amount: {input}")));
+    }
+    let whole_wei = whole
+        .parse::<u128>()
+        .map_err(|e| CliError::Client(format!("bad AII amount: {e}")))?
+        .checked_mul(WEI_PER_AII)
+        .ok_or_else(|| CliError::Client("AII amount overflows u128".into()))?;
+    let frac_wei = if let Some(frac) = frac {
+        if frac.len() > 18 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(CliError::Client(format!("bad AII amount: {input}")));
+        }
+        let mut padded = frac.to_string();
+        while padded.len() < 18 {
+            padded.push('0');
+        }
+        padded
+            .parse::<u128>()
+            .map_err(|e| CliError::Client(format!("bad AII amount: {e}")))?
+    } else {
+        0
+    };
+    whole_wei
+        .checked_add(frac_wei)
+        .ok_or_else(|| CliError::Client("AII amount overflows u128".into()))
+}
+
+fn local_transfer_secret_key(index: usize) -> Result<aii_crypto::secp::SecretKey, CliError> {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(b"AII-LOAD");
+    bytes[24..].copy_from_slice(
+        &u64::try_from(index + 1)
+            .map_err(|_| CliError::Client("test account index overflow".into()))?
+            .to_be_bytes(),
+    );
+    aii_crypto::secp::SecretKey::from_bytes(&bytes)
+        .map_err(|e| CliError::Client(format!("test secret key: {e}")))
+}
+
+fn sign_legacy_transfer(
+    sk: &aii_crypto::secp::SecretKey,
+    chain_id: u64,
+    nonce: u64,
+    to: aii_types::Address,
+    value: aii_types::U256,
+    gas_price: aii_types::U256,
+) -> Result<aii_block::tx::Tx, CliError> {
+    use aii_block::tx::{Tx, TxLegacy};
+    use aii_crypto::secp::sign;
+    use aii_types::{AlgoId, H256};
+
+    let mut tx = TxLegacy {
+        nonce,
+        gas_price,
+        gas_limit: 21_000,
+        to: Some(to),
+        value,
+        data: vec![],
+        v: 0,
+        r: H256::ZERO,
+        s: H256::ZERO,
+        algo_id: AlgoId::Secp256k1,
+    };
+    let hash = compute_legacy_eip155_hash(&tx, chain_id);
+    let sig = sign(sk, &hash).map_err(|e| CliError::Client(e.to_string()))?;
+    let raw = sig.to_bytes();
+    tx.r = H256::new(raw[..32].try_into().unwrap());
+    tx.s = H256::new(raw[32..64].try_into().unwrap());
+    tx.v = chain_id
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(35))
+        .and_then(|v| v.checked_add(u64::from(raw[64])))
+        .ok_or_else(|| CliError::Client("chain_id too large for EIP-155 v".into()))?;
+    Ok(Tx::Legacy(tx))
+}
+
+fn read_secp_secret_file(path: &std::path::Path) -> Result<aii_crypto::secp::SecretKey, CliError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Client(format!("{}: {e}", path.display())))?;
+    let s = raw.trim().strip_prefix("0x").unwrap_or_else(|| raw.trim());
+    let bytes = hex::decode(s)
+        .map_err(|e| CliError::Client(format!("{}: bad hex: {e}", path.display())))?;
+    if bytes.len() != 32 {
+        return Err(CliError::Client(format!(
+            "{}: expected 32-byte secp256k1 private key, got {} bytes",
+            path.display(),
+            bytes.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    aii_crypto::secp::SecretKey::from_bytes(&arr)
+        .map_err(|e| CliError::Client(format!("{}: {e}", path.display())))
+}
+
+/// Derive the public address from a 32-byte secp256k1 private-key hex file.
+///
+/// This is useful for test funding flows where key material stays on disk and
+/// only the address is displayed or passed to RPC commands.
+pub fn run_account_from_key_file(path: &std::path::Path) -> Result<aii_types::Address, CliError> {
+    Ok(read_secp_secret_file(path)?.public_key().address())
+}
+
+/// Credit testnet state directly in a stopped node's RocksDB.
+///
+/// This is an operator-maintenance escape hatch for testnets where no funded
+/// EOA private key is available. Stop every validator first, apply the same
+/// credit to every validator's state DB, then restart the network.
+#[allow(clippy::missing_panics_doc)]
+pub fn run_state_credit(
+    data_dir: &std::path::Path,
+    recipients: &[aii_types::Address],
+    amount_aii: &str,
+) -> Result<StateCreditReport, CliError> {
+    use aii_state::{Account, StateDb};
+    use aii_storage::RocksDbBackend;
+    use std::sync::Arc;
+
+    if recipients.is_empty() {
+        return Err(CliError::Client(
+            "at least one recipient is required".into(),
+        ));
+    }
+    let amount_wei = parse_aii_decimal_to_wei(amount_aii)?;
+    if amount_wei == 0 {
+        return Err(CliError::Client(
+            "amount_aii must be greater than zero".into(),
+        ));
+    }
+
+    let backend = Arc::new(
+        RocksDbBackend::open(data_dir)
+            .map_err(|e| CliError::Client(format!("open state db: {e}")))?,
+    );
+    let state = StateDb::new(backend);
+    let amount = aii_types::U256::from(amount_wei);
+    let mut reports = Vec::with_capacity(recipients.len());
+    for (index, address) in recipients.iter().enumerate() {
+        let mut account = state
+            .account(address)
+            .map_err(|e| CliError::Client(format!("read account: {e}")))?
+            .unwrap_or(Account::EMPTY);
+        let before = account.balance;
+        account.balance = account.balance.saturating_add(amount);
+        state
+            .set_account(address, &account)
+            .map_err(|e| CliError::Client(format!("write account: {e}")))?;
+        reports.push(StateCreditAccountReport {
+            index,
+            address: format!("0x{}", hex::encode(address.as_bytes())),
+            before_balance_wei: before.to_string(),
+            after_balance_wei: account.balance.to_string(),
+            nonce: account.nonce,
+        });
+    }
+
+    Ok(StateCreditReport {
+        data_dir: data_dir.display().to_string(),
+        amount_aii: amount_aii.to_string(),
+        amount_wei: amount_wei.to_string(),
+        accounts: reports,
+    })
+}
+
+fn parse_hex_u256(s: &str) -> Result<aii_types::U256, CliError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() {
+        return Ok(aii_types::U256::ZERO);
+    }
+    let padded_hex = if s.len() % 2 == 0 {
+        s.to_string()
+    } else {
+        format!("0{s}")
+    };
+    let mut bytes =
+        hex::decode(&padded_hex).map_err(|e| CliError::Client(format!("bad hex u256: {e}")))?;
+    if bytes.len() > 32 {
+        return Err(CliError::Client("hex u256 exceeds 32 bytes".into()));
+    }
+    let mut padded = [0u8; 32];
+    let start = 32 - bytes.len();
+    padded[start..].copy_from_slice(&bytes);
+    bytes.clear();
+    Ok(aii_types::U256::from_be_bytes(padded))
+}
+
+fn planned_amount_wei(min_wei: u128, max_wei: u128, total: u64, i: u64) -> u128 {
+    if total <= 1 {
+        min_wei
+    } else {
+        min_wei + (((max_wei - min_wei) * u128::from(i)) / u128::from(total - 1))
+    }
+}
+
+/// Fund recipient addresses from one real on-chain funded private key.
+///
+/// The funding key file must contain a 32-byte secp256k1 private key as hex.
+/// Recipients are plain addresses; callers that have recipient key files can
+/// derive their addresses and pass them here. Private keys are never returned.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_fund_addresses(
+    rpc: &str,
+    chain_id: u64,
+    from_key_file: &std::path::Path,
+    recipients: &[aii_types::Address],
+    amount_aii: &str,
+    settle_sec: u64,
+) -> Result<FundAddressesReport, CliError> {
+    use aii_block::Hashable as _;
+    use alloy_rlp::Encodable as _;
+    use std::time::Instant;
+
+    if recipients.is_empty() {
+        return Err(CliError::Client(
+            "at least one recipient is required".into(),
+        ));
+    }
+    let amount_wei = parse_aii_decimal_to_wei(amount_aii)?;
+    if amount_wei == 0 {
+        return Err(CliError::Client(
+            "amount_aii must be greater than zero".into(),
+        ));
+    }
+
+    let client = client(rpc)?;
+    let sk = read_secp_secret_file(from_key_file)?;
+    let from = sk.public_key().address();
+    let from_hex = format!("0x{}", hex::encode(from.as_bytes()));
+    let account: Option<aii_rpc::AccountView> = client
+        .request("aii_getAccount", rpc_params![from_hex.clone()])
+        .await?;
+    let initial_nonce = account.as_ref().map_or(0, |a| a.nonce);
+    let initial_balance = match account {
+        Some(a) => parse_hex_u256(&a.balance)?,
+        None => aii_types::U256::ZERO,
+    };
+    let gas_price_hex: String = client.request("eth_gasPrice", rpc_params![]).await?;
+    let gas_price = parse_hex_u256(&gas_price_hex)?;
+    let tx_count = u64::try_from(recipients.len())
+        .map_err(|_| CliError::Client("too many recipients".into()))?;
+    let total_value =
+        aii_types::U256::from(amount_wei).saturating_mul(aii_types::U256::from(tx_count));
+    let gas_budget = gas_price
+        .saturating_mul(aii_types::U256::from(21_000u64))
+        .saturating_mul(aii_types::U256::from(tx_count));
+    let required = total_value.saturating_add(gas_budget);
+    if initial_balance < required {
+        return Err(CliError::Client(format!(
+            "funding account has insufficient balance: have {initial_balance} wei, need at least {required} wei"
+        )));
+    }
+
+    let start = Instant::now();
+    let mut accepted = 0u64;
+    let mut rejected = 0u64;
+    let mut reports = Vec::with_capacity(recipients.len());
+    for (index, recipient) in recipients.iter().enumerate() {
+        let tx = sign_legacy_transfer(
+            &sk,
+            chain_id,
+            initial_nonce + u64::try_from(index).expect("recipient index fits u64"),
+            *recipient,
+            aii_types::U256::from(amount_wei),
+            gas_price,
+        )?;
+        let tx_hash = tx.hash();
+        let mut out = alloy_rlp::bytes::BytesMut::new();
+        tx.encode(&mut out);
+        let raw_hex = format!("0x{}", hex::encode(out));
+        match client
+            .request::<String, _>("eth_sendRawTransaction", rpc_params![raw_hex])
+            .await
+        {
+            Ok(hash) => {
+                accepted = accepted.saturating_add(1);
+                reports.push(FundRecipientReport {
+                    index,
+                    address: format!("0x{}", hex::encode(recipient.as_bytes())),
+                    amount_wei: amount_wei.to_string(),
+                    tx_hash: Some(hash),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                rejected = rejected.saturating_add(1);
+                reports.push(FundRecipientReport {
+                    index,
+                    address: format!("0x{}", hex::encode(recipient.as_bytes())),
+                    amount_wei: amount_wei.to_string(),
+                    tx_hash: None,
+                    error: Some(format!("hash=0x{}: {e}", hex::encode(tx_hash.as_bytes()))),
+                });
+            }
+        }
+    }
+
+    if settle_sec > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(settle_sec)).await;
+    }
+    let account: Option<aii_rpc::AccountView> = client
+        .request("aii_getAccount", rpc_params![from_hex.clone()])
+        .await?;
+    let final_balance = match account {
+        Some(a) => parse_hex_u256(&a.balance)?,
+        None => aii_types::U256::ZERO,
+    };
+
+    Ok(FundAddressesReport {
+        rpc: rpc.to_string(),
+        chain_id,
+        from_address: from_hex,
+        initial_nonce,
+        initial_balance_wei: initial_balance.to_string(),
+        final_balance_wei: final_balance.to_string(),
+        amount_aii: amount_aii.to_string(),
+        amount_wei: amount_wei.to_string(),
+        gas_price_wei: gas_price.to_string(),
+        submitted: tx_count,
+        accepted,
+        rejected,
+        recipients: reports,
+        settle_sec,
+        elapsed_ms: start.elapsed().as_millis(),
+    })
+}
+
+/// Run a real-chain transfer load using funded key files.
+///
+/// The supplied key files must contain 32-byte secp256k1 private keys as hex
+/// text. The function derives the four addresses, reads live nonce/balance
+/// from RPC, signs real EIP-155 legacy transfers, submits them through
+/// `eth_sendRawTransaction`, waits `settle_sec`, then reads balances again.
+/// Private keys are never returned in the report.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_live_transfer_load(
+    rpc: &str,
+    chain_id: u64,
+    key_files: &[std::path::PathBuf],
+    total: u64,
+    min_aii: &str,
+    max_aii: &str,
+    txs_per_block: u64,
+    settle_sec: u64,
+) -> Result<LiveTransferLoadReport, CliError> {
+    use aii_block::tx::Tx;
+    use aii_block::Hashable as _;
+    use alloy_rlp::Encodable as _;
+    use std::time::Instant;
+
+    if total == 0 {
+        return Err(CliError::Client("total must be greater than zero".into()));
+    }
+    if key_files.len() < 2 {
+        return Err(CliError::Client(
+            "at least two key files are required".into(),
+        ));
+    }
+    if txs_per_block == 0 {
+        return Err(CliError::Client(
+            "txs_per_block must be greater than zero".into(),
+        ));
+    }
+    let min_wei = parse_aii_decimal_to_wei(min_aii)?;
+    let max_wei = parse_aii_decimal_to_wei(max_aii)?;
+    if min_wei > max_wei {
+        return Err(CliError::Client("min_aii must be <= max_aii".into()));
+    }
+
+    let client = client(rpc)?;
+    let mut keys = Vec::with_capacity(key_files.len());
+    let mut addresses = Vec::with_capacity(key_files.len());
+    for path in key_files {
+        let sk = read_secp_secret_file(path)?;
+        let address = sk.public_key().address();
+        keys.push(sk);
+        addresses.push(address);
+    }
+
+    let gas_price_hex: String = client.request("eth_gasPrice", rpc_params![]).await?;
+    let gas_price = parse_hex_u256(&gas_price_hex)?;
+    let gas_limit = aii_types::U256::from(21_000u64);
+    let per_tx_fee = gas_price.saturating_mul(gas_limit);
+
+    let mut initial_nonces = Vec::with_capacity(addresses.len());
+    let mut initial_balances = Vec::with_capacity(addresses.len());
+    for address in &addresses {
+        let account: Option<aii_rpc::AccountView> = client
+            .request(
+                "aii_getAccount",
+                rpc_params![format!("0x{}", hex::encode(address.as_bytes()))],
+            )
+            .await?;
+        initial_nonces.push(account.as_ref().map_or(0, |a| a.nonce));
+        initial_balances.push(match account {
+            Some(a) => parse_hex_u256(&a.balance)?,
+            None => aii_types::U256::ZERO,
+        });
+    }
+
+    let accounts = addresses.len();
+    let mut planned_counts = vec![0u64; accounts];
+    let mut planned_outgoing = vec![aii_types::U256::ZERO; accounts];
+    let mut total_value_wei = aii_types::U256::ZERO;
+    for i in 0..total {
+        let sender_index = (i as usize) % accounts;
+        let amount = aii_types::U256::from(planned_amount_wei(min_wei, max_wei, total, i));
+        planned_counts[sender_index] = planned_counts[sender_index].saturating_add(1);
+        planned_outgoing[sender_index] = planned_outgoing[sender_index].saturating_add(amount);
+        total_value_wei = total_value_wei.saturating_add(amount);
+    }
+    for (index, balance) in initial_balances.iter().enumerate() {
+        let required = planned_outgoing[index].saturating_add(
+            per_tx_fee.saturating_mul(aii_types::U256::from(planned_counts[index])),
+        );
+        if *balance < required {
+            return Err(CliError::Client(format!(
+                "account #{index} has insufficient balance: have {balance} wei, need at least {required} wei"
+            )));
+        }
+    }
+
+    let start = Instant::now();
+    let mut next_nonces = initial_nonces.clone();
+    let mut submitted = 0u64;
+    let mut accepted = 0u64;
+    let mut rejected = 0u64;
+    let mut tx_hashes = Vec::new();
+    let mut errors = Vec::new();
+
+    for i in 0..total {
+        let sender_index = (i as usize) % accounts;
+        let recipient_index = (sender_index + 1) % accounts;
+        let amount = aii_types::U256::from(planned_amount_wei(min_wei, max_wei, total, i));
+        let tx = sign_legacy_transfer(
+            &keys[sender_index],
+            chain_id,
+            next_nonces[sender_index],
+            addresses[recipient_index],
+            amount,
+            gas_price,
+        )?;
+        let recovered = tx
+            .recover_signer(chain_id)
+            .map_err(|e| CliError::Client(format!("recover signer: {e}")))?;
+        if recovered != addresses[sender_index] {
+            rejected = rejected.saturating_add(1);
+            errors.push(format!("tx #{i}: signer recovery mismatch"));
+            continue;
+        }
+        let tx_hash = match &tx {
+            Tx::Legacy(_) | Tx::Eip1559(_) | Tx::Eip4844(_) => tx.hash(),
+        };
+        let mut out = alloy_rlp::bytes::BytesMut::new();
+        tx.encode(&mut out);
+        let raw_hex = format!("0x{}", hex::encode(out));
+        submitted = submitted.saturating_add(1);
+        match client
+            .request::<String, _>("eth_sendRawTransaction", rpc_params![raw_hex])
+            .await
+        {
+            Ok(hash) => {
+                accepted = accepted.saturating_add(1);
+                next_nonces[sender_index] = next_nonces[sender_index].saturating_add(1);
+                tx_hashes.push(hash);
+            }
+            Err(e) => {
+                rejected = rejected.saturating_add(1);
+                errors.push(format!(
+                    "tx #{i} hash=0x{}: {e}",
+                    hex::encode(tx_hash.as_bytes())
+                ));
+            }
+        }
+    }
+
+    if settle_sec > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(settle_sec)).await;
+    }
+
+    let mut reports = Vec::with_capacity(accounts);
+    for (index, address) in addresses.iter().enumerate() {
+        let account: Option<aii_rpc::AccountView> = client
+            .request(
+                "aii_getAccount",
+                rpc_params![format!("0x{}", hex::encode(address.as_bytes()))],
+            )
+            .await?;
+        let final_balance = match account {
+            Some(a) => parse_hex_u256(&a.balance)?,
+            None => aii_types::U256::ZERO,
+        };
+        reports.push(LiveTransferAccountReport {
+            index,
+            address: format!("0x{}", hex::encode(address.as_bytes())),
+            initial_nonce: initial_nonces[index],
+            initial_balance_wei: initial_balances[index].to_string(),
+            final_balance_wei: final_balance.to_string(),
+            signed_txs: planned_counts[index],
+            planned_outgoing_value_wei: planned_outgoing[index].to_string(),
+            planned_gas_budget_wei: per_tx_fee
+                .saturating_mul(aii_types::U256::from(planned_counts[index]))
+                .to_string(),
+        });
+    }
+
+    Ok(LiveTransferLoadReport {
+        rpc: rpc.to_string(),
+        chain_id,
+        accounts: reports,
+        total_requested: total,
+        submitted,
+        accepted,
+        rejected,
+        simulated_blocks: total.div_ceil(txs_per_block),
+        txs_per_block,
+        min_value_aii: min_aii.to_string(),
+        max_value_aii: max_aii.to_string(),
+        min_value_wei: min_wei.to_string(),
+        max_value_wei: max_wei.to_string(),
+        total_value_wei: total_value_wei.to_string(),
+        gas_price_wei: gas_price.to_string(),
+        settle_sec,
+        tx_hashes,
+        errors,
+        elapsed_ms: start.elapsed().as_millis(),
+    })
+}
+
+/// Run a deterministic, in-memory 4-address transfer load.
+///
+/// This is intended for local workstation and Android-device smoke testing.
+/// It signs real EIP-155 legacy transactions, recovers each signer, then
+/// executes value transfers against an in-memory state database. It never
+/// submits transactions to a live RPC endpoint and never uses real funds.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn run_local_transfer_load(
+    chain_id: u64,
+    total: u64,
+    accounts: usize,
+    min_aii: &str,
+    max_aii: &str,
+    txs_per_block: u64,
+) -> Result<LocalTransferLoadReport, CliError> {
+    use aii_state::{Account, StateDb};
+    use aii_storage::MemoryBackend;
+    use aii_types::U256;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    if total == 0 {
+        return Err(CliError::Client("total must be greater than zero".into()));
+    }
+    if accounts < 2 {
+        return Err(CliError::Client("accounts must be at least 2".into()));
+    }
+    if txs_per_block == 0 {
+        return Err(CliError::Client(
+            "txs_per_block must be greater than zero".into(),
+        ));
+    }
+
+    let min_wei = parse_aii_decimal_to_wei(min_aii)?;
+    let max_wei = parse_aii_decimal_to_wei(max_aii)?;
+    if min_wei > max_wei {
+        return Err(CliError::Client("min_aii must be <= max_aii".into()));
+    }
+
+    let state = Arc::new(StateDb::new(Arc::new(MemoryBackend::new())));
+    let mut keys = Vec::with_capacity(accounts);
+    let mut addresses = Vec::with_capacity(accounts);
+    for index in 0..accounts {
+        let sk = local_transfer_secret_key(index)?;
+        let address = sk.public_key().address();
+        keys.push(sk);
+        addresses.push(address);
+    }
+
+    let initial_balance_wei = U256::from(
+        WEI_PER_AII
+            .checked_mul(100_000)
+            .ok_or_else(|| CliError::Client("initial balance overflow".into()))?,
+    );
+    for address in &addresses {
+        state
+            .set_account(
+                address,
+                &Account {
+                    balance: initial_balance_wei,
+                    ..Account::EMPTY
+                },
+            )
+            .map_err(|e| CliError::Client(format!("local state: {e}")))?;
+    }
+
+    let gas_price = U256::from(1_000_000_000u64);
+    let mut nonces = vec![0u64; accounts];
+    let mut executed = 0u64;
+    let mut failed = 0u64;
+    let mut total_value_wei = U256::ZERO;
+    let mut total_gas_used = 0u64;
+    let range = max_wei - min_wei;
+    let denominator = total.saturating_sub(1);
+    let start = Instant::now();
+
+    for i in 0..total {
+        let sender_index = (i as usize) % accounts;
+        let recipient_index = (sender_index + 1) % accounts;
+        let step = if denominator == 0 {
+            0
+        } else {
+            (range * u128::from(i)) / u128::from(denominator)
+        };
+        let amount_wei = min_wei + step;
+        let amount = U256::from(amount_wei);
+        let tx = sign_legacy_transfer(
+            &keys[sender_index],
+            chain_id,
+            nonces[sender_index],
+            addresses[recipient_index],
+            amount,
+            gas_price,
+        )?;
+        let recovered = tx
+            .recover_signer(chain_id)
+            .map_err(|e| CliError::Client(format!("recover signer: {e}")))?;
+        if recovered != addresses[sender_index] {
+            failed += 1;
+            continue;
+        }
+        match aii_evm::execute_transfer(&state, addresses[sender_index], &tx) {
+            Ok(receipt) => {
+                nonces[sender_index] = nonces[sender_index].wrapping_add(1);
+                executed = executed.wrapping_add(1);
+                total_value_wei = total_value_wei.wrapping_add(amount);
+                total_gas_used = total_gas_used.wrapping_add(receipt.cumulative_gas_used);
+            }
+            Err(_) => {
+                failed = failed.wrapping_add(1);
+            }
+        }
+    }
+
+    let mut account_reports = Vec::with_capacity(accounts);
+    for (index, address) in addresses.iter().enumerate() {
+        let account = state
+            .account(address)
+            .map_err(|e| CliError::Client(format!("local state: {e}")))?
+            .unwrap_or(Account::EMPTY);
+        account_reports.push(LocalTransferAccountReport {
+            index,
+            address: format!("0x{}", hex::encode(address.as_bytes())),
+            initial_balance_wei: initial_balance_wei.to_string(),
+            final_balance_wei: account.balance.to_string(),
+            nonce: account.nonce,
+        });
+    }
+
+    Ok(LocalTransferLoadReport {
+        chain_id,
+        accounts: account_reports,
+        total_requested: total,
+        executed,
+        failed,
+        simulated_blocks: total.div_ceil(txs_per_block),
+        txs_per_block,
+        min_value_aii: min_aii.to_string(),
+        max_value_aii: max_aii.to_string(),
+        min_value_wei: min_wei.to_string(),
+        max_value_wei: max_wei.to_string(),
+        total_value_wei: total_value_wei.to_string(),
+        total_gas_used,
+        gas_price_wei: gas_price.to_string(),
+        elapsed_ms: start.elapsed().as_millis(),
+    })
+}
+
 // ──────────────────────── Stress harness (v0.0.37) ──────────────────────────
 
 /// Outcome of one stress run.
@@ -879,6 +1764,487 @@ pub fn run_tier() -> TierReport {
         score: s,
         tier: recommend_tier(s),
     }
+}
+
+// ──────────────────────── BFT capacity tooling ─────────────────────────────
+
+/// Deterministic BFT capacity report for one successful height/round.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BftCapacityReport {
+    /// Active validator count in the DPoS/BFT committee.
+    pub validators: usize,
+    /// Total online network nodes in the modeled deployment.
+    pub network_nodes: u64,
+    /// Nodes participating in the BFT consensus committee.
+    pub consensus_nodes: usize,
+    /// Online nodes that sync/serve the network but do not add BFT votes.
+    pub passive_nodes: u64,
+    /// Target seconds available for the round.
+    pub target_secs: u64,
+    /// Proposal bytes emitted by the leader before peer fan-out.
+    pub proposal_bytes: usize,
+    /// Equal-stake validators required to cross 2/3 + 1 quorum.
+    pub equal_stake_quorum_votes: usize,
+    /// Committee-wide vote messages in a full-mesh broadcast model.
+    pub vote_messages_per_round: u64,
+    /// Committee-wide vote payload bytes in a full-mesh broadcast model.
+    pub vote_payload_bytes_per_round: u64,
+    /// Leader upload bytes for sending the proposal to every other validator.
+    pub leader_proposal_fanout_bytes: u64,
+    /// Minimum leader upload bandwidth for proposal fan-out within
+    /// `target_secs`, in megabits/s.
+    pub min_leader_upload_mbps: u64,
+    /// Whether this scenario respects the protocol design cap.
+    pub satisfies_design_cap: bool,
+    /// Passive/non-committee nodes do not increase all-to-all BFT fanout.
+    pub passive_nodes_do_not_increase_bft_fanout: bool,
+}
+
+/// Run the BFT capacity budget calculator.
+///
+/// Defaults to max wire proposal size and the roadmap 30-second finality
+/// target. The caller supplies the active DPoS/BFT committee size.
+///
+/// # Errors
+/// Returns an error for empty or oversized committees, zero target
+/// seconds, or a proposal larger than the wire codec permits.
+pub fn run_bft_capacity(
+    validators: usize,
+    proposal_bytes: Option<usize>,
+    target_secs: Option<u64>,
+    network_nodes: Option<u64>,
+) -> Result<BftCapacityReport, CliError> {
+    let budget = aii_consensus_bft::capacity_budget(
+        validators,
+        proposal_bytes.unwrap_or_else(aii_consensus_bft::max_wire_proposal_bytes),
+        target_secs.unwrap_or(aii_consensus_bft::FINALITY_TARGET_SECS),
+    )
+    .map_err(|e| CliError::Client(e.to_string()))?;
+    let network_nodes = network_nodes.unwrap_or(validators as u64);
+    if network_nodes < validators as u64 {
+        return Err(CliError::Client(format!(
+            "network nodes ({network_nodes}) cannot be less than active validators ({validators})"
+        )));
+    }
+    Ok(BftCapacityReport {
+        validators: budget.validators,
+        network_nodes,
+        consensus_nodes: budget.validators,
+        passive_nodes: network_nodes - budget.validators as u64,
+        target_secs: budget.target_secs,
+        proposal_bytes: budget.proposal_bytes,
+        equal_stake_quorum_votes: budget.equal_stake_quorum_votes,
+        vote_messages_per_round: budget.vote_messages_per_round,
+        vote_payload_bytes_per_round: budget.vote_payload_bytes_per_round,
+        leader_proposal_fanout_bytes: budget.leader_proposal_fanout_bytes,
+        min_leader_upload_mbps: budget.min_leader_upload_mbps,
+        satisfies_design_cap: budget.satisfies_design_cap(),
+        passive_nodes_do_not_increase_bft_fanout: true,
+    })
+}
+
+/// Measured BFT pressure report for the active committee path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BftPressureReport {
+    /// Active DPoS/BFT validators in the measured committee.
+    pub validators: usize,
+    /// Total online network nodes in the modeled deployment.
+    pub network_nodes: u64,
+    /// Nodes participating in the BFT consensus committee.
+    pub consensus_nodes: usize,
+    /// Online nodes that sync/serve the network but do not add BFT votes.
+    pub passive_nodes: u64,
+    /// Heights measured by this pressure run.
+    pub heights: u64,
+    /// Target seconds available per height.
+    pub target_secs: u64,
+    /// Equal-stake validators required to cross 2/3 + 1 quorum.
+    pub equal_stake_quorum_votes: usize,
+    /// PRE-VOTE + PRE-COMMIT votes signed and submitted.
+    pub votes_processed: u64,
+    /// POLC + PRE-COMMIT certificates formed and verified.
+    pub certificates_verified: u64,
+    /// Total wall-clock time for the measured section.
+    pub elapsed_ms: u128,
+    /// Slowest single-height wall-clock time.
+    pub max_height_ms: u128,
+    /// Average wall-clock time per height.
+    pub avg_height_ms: u128,
+    /// Whether the slowest measured height fit inside `target_secs`.
+    pub satisfies_target: bool,
+    /// Passive/non-committee nodes do not increase all-to-all BFT fanout.
+    pub passive_nodes_do_not_increase_bft_fanout: bool,
+}
+
+/// Run an executable BFT pressure check over quorum vote/certificate work.
+///
+/// The measured section signs and submits quorum PRE-VOTEs, forms and
+/// verifies the POLC, signs and submits quorum PRE-COMMITs, then forms
+/// and verifies the finality certificate for each height.
+///
+/// # Errors
+/// Returns an error for invalid capacity inputs or if the pressure path
+/// fails to reach/verify quorum.
+pub fn run_bft_pressure(
+    validators: usize,
+    network_nodes: Option<u64>,
+    heights: Option<u64>,
+    target_secs: Option<u64>,
+) -> Result<BftPressureReport, CliError> {
+    let capacity = run_bft_capacity(validators, None, target_secs, network_nodes)?;
+    let heights = heights.unwrap_or(1);
+    if heights == 0 {
+        return Err(CliError::Client("heights must be greater than zero".into()));
+    }
+
+    let (validator_set, bls_keys) = pressure_validator_set(capacity.validators)?;
+    let quorum_votes = capacity.equal_stake_quorum_votes;
+    let target_ms = u128::from(capacity.target_secs) * 1_000;
+    let mut max_height_ms = 0u128;
+    let total_started = std::time::Instant::now();
+
+    for height in 1..=heights {
+        let height_started = std::time::Instant::now();
+        let block_hash = pressure_block_hash(height);
+        let mut prevotes =
+            aii_consensus_bft::PrevoteTallier::new(block_hash, height, 0, validator_set.clone());
+        for (idx, sk) in bls_keys.iter().take(quorum_votes).enumerate() {
+            let vote = aii_consensus_bft::PrevoteVote::sign(sk, block_hash, height, 0, idx as u32);
+            prevotes
+                .submit(vote)
+                .map_err(|e| CliError::Client(e.to_string()))?;
+        }
+        let polc = prevotes
+            .try_form_polc()
+            .ok_or_else(|| CliError::Client("prevote quorum did not form POLC".into()))?;
+        polc.verify(&validator_set)
+            .map_err(|e| CliError::Client(e.to_string()))?;
+
+        let mut precommits =
+            aii_consensus_bft::PrecommitTallier::new(block_hash, height, 0, validator_set.clone());
+        for (idx, sk) in bls_keys.iter().take(quorum_votes).enumerate() {
+            let vote =
+                aii_consensus_bft::PrecommitVote::sign(sk, block_hash, height, 0, idx as u32);
+            precommits
+                .submit(vote)
+                .map_err(|e| CliError::Client(e.to_string()))?;
+        }
+        let certificate = precommits
+            .try_finalize()
+            .ok_or_else(|| CliError::Client("precommit quorum did not finalize".into()))?;
+        certificate
+            .verify(&validator_set)
+            .map_err(|e| CliError::Client(e.to_string()))?;
+
+        max_height_ms = max_height_ms.max(height_started.elapsed().as_millis());
+    }
+
+    let elapsed_ms = total_started.elapsed().as_millis();
+    Ok(BftPressureReport {
+        validators: capacity.validators,
+        network_nodes: capacity.network_nodes,
+        consensus_nodes: capacity.consensus_nodes,
+        passive_nodes: capacity.passive_nodes,
+        heights,
+        target_secs: capacity.target_secs,
+        equal_stake_quorum_votes: quorum_votes,
+        votes_processed: heights * quorum_votes as u64 * 2,
+        certificates_verified: heights * 2,
+        elapsed_ms,
+        max_height_ms,
+        avg_height_ms: elapsed_ms / u128::from(heights),
+        satisfies_target: max_height_ms <= target_ms,
+        passive_nodes_do_not_increase_bft_fanout: true,
+    })
+}
+
+fn pressure_validator_set(
+    validators: usize,
+) -> Result<
+    (
+        aii_consensus_bft::ValidatorSet,
+        Vec<aii_crypto::bls::SecretKey>,
+    ),
+    CliError,
+> {
+    let mut entries = Vec::with_capacity(validators);
+    let mut bls_keys = Vec::with_capacity(validators);
+    for i in 0..validators {
+        let mut ikm = [0u8; 32];
+        ikm[0..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+        ikm[8..16].copy_from_slice(b"AII-BFTP");
+        let bls = aii_crypto::bls::SecretKey::from_ikm(&ikm, b"AII-BFT-PRESSURE")
+            .map_err(|e| CliError::Client(e.to_string()))?;
+        let vrf = aii_crypto::vrf::SecretKey::generate();
+        entries.push(aii_consensus_bft::Validator {
+            bls_pubkey: bls.public_key(),
+            vrf_pubkey: vrf.public_key(),
+            stake: 1,
+        });
+        bls_keys.push(bls);
+    }
+    let validator_set = aii_consensus_bft::ValidatorSet::new(entries)
+        .map_err(|e| CliError::Client(e.to_string()))?;
+    Ok((validator_set, bls_keys))
+}
+
+fn pressure_block_hash(height: u64) -> aii_types::H256 {
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(&height.to_be_bytes());
+    bytes[8..20].copy_from_slice(b"AII-PRESSURE");
+    aii_types::H256::new(bytes)
+}
+
+// ──────────────────────── Discovery diagnostics ────────────────────────────
+
+/// Default public testnet Discovery v4 seeds used by `aii discovery-probe`.
+pub const DEFAULT_DISCOVERY_PROBE_SEEDS: &[&str] = &["8.211.135.234:30310", "106.14.223.128:30310"];
+/// Default HTTP bootnodes used as a TCP peer-discovery fallback when
+/// UDP Discovery v4 is filtered before packets reach the seed.
+pub const DEFAULT_DISCOVERY_PROBE_HTTP_BOOTNODES: &[&str] =
+    &["http://8.211.135.234:8545", "http://106.14.223.128:8545"];
+
+/// Result from one Discovery v4 probe window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryProbeReport {
+    /// Seed specs supplied to the probe before DNS/socket resolution.
+    pub seed_specs: Vec<String>,
+    /// Seed socket addresses that resolved and were queried.
+    pub resolved_seeds: Vec<String>,
+    /// BFT TCP peers returned by `Neighbours`.
+    pub discovered_bft_peers: Vec<String>,
+    /// UDP Discovery v4 peers returned by `Neighbours`.
+    pub discovered_discovery_peers: Vec<String>,
+    /// HTTP bootnode RPC URLs queried for `aii_peers` fallback data.
+    pub http_bootnodes: Vec<String>,
+    /// BFT TCP peers returned by HTTP bootnode `aii_peers`.
+    pub http_fallback_bft_peers: Vec<String>,
+    /// Public UDP endpoint observed by a seed/responder via `Pong.to`.
+    pub observed_discovery: Option<String>,
+    /// Probe wall-clock duration in milliseconds.
+    pub elapsed_ms: u128,
+}
+
+/// Run a one-shot Discovery v4 probe against public or operator-supplied seeds.
+///
+/// This is a diagnostic command: it binds a temporary UDP socket,
+/// pings each seed, asks for neighbours, and reports both discovered
+/// BFT peers and the public UDP endpoint the seed observed for us.
+///
+/// # Errors
+/// Returns bind, packet signing, or UDP transport errors from the
+/// discovery layer.
+#[allow(clippy::too_many_lines)]
+pub async fn run_discovery_probe(
+    seed_specs: &[String],
+    listen: std::net::SocketAddr,
+    bft_listen: std::net::SocketAddr,
+    timeout_ms: u64,
+    http_bootnodes: &[String],
+) -> Result<DiscoveryProbeReport, CliError> {
+    use aii_net_p2p::discovery::{
+        expiration_in, Endpoint, FindNode, Neighbours, Packet, Ping, UdpDiscovery,
+        DISCOVERY_VERSION,
+    };
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    let resolved_seeds = resolve_probe_seed_specs(seed_specs);
+    let started = Instant::now();
+    let mut found_bft = BTreeSet::new();
+    let mut found_discovery = BTreeSet::new();
+    let mut observed_discovery = None;
+
+    if !resolved_seeds.is_empty() {
+        let driver = UdpDiscovery::bind(listen, probe_secret_key())
+            .await
+            .map_err(|e| CliError::Client(format!("discovery: {e}")))?;
+        let local = Endpoint {
+            ip: driver.local_addr().ip(),
+            udp_port: driver.local_addr().port(),
+            tcp_port: bft_listen.port(),
+        };
+        let target = aii_crypto::keccak256(&driver.local_addr().to_string().into_bytes());
+
+        for seed in &resolved_seeds {
+            let seed_ep = Endpoint {
+                ip: seed.ip(),
+                udp_port: seed.port(),
+                tcp_port: 0,
+            };
+            let ping = Packet::Ping(Ping {
+                version: DISCOVERY_VERSION,
+                from: local.clone(),
+                to: seed_ep,
+                expiration: expiration_in(60),
+            });
+            let _ = driver.send(*seed, &ping).await;
+            let find = Packet::FindNode(FindNode {
+                target,
+                expiration: expiration_in(60),
+            });
+            let _ = driver.send(*seed, &find).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let slice = remaining.min(Duration::from_millis(100));
+            let Ok((decoded, src)) = driver.recv(slice).await else {
+                continue;
+            };
+            match decoded.packet {
+                Packet::Ping(p) => {
+                    let observed = Endpoint {
+                        ip: src.ip(),
+                        udp_port: src.port(),
+                        tcp_port: p.from.tcp_port,
+                    };
+                    let _ = driver
+                        .send(
+                            src,
+                            &Packet::Pong(aii_net_p2p::discovery::Pong {
+                                to: observed,
+                                ping_hash: decoded.packet_hash,
+                                expiration: expiration_in(60),
+                            }),
+                        )
+                        .await;
+                }
+                Packet::FindNode(_) => {
+                    let _ = driver
+                        .send(
+                            src,
+                            &Packet::Neighbours(Neighbours {
+                                nodes: Vec::new(),
+                                expiration: expiration_in(60),
+                            }),
+                        )
+                        .await;
+                }
+                Packet::Neighbours(n) => {
+                    for node in &n.nodes {
+                        if let Some(peer) = endpoint_to_probe_peer(node, false) {
+                            found_bft.insert(peer);
+                        }
+                        if let Some(peer) = endpoint_to_probe_peer(node, true) {
+                            found_discovery.insert(peer);
+                        }
+                    }
+                }
+                Packet::Pong(p) => {
+                    if observed_discovery.is_none() {
+                        observed_discovery =
+                            endpoint_to_probe_peer(&p.to, true).map(|addr| addr.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let http_fallback_bft_peers = fetch_probe_http_bootnode_peers(http_bootnodes).await;
+    for peer in &http_fallback_bft_peers {
+        if let Ok(addr) = peer.parse::<std::net::SocketAddr>() {
+            found_bft.insert(addr);
+        }
+    }
+
+    Ok(DiscoveryProbeReport {
+        seed_specs: seed_specs.to_vec(),
+        resolved_seeds: resolved_seeds
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        discovered_bft_peers: found_bft
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        discovered_discovery_peers: found_discovery
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        http_bootnodes: http_bootnodes.to_vec(),
+        http_fallback_bft_peers,
+        observed_discovery,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+async fn fetch_probe_http_bootnode_peers(http_bootnodes: &[String]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for bootnode in http_bootnodes {
+        let Ok(client) = HttpClientBuilder::default().build(bootnode) else {
+            continue;
+        };
+        let Ok(peers) = client
+            .request::<Vec<String>, _>("aii_peers", rpc_params![])
+            .await
+        else {
+            continue;
+        };
+        for peer in peers {
+            if let Ok(addr) = peer.parse::<std::net::SocketAddr>() {
+                out.insert(addr);
+            }
+        }
+    }
+    out.iter().map(ToString::to_string).collect()
+}
+
+fn resolve_probe_seed_specs(seed_specs: &[String]) -> Vec<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in seed_specs {
+        if let Ok(addr) = spec.parse::<std::net::SocketAddr>() {
+            if seen.insert(addr) {
+                out.push(addr);
+            }
+            continue;
+        }
+        if let Ok(addrs) = spec.to_socket_addrs() {
+            for addr in addrs {
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn endpoint_to_probe_peer(
+    endpoint: &aii_net_p2p::discovery::Endpoint,
+    discovery_port: bool,
+) -> Option<std::net::SocketAddr> {
+    let port = if discovery_port {
+        endpoint.udp_port
+    } else {
+        endpoint.tcp_port
+    };
+    let peer = std::net::SocketAddr::new(endpoint.ip, port);
+    (!peer.ip().is_unspecified() && peer.port() != 0).then_some(peer)
+}
+
+fn probe_secret_key() -> aii_crypto::secp::SecretKey {
+    let seed = format!(
+        "{}:{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    for counter in 0u64.. {
+        let mut input = seed.as_bytes().to_vec();
+        input.extend_from_slice(&counter.to_be_bytes());
+        let bytes = *aii_crypto::keccak256(&input).as_bytes();
+        if let Ok(sk) = aii_crypto::secp::SecretKey::from_bytes(&bytes) {
+            return sk;
+        }
+    }
+    unreachable!("secp256k1 key generation loop should eventually find a valid scalar")
 }
 
 // ──────────────────────── Validator / Genesis tooling (v0.0.32) ─────────────
@@ -1229,6 +2595,223 @@ mod tests {
         let r2 = run_tier();
         assert_eq!(r1.tier, r2.tier);
         assert!(r1.score <= 100);
+    }
+
+    #[test]
+    fn bft_capacity_reports_default_roadmap_budget() {
+        let r = run_bft_capacity(21, None, None, None).unwrap();
+        assert_eq!(r.validators, 21);
+        assert_eq!(r.network_nodes, 21);
+        assert_eq!(r.consensus_nodes, 21);
+        assert_eq!(r.passive_nodes, 0);
+        assert_eq!(r.target_secs, aii_consensus_bft::FINALITY_TARGET_SECS);
+        assert_eq!(
+            r.proposal_bytes,
+            aii_consensus_bft::max_wire_proposal_bytes()
+        );
+        assert_eq!(r.equal_stake_quorum_votes, 15);
+        assert_eq!(r.vote_messages_per_round, 840);
+        assert!(r.satisfies_design_cap);
+    }
+
+    #[test]
+    fn bft_capacity_rejects_oversized_committee() {
+        let err =
+            run_bft_capacity(aii_consensus_bft::MAX_VALIDATORS + 1, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn bft_capacity_models_large_network_with_capped_active_committee() {
+        let r = run_bft_capacity(128, None, Some(30), Some(21_000_000)).unwrap();
+        assert_eq!(r.validators, 128);
+        assert_eq!(r.network_nodes, 21_000_000);
+        assert_eq!(r.passive_nodes, 20_999_872);
+        assert_eq!(r.consensus_nodes, 128);
+        assert!(r.satisfies_design_cap);
+        assert!(r.passive_nodes_do_not_increase_bft_fanout);
+    }
+
+    #[test]
+    fn bft_pressure_processes_quorum_votes_and_certificates() {
+        let r = run_bft_pressure(4, Some(21_000_000), Some(2), Some(30)).unwrap();
+        assert_eq!(r.validators, 4);
+        assert_eq!(r.network_nodes, 21_000_000);
+        assert_eq!(r.consensus_nodes, 4);
+        assert_eq!(r.passive_nodes, 20_999_996);
+        assert_eq!(r.heights, 2);
+        assert_eq!(r.equal_stake_quorum_votes, 3);
+        assert_eq!(r.votes_processed, 12);
+        assert_eq!(r.certificates_verified, 4);
+        assert!(r.satisfies_target);
+        assert!(r.passive_nodes_do_not_increase_bft_fanout);
+    }
+
+    #[test]
+    fn bft_pressure_rejects_zero_heights() {
+        let err = run_bft_pressure(4, None, Some(0), None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("heights must be greater than zero"));
+    }
+
+    #[test]
+    fn parse_aii_decimal_to_wei_accepts_fractional_values() {
+        assert_eq!(parse_aii_decimal_to_wei("0.1").unwrap(), WEI_PER_AII / 10);
+        assert_eq!(parse_aii_decimal_to_wei("50").unwrap(), WEI_PER_AII * 50);
+        assert_eq!(
+            parse_aii_decimal_to_wei("1.000000000000000001").unwrap(),
+            WEI_PER_AII + 1
+        );
+        assert!(parse_aii_decimal_to_wei("1.0000000000000000001").is_err());
+        assert!(parse_aii_decimal_to_wei("-1").is_err());
+    }
+
+    #[test]
+    fn local_transfer_load_executes_four_account_value_range() {
+        let r = run_local_transfer_load(9999, 40, 4, "0.1", "50", 10).unwrap();
+        assert_eq!(r.chain_id, 9999);
+        assert_eq!(r.accounts.len(), 4);
+        assert_eq!(r.total_requested, 40);
+        assert_eq!(r.executed, 40);
+        assert_eq!(r.failed, 0);
+        assert_eq!(r.simulated_blocks, 4);
+        assert_eq!(r.min_value_wei, (WEI_PER_AII / 10).to_string());
+        assert_eq!(r.max_value_wei, (WEI_PER_AII * 50).to_string());
+        assert_eq!(r.total_gas_used, 40 * 21_000);
+        assert_eq!(r.accounts.iter().map(|a| a.nonce).sum::<u64>(), 40);
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_returns_empty_report_for_unresolvable_seed() {
+        let report = run_discovery_probe(
+            &["not a socket address".to_string()],
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:30311".parse().unwrap(),
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.resolved_seeds, Vec::<String>::new());
+        assert_eq!(report.discovered_bft_peers, Vec::<String>::new());
+        assert_eq!(report.observed_discovery, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_reports_neighbours_and_observed_endpoint() {
+        use aii_net_p2p::discovery::{
+            expiration_in, Endpoint, Neighbours, Packet, Pong, UdpDiscovery,
+        };
+
+        fn fixed_secret(byte: u8) -> aii_crypto::secp::SecretKey {
+            let mut bytes = [0u8; 32];
+            bytes[31] = byte;
+            aii_crypto::secp::SecretKey::from_bytes(&bytes).unwrap()
+        }
+
+        let seed = UdpDiscovery::bind("127.0.0.1:0".parse().unwrap(), fixed_secret(1))
+            .await
+            .unwrap();
+        let seed_addr = seed.local_addr();
+        let observed = "127.0.0.1:43000".parse::<std::net::SocketAddr>().unwrap();
+        let advertised_bft = "127.0.0.1:30331".parse::<std::net::SocketAddr>().unwrap();
+        let advertised_discovery = "127.0.0.1:30330".parse::<std::net::SocketAddr>().unwrap();
+
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((decoded, src)) = seed.recv(std::time::Duration::from_secs(2)).await else {
+                    continue;
+                };
+                match decoded.packet {
+                    Packet::Ping(p) => {
+                        let _ = seed
+                            .send(
+                                src,
+                                &Packet::Pong(Pong {
+                                    to: Endpoint {
+                                        ip: observed.ip(),
+                                        udp_port: observed.port(),
+                                        tcp_port: p.from.tcp_port,
+                                    },
+                                    ping_hash: decoded.packet_hash,
+                                    expiration: expiration_in(60),
+                                }),
+                            )
+                            .await;
+                    }
+                    Packet::FindNode(_) => {
+                        let _ = seed
+                            .send(
+                                src,
+                                &Packet::Neighbours(Neighbours {
+                                    nodes: vec![Endpoint {
+                                        ip: advertised_bft.ip(),
+                                        udp_port: advertised_discovery.port(),
+                                        tcp_port: advertised_bft.port(),
+                                    }],
+                                    expiration: expiration_in(60),
+                                }),
+                            )
+                            .await;
+                    }
+                    Packet::Pong(_) | Packet::Neighbours(_) => {}
+                }
+            }
+        });
+
+        let report = run_discovery_probe(
+            &[seed_addr.to_string()],
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:30311".parse().unwrap(),
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert_eq!(report.resolved_seeds, vec![seed_addr.to_string()]);
+        assert_eq!(
+            report.discovered_bft_peers,
+            vec![advertised_bft.to_string()],
+        );
+        assert_eq!(
+            report.discovered_discovery_peers,
+            vec![advertised_discovery.to_string()],
+        );
+        assert_eq!(report.observed_discovery, Some(observed.to_string()));
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_reports_http_bootnode_peers_when_udp_finds_none() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        state.set_bft_peers(&[
+            "127.0.0.1:30311".parse().unwrap(),
+            "127.0.0.1:30312".parse().unwrap(),
+        ]);
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state)
+            .await
+            .unwrap();
+        let bootnode = format!("http://{addr}");
+
+        let report = run_discovery_probe(
+            &["127.0.0.1:9".to_string()],
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:30311".parse().unwrap(),
+            10,
+            std::slice::from_ref(&bootnode),
+        )
+        .await
+        .unwrap();
+
+        handle.stop().unwrap();
+        assert_eq!(report.http_bootnodes, vec![bootnode]);
+        assert_eq!(
+            report.http_fallback_bft_peers,
+            vec!["127.0.0.1:30311", "127.0.0.1:30312"],
+        );
+        assert_eq!(report.discovered_bft_peers, report.http_fallback_bft_peers);
+        assert_eq!(report.observed_discovery, None);
     }
 
     // ───────────────────── validator / genesis tooling tests ─────────────────────

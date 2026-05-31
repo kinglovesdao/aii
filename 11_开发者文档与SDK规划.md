@@ -50,9 +50,8 @@ docs.《[占位]项目名》.io
 │   ├── 监控
 │   └── 安全
 └── Migrate             迁移
-    ├── 从 Ethereum 迁移
-    ├── 从 BSC 迁移
-    └── 从 MOAC 迁移
+	    ├── 从 Ethereum 迁移
+	    └── 从 BSC 迁移
 ```
 
 文档工具链推荐：**Docusaurus 2 / VitePress**（双语 i18n 中英版同步）。

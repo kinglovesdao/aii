@@ -11,6 +11,7 @@
 pub mod bft_bootstrap;
 pub mod bft_p2p;
 pub mod bft_state;
+pub mod discovery_bootstrap;
 pub mod dpos;
 pub mod governance;
 #[cfg(unix)]
@@ -22,26 +23,26 @@ pub mod release_install;
 pub mod release_store;
 pub mod staking;
 pub mod sync;
+pub mod validator_registry;
 
-pub use dpos::{elect_active_set, latest_validator_set, ValidatorEntry};
+pub use dpos::{
+    elect_active_set, elect_registered_active_set, latest_validator_set, ValidatorEntry,
+};
 pub use governance::{Governance, Proposal, ProposalStatus, Vote};
 pub use precompile::{dispatch as precompile_dispatch, PrecompileOutcome, PRECOMPILE_ADDR};
 pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
+pub use validator_registry::{ValidatorKeys, ValidatorRegistry};
+
+const BFT_STAKE_WEIGHT_UNIT_WEI: u128 = 1_000_000_000_000_000_000;
 
 /// `BlockExecutor` adapter built on top of a live [`NodeState`].
 ///
-/// Today's impl is the half-step "consult-current-state" mode.
-/// The engine asks for post-execution roots **before** consensus,
-/// but the oracle returns the current `state_root` (i.e. the
-/// post-block-(N-1) state, not the post-block-N state). Hash
-/// stability still wins — both leader and followers compute the
-/// same answer because every node starts the round at the same
-/// head state.
-///
-/// A future iteration applies the body against a state snapshot
-/// before answering, so the header truly locks to the post-block-N
-/// state. The trait surface stays unchanged.
+/// Proposal execution is isolated: the adapter copies the execution
+/// column families into a temporary RocksDB instance, applies the
+/// proposed body there, and returns the resulting Yellow-Paper roots.
+/// The live chain state is only mutated later, after consensus
+/// finalises the block and `commit_block` runs.
 pub struct NodeStateExecutor {
     state: Arc<NodeState>,
 }
@@ -58,23 +59,325 @@ impl aii_consensus_iface::BlockExecutor for NodeStateExecutor {
     fn execute_for_proposal(
         &self,
         body: &BlockBody,
-        _coinbase: Address,
-        _block_number: u64,
+        coinbase: Address,
+        block_number: u64,
     ) -> Result<aii_consensus_iface::PostBlockRoots, aii_consensus_iface::ConsensusError> {
-        let state_root = self
-            .state
-            .state()
-            .state_root()
-            .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
-        // Pre-execution receipts_root = empty (no receipts have been
-        // computed for this body yet). Same for the bloom.
-        Ok(aii_consensus_iface::PostBlockRoots {
-            state_root,
-            receipts_root: aii_block::EMPTY_TRIE_HASH,
-            logs_bloom: [0u8; 256],
-            gas_used: (body.transactions.len() as u64) * 21_000,
-        })
+        let temp_backend = Arc::new(
+            RocksDbBackend::open_in_temp()
+                .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?,
+        );
+        copy_execution_backend(&self.state.backend, &temp_backend)?;
+        let temp_state = Arc::new(StateDb::new(Arc::clone(&temp_backend)));
+        execute_body_for_roots(
+            &self.state.spec,
+            &temp_backend,
+            &temp_state,
+            body,
+            coinbase,
+            block_number,
+        )
     }
+}
+
+fn copy_execution_backend(
+    src: &Arc<RocksDbBackend>,
+    dst: &Arc<RocksDbBackend>,
+) -> Result<(), aii_consensus_iface::ConsensusError> {
+    for cf in [
+        ColumnFamily::State,
+        ColumnFamily::Code,
+        ColumnFamily::AccountStorage,
+        ColumnFamily::Meta,
+    ] {
+        for kv in src.iter(cf) {
+            let (key, value) =
+                kv.map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+            dst.put(cf, &key, &value)
+                .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn credit_state_for_roots(
+    state: &Arc<StateDb<RocksDbBackend>>,
+    addr: &Address,
+    delta: U256,
+) -> Result<(), aii_consensus_iface::ConsensusError> {
+    if delta.is_zero() {
+        return Ok(());
+    }
+    let mut acc = state
+        .account(addr)
+        .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?
+        .unwrap_or(aii_state::Account::EMPTY);
+    acc.balance = acc.balance.saturating_add(delta);
+    state
+        .set_account(addr, &acc)
+        .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))
+}
+
+fn beneficiary_may_receive_block_subsidy_on_backend(
+    backend: &Arc<RocksDbBackend>,
+    beneficiary: &Address,
+) -> bool {
+    match latest_validator_set(backend) {
+        Ok(Some((_epoch, entries))) => entries.iter().any(|entry| entry.address == *beneficiary),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_body_for_roots(
+    spec: &ChainSpec,
+    backend: &Arc<RocksDbBackend>,
+    state: &Arc<StateDb<RocksDbBackend>>,
+    body: &BlockBody,
+    coinbase: Address,
+    block_number: u64,
+) -> Result<aii_consensus_iface::PostBlockRoots, aii_consensus_iface::ConsensusError> {
+    use aii_block::tx::{TxEip1559, TxLegacy};
+
+    let mut cumulative_gas_used: u64 = 0;
+    let mut receipts: Vec<Receipt> = Vec::new();
+    for tx in &body.transactions {
+        let tx_type = match tx {
+            Tx::Legacy(_) => TxType::Legacy,
+            Tx::Eip1559(_) => TxType::Eip1559,
+            Tx::Eip4844(_) => TxType::Eip4844,
+        };
+        let Ok(sender) = tx.recover_signer(spec.chain_id) else {
+            continue;
+        };
+        let (to, value, data, gas_limit, gas_price) = match tx {
+            Tx::Legacy(TxLegacy {
+                to,
+                value,
+                data,
+                gas_limit,
+                gas_price,
+                ..
+            }) => (*to, *value, data.clone(), *gas_limit, *gas_price),
+            Tx::Eip1559(TxEip1559 {
+                to,
+                value,
+                data,
+                gas_limit,
+                max_fee_per_gas,
+                ..
+            }) => (*to, *value, data.clone(), *gas_limit, *max_fee_per_gas),
+            Tx::Eip4844(_) => continue,
+        };
+        if to == Some(precompile::PRECOMPILE_ADDR) {
+            let table = StakeTable::new(Arc::clone(backend));
+            let registry = ValidatorRegistry::new(Arc::clone(backend));
+            let gov = Governance::new(Arc::clone(backend));
+            let success = precompile::dispatch(
+                &table,
+                &registry,
+                &gov,
+                sender,
+                value,
+                &data,
+                block_number,
+                spec.unbonding_period_blocks,
+            )
+            .is_ok();
+            let gas_charged = 21_000u64;
+            cumulative_gas_used = cumulative_gas_used.saturating_add(gas_charged);
+            let fee = U256::from(gas_charged).saturating_mul(gas_price);
+            credit_state_for_roots(state, &coinbase, fee)?;
+            receipts.push(Receipt {
+                tx_type,
+                status: success,
+                cumulative_gas_used,
+                logs_bloom: Bloom::ZERO,
+                logs: vec![],
+            });
+            continue;
+        }
+        let Ok(summary) =
+            aii_evm::execute_with_revm(state, sender, to, value, data, gas_limit, gas_price)
+        else {
+            continue;
+        };
+        cumulative_gas_used = cumulative_gas_used.saturating_add(summary.gas_used);
+        let fee = U256::from(summary.gas_used).saturating_mul(gas_price);
+        credit_state_for_roots(state, &coinbase, fee)?;
+        let mut tx_bloom = Bloom::ZERO;
+        for log in &summary.logs {
+            tx_bloom.accrue(log.address.as_bytes());
+            for topic in &log.topics {
+                tx_bloom.accrue(topic.as_bytes());
+            }
+        }
+        receipts.push(Receipt {
+            tx_type,
+            status: summary.success,
+            cumulative_gas_used,
+            logs_bloom: tx_bloom,
+            logs: summary.logs,
+        });
+    }
+    let subsidy_wei = spec.block_reward_at(block_number);
+    if subsidy_wei > 0 && beneficiary_may_receive_block_subsidy_on_backend(backend, &coinbase) {
+        credit_state_for_roots(state, &coinbase, U256::from(subsidy_wei))?;
+    }
+    let state_root = state
+        .state_root()
+        .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+    let receipts_root = aii_state::receipts_root(&receipts);
+    let mut block_bloom = Bloom::ZERO;
+    for receipt in &receipts {
+        for log in &receipt.logs {
+            block_bloom.accrue(log.address.as_bytes());
+            for topic in &log.topics {
+                block_bloom.accrue(topic.as_bytes());
+            }
+        }
+    }
+    Ok(aii_consensus_iface::PostBlockRoots {
+        state_root,
+        receipts_root,
+        logs_bloom: block_bloom.0,
+        gas_used: cumulative_gas_used,
+    })
+}
+
+/// Convert a keyed DPoS epoch record into the BFT runtime validator set.
+///
+/// Every entry must carry BLS and VRF pubkeys. Wei-denominated stake is
+/// converted into whole-AII voting weight for the BFT engine's `u64`
+/// domain, with sub-token stakes rounded up to one unit so low-stake
+/// local tests still have non-zero weight. Values that remain too large
+/// after scaling are rejected instead of silently truncating.
+///
+/// # Errors
+/// Returns BFT validation errors for missing/malformed keys, oversized
+/// stake values, empty sets, or oversized validator sets.
+pub fn bft_validator_set_from_entries(
+    entries: &[ValidatorEntry],
+) -> Result<aii_consensus_bft::ValidatorSet, aii_consensus_bft::BftError> {
+    let mut validators = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(bls_pubkey) = entry.bls_pubkey else {
+            return Err(aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: i,
+                kind: "bls",
+            });
+        };
+        let Some(vrf_pubkey) = entry.vrf_pubkey else {
+            return Err(aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: i,
+                kind: "vrf",
+            });
+        };
+        let bls_pubkey = aii_crypto::bls::PublicKey::from_compressed(bls_pubkey.as_bytes())
+            .map_err(|_| aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: i,
+                kind: "bls",
+            })?;
+        let vrf_pubkey =
+            aii_crypto::vrf::PublicKey::from_bytes(vrf_pubkey.as_bytes()).map_err(|_| {
+                aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                    index: i,
+                    kind: "vrf",
+                }
+            })?;
+        let stake = bft_stake_weight_from_wei(entry.stake_wei)?;
+        validators.push(aii_consensus_bft::Validator {
+            bls_pubkey,
+            vrf_pubkey,
+            stake,
+        });
+    }
+    aii_consensus_bft::ValidatorSet::new(validators)
+}
+
+fn bft_stake_weight_from_wei(stake_wei: U256) -> Result<u64, aii_consensus_bft::BftError> {
+    let unit = U256::from(BFT_STAKE_WEIGHT_UNIT_WEI);
+    let weight = stake_wei / unit;
+    let weight = if weight.is_zero() {
+        U256::from(1u64)
+    } else {
+        weight
+    };
+    u64::try_from(weight).map_err(|_| aii_consensus_bft::BftError::TotalStakeOverflow)
+}
+
+/// Find this node's validator index inside a keyed DPoS epoch record.
+///
+/// Returns `None` for legacy stake-only records or when the local key is
+/// not a member of the elected set.
+#[must_use]
+pub fn bft_my_index_from_entries(
+    entries: &[ValidatorEntry],
+    local_bls_pubkey: &aii_types::BlsPubKey,
+) -> Option<u32> {
+    entries
+        .iter()
+        .position(|entry| entry.bls_pubkey.as_ref() == Some(local_bls_pubkey))
+        .and_then(|idx| u32::try_from(idx).ok())
+}
+
+/// Result of trying to align a running BFT engine with the latest
+/// on-chain DPoS validator-set record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BftDposRotation {
+    /// No DPoS epoch record has been persisted yet.
+    NoActiveSet,
+    /// A DPoS epoch exists, but this node's BLS key is not part of it.
+    LocalKeyMissing {
+        /// Epoch number of the latest persisted DPoS validator set.
+        epoch: u64,
+        /// Number of validators in that epoch record.
+        validators: usize,
+    },
+    /// The engine accepted the latest DPoS validator set.
+    Rotated {
+        /// Epoch number of the latest persisted DPoS validator set.
+        epoch: u64,
+        /// Number of validators in that epoch record.
+        validators: usize,
+        /// This node's index inside the BFT runtime validator set.
+        my_index: u32,
+    },
+}
+
+/// Rotate `engine` to the latest persisted keyed DPoS validator set,
+/// if one exists and includes this node's BLS key.
+///
+/// This is used during `aiid --bft` startup before choosing the
+/// single-validator or gossip-driven runtime path. Without it, a node
+/// bootstrapped from a single-validator genesis can keep running the
+/// single-validator producer after a later DPoS epoch has elected a
+/// multi-validator set, until the operator manually rewrites genesis.
+///
+/// # Errors
+/// Propagates storage errors and BFT validator-set validation errors.
+pub fn rotate_bft_engine_to_latest_dpos(
+    engine: &aii_consensus_bft::BftEngine,
+    state: &NodeState,
+) -> Result<BftDposRotation, Box<dyn std::error::Error + Send + Sync>> {
+    let Some((epoch, entries)) = latest_validator_set(&state.backend)? else {
+        return Ok(BftDposRotation::NoActiveSet);
+    };
+    let local_bls_pubkey = engine.my_bls_pubkey();
+    let Some(my_index) = bft_my_index_from_entries(&entries, &local_bls_pubkey) else {
+        return Ok(BftDposRotation::LocalKeyMissing {
+            epoch,
+            validators: entries.len(),
+        });
+    };
+    let validator_set = bft_validator_set_from_entries(&entries)?;
+    let validators = validator_set.size();
+    engine.rotate_validator_set(validator_set, my_index)?;
+    Ok(BftDposRotation::Rotated {
+        epoch,
+        validators,
+        my_index,
+    })
 }
 
 use aii_block::tx::Tx;
@@ -501,20 +804,57 @@ impl NodeState {
         }
         let epoch = block_number / epoch_len;
         let table = self.stake_table();
-        let elected = match elect_active_set(
+        let registry = self.validator_registry();
+        let registered = match elect_registered_active_set(
             &table,
+            &registry,
             U256::from(self.spec.min_validator_stake_wei),
             self.spec.validators_per_epoch,
         ) {
             Ok(set) => set,
             Err(e) => {
-                tracing::warn!(error = %e, "elect_active_set failed — skipping epoch");
-                return;
+                tracing::warn!(
+                    error = %e,
+                    "elect_registered_active_set failed — trying legacy election"
+                );
+                Vec::new()
             }
+        };
+        let elected = if registered.is_empty() {
+            match elect_active_set(
+                &table,
+                U256::from(self.spec.min_validator_stake_wei),
+                self.spec.validators_per_epoch,
+            ) {
+                Ok(set) => set,
+                Err(e) => {
+                    tracing::warn!(error = %e, "elect_active_set failed — skipping epoch");
+                    return;
+                }
+            }
+        } else {
+            registered
         };
         if let Err(e) = dpos::persist_validator_set(&self.backend, epoch, &elected) {
             tracing::error!(error = %e, "persist_validator_set failed");
             return;
+        }
+        if elected
+            .iter()
+            .all(|entry| entry.bls_pubkey.is_some() && entry.vrf_pubkey.is_some())
+        {
+            match bft_validator_set_from_entries(&elected) {
+                Ok(set) => tracing::info!(
+                    epoch,
+                    validators = set.size(),
+                    "DPoS validator set is BFT-runtime ready",
+                ),
+                Err(e) => tracing::warn!(
+                    epoch,
+                    error = %e,
+                    "DPoS validator set cannot be converted to BFT runtime set",
+                ),
+            }
         }
         tracing::info!(
             epoch,
@@ -654,6 +994,23 @@ impl NodeState {
         }
     }
 
+    fn beneficiary_may_receive_block_subsidy(&self, beneficiary: &Address) -> bool {
+        match latest_validator_set(&self.backend) {
+            Ok(Some((_epoch, entries))) => {
+                entries.iter().any(|entry| entry.address == *beneficiary)
+            }
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!(
+                    beneficiary = ?beneficiary,
+                    error = %e,
+                    "validator reward eligibility check failed",
+                );
+                false
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_block_txs(&self, block: &Block) {
         use aii_block::tx::{TxEip1559, TxLegacy};
@@ -715,9 +1072,11 @@ impl NodeState {
             // state and doesn't run EVM bytecode.
             if to == Some(precompile::PRECOMPILE_ADDR) {
                 let table = self.stake_table();
+                let registry = self.validator_registry();
                 let gov = self.governance();
                 let outcome = precompile::dispatch(
                     &table,
+                    &registry,
                     &gov,
                     sender,
                     value,
@@ -817,8 +1176,15 @@ impl NodeState {
         // controlled by ChainSpec; testnets can disable halving by
         // setting `block_reward_halving_interval = u64::MAX`.
         let subsidy_wei = self.spec.block_reward_at(block.header.number);
-        if subsidy_wei > 0 {
+        if subsidy_wei > 0 && self.beneficiary_may_receive_block_subsidy(&block.header.beneficiary)
+        {
             self.credit(&block.header.beneficiary, U256::from(subsidy_wei));
+        } else if subsidy_wei > 0 {
+            tracing::warn!(
+                block = block.header.number,
+                beneficiary = ?block.header.beneficiary,
+                "block subsidy skipped for non-elected beneficiary",
+            );
         }
         self.persist_receipts(block.hash(), &receipts);
         // Compute + persist Yellow-Paper sidecar roots so light
@@ -942,10 +1308,6 @@ impl NodeState {
     /// `Meta:slash:<vidx>:<height>:<phase>`; duplicate records for
     /// the same `(validator, height, phase)` triple overwrite (idempotent).
     ///
-    /// Future releases will, in addition to recording the slash, debit
-    /// the offending validator's staked balance — that requires the
-    /// DPoS stake table from C.6 / E.3. For now the record itself is
-    /// the slashing primitive.
     /// Optional slash-debit hook. When invoked together with
     /// [`Self::record_slashing`], this debits the offending
     /// validator's bond by `slash_amount_wei` (saturating at zero).
@@ -958,6 +1320,21 @@ impl NodeState {
                 tracing::error!(error = %e, "slash debit failed");
             }
         }
+    }
+
+    /// Resolve a BFT validator index against the latest persisted DPoS
+    /// epoch set.
+    ///
+    /// Returns `None` when no epoch set exists or the index is outside
+    /// the current elected validator set.
+    #[must_use]
+    pub fn latest_validator_address_by_index(
+        &self,
+        validator_index: u32,
+    ) -> Option<(u64, Address)> {
+        let (epoch, entries) = latest_validator_set(&self.backend).ok().flatten()?;
+        let idx = usize::try_from(validator_index).ok()?;
+        entries.get(idx).map(|entry| (epoch, entry.address))
     }
 
     /// Append an equivocation record to the slashing index. Idempotent
@@ -1253,6 +1630,13 @@ impl NodeState {
     #[must_use]
     pub fn stake_table(&self) -> StakeTable {
         StakeTable::new(Arc::clone(&self.backend))
+    }
+
+    /// Construct a fresh `ValidatorRegistry` view bound to this node's
+    /// backend. Cheap — the inner `RocksDbBackend` Arc is shared.
+    #[must_use]
+    pub fn validator_registry(&self) -> ValidatorRegistry {
+        ValidatorRegistry::new(Arc::clone(&self.backend))
     }
 
     /// Construct a fresh `Governance` view bound to this node's
@@ -1748,6 +2132,12 @@ impl RpcState for NodeState {
                 .map(|e| ValidatorEntryView {
                     address: format!("0x{}", hex::encode(e.address.as_bytes())),
                     stake_wei: format!("0x{:x}", e.stake_wei),
+                    bls_pubkey: e
+                        .bls_pubkey
+                        .map(|pk| format!("0x{}", hex::encode(pk.as_bytes()))),
+                    vrf_pubkey: e
+                        .vrf_pubkey
+                        .map(|pk| format!("0x{}", hex::encode(pk.as_bytes()))),
                 })
                 .collect(),
         })
@@ -2265,10 +2655,211 @@ impl RpcState for NodeState {
 mod tests {
     use super::*;
     use aii_block::{BlockBody, Bloom, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
+    use aii_config::MAX_ACTIVE_VALIDATORS;
     use aii_state::Account;
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
+
+    #[test]
+    fn configured_active_validator_cap_matches_bft_vote_bitmap_cap() {
+        assert_eq!(
+            MAX_ACTIVE_VALIDATORS as usize,
+            aii_consensus_bft::MAX_VALIDATORS
+        );
+    }
+
+    #[test]
+    fn keyed_dpos_entries_convert_to_bft_validator_set() {
+        let bls = aii_crypto::bls::SecretKey::from_ikm(&[0x44; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let vrf = aii_crypto::vrf::SecretKey::generate();
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xa1; 20]),
+            stake_wei: U256::from(1_000u64) * U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+            bls_pubkey: Some(aii_types::BlsPubKey::new(bls.public_key().to_compressed())),
+            vrf_pubkey: Some(aii_types::VrfPubKey::new(vrf.public_key().to_bytes())),
+        }];
+
+        let set = bft_validator_set_from_entries(&entries).unwrap();
+
+        assert_eq!(set.size(), 1);
+        assert_eq!(set.total_stake(), 1_000);
+    }
+
+    #[test]
+    fn sub_token_dpos_stake_converts_to_nonzero_bft_weight() {
+        let bls = aii_crypto::bls::SecretKey::from_ikm(&[0x45; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let vrf = aii_crypto::vrf::SecretKey::generate();
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xa1; 20]),
+            stake_wei: U256::from(1_000u64),
+            bls_pubkey: Some(aii_types::BlsPubKey::new(bls.public_key().to_compressed())),
+            vrf_pubkey: Some(aii_types::VrfPubKey::new(vrf.public_key().to_bytes())),
+        }];
+
+        let set = bft_validator_set_from_entries(&entries).unwrap();
+
+        assert_eq!(set.total_stake(), 1);
+    }
+
+    #[test]
+    fn local_bls_key_finds_dpos_bft_index() {
+        let bls_a = aii_crypto::bls::SecretKey::from_ikm(&[0x46; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let bls_b = aii_crypto::bls::SecretKey::from_ikm(&[0x47; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let local = aii_types::BlsPubKey::new(bls_b.public_key().to_compressed());
+        let entries = vec![
+            ValidatorEntry {
+                address: Address::new([0xa1; 20]),
+                stake_wei: U256::from(1_000u64),
+                bls_pubkey: Some(aii_types::BlsPubKey::new(
+                    bls_a.public_key().to_compressed(),
+                )),
+                vrf_pubkey: None,
+            },
+            ValidatorEntry {
+                address: Address::new([0xb2; 20]),
+                stake_wei: U256::from(1_000u64),
+                bls_pubkey: Some(local),
+                vrf_pubkey: None,
+            },
+        ];
+
+        assert_eq!(bft_my_index_from_entries(&entries, &local), Some(1));
+    }
+
+    #[test]
+    fn stake_only_dpos_entries_do_not_convert_to_bft_validator_set() {
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xa1; 20]),
+            stake_wei: U256::from(1_000u64),
+            bls_pubkey: None,
+            vrf_pubkey: None,
+        }];
+
+        let err = bft_validator_set_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            err,
+            aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: 0,
+                kind: "bls",
+            }
+        );
+    }
+
+    fn test_bft_engine_from_keys(
+        bls: aii_crypto::bls::SecretKey,
+        vrf: aii_crypto::vrf::SecretKey,
+    ) -> aii_consensus_bft::BftEngine {
+        let validator_set =
+            aii_consensus_bft::ValidatorSet::new(vec![aii_consensus_bft::Validator {
+                bls_pubkey: bls.public_key(),
+                vrf_pubkey: vrf.public_key(),
+                stake: 1,
+            }])
+            .unwrap();
+        let cfg = aii_consensus_bft::BftConfig {
+            validator_set,
+            my_index: 0,
+            my_bls_sk: bls,
+            my_vrf_sk: vrf,
+            initial_seed: [0x55; 32],
+            coinbase: Address::new([0xc0; 20]),
+            gas_limit: 30_000_000,
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            slot_seconds: 3,
+            executor: None,
+        };
+        aii_consensus_bft::BftEngine::new(cfg, &fake_block(0, H256::ZERO))
+    }
+
+    #[test]
+    fn startup_dpos_rotation_turns_single_genesis_engine_into_multi_validator() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let local_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x48; 32], b"aii-dpos-to-bft")
+            .expect("local bls");
+        let local_vrf = aii_crypto::vrf::SecretKey::generate();
+        let remote_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x49; 32], b"aii-dpos-to-bft")
+            .expect("remote bls");
+        let remote_vrf = aii_crypto::vrf::SecretKey::generate();
+        let engine = test_bft_engine_from_keys(local_bls.clone(), local_vrf.clone());
+        assert!(engine.is_single_validator());
+
+        let entries = vec![
+            ValidatorEntry {
+                address: Address::new([0xa1; 20]),
+                stake_wei: U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+                bls_pubkey: Some(aii_types::BlsPubKey::new(
+                    local_bls.public_key().to_compressed(),
+                )),
+                vrf_pubkey: Some(aii_types::VrfPubKey::new(local_vrf.public_key().to_bytes())),
+            },
+            ValidatorEntry {
+                address: Address::new([0xb2; 20]),
+                stake_wei: U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+                bls_pubkey: Some(aii_types::BlsPubKey::new(
+                    remote_bls.public_key().to_compressed(),
+                )),
+                vrf_pubkey: Some(aii_types::VrfPubKey::new(
+                    remote_vrf.public_key().to_bytes(),
+                )),
+            },
+        ];
+        let backend = state.backend();
+        dpos::persist_validator_set(&backend, 3, &entries).unwrap();
+
+        let outcome = rotate_bft_engine_to_latest_dpos(&engine, &state).unwrap();
+
+        assert_eq!(
+            outcome,
+            BftDposRotation::Rotated {
+                epoch: 3,
+                validators: 2,
+                my_index: 0,
+            }
+        );
+        assert!(!engine.is_single_validator());
+        assert_eq!(engine.validator_set_size(), 2);
+    }
+
+    #[test]
+    fn startup_dpos_rotation_reports_missing_local_key() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let local_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x4a; 32], b"aii-dpos-to-bft")
+            .expect("local bls");
+        let local_vrf = aii_crypto::vrf::SecretKey::generate();
+        let remote_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x4b; 32], b"aii-dpos-to-bft")
+            .expect("remote bls");
+        let remote_vrf = aii_crypto::vrf::SecretKey::generate();
+        let engine = test_bft_engine_from_keys(local_bls, local_vrf);
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xb2; 20]),
+            stake_wei: U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+            bls_pubkey: Some(aii_types::BlsPubKey::new(
+                remote_bls.public_key().to_compressed(),
+            )),
+            vrf_pubkey: Some(aii_types::VrfPubKey::new(
+                remote_vrf.public_key().to_bytes(),
+            )),
+        }];
+        let backend = state.backend();
+        dpos::persist_validator_set(&backend, 9, &entries).unwrap();
+
+        let outcome = rotate_bft_engine_to_latest_dpos(&engine, &state).unwrap();
+
+        assert_eq!(
+            outcome,
+            BftDposRotation::LocalKeyMissing {
+                epoch: 9,
+                validators: 1,
+            }
+        );
+        assert!(engine.is_single_validator());
+    }
 
     #[tokio::test]
     async fn end_to_end_chain_id_query() {
@@ -3044,6 +3635,40 @@ mod tests {
     }
 
     #[test]
+    fn node_state_executor_returns_post_roots_without_mutating_live_state() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let live_before = state.state().state_root().unwrap();
+        let coinbase = Address::new([0xc0; 20]);
+        let executor = NodeStateExecutor::new(Arc::clone(&state));
+
+        let roots = aii_consensus_iface::BlockExecutor::execute_for_proposal(
+            &executor,
+            &BlockBody::default(),
+            coinbase,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.state().state_root().unwrap(),
+            live_before,
+            "proposal execution must not mutate live state",
+        );
+        let expected_backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let expected_state = Arc::new(StateDb::new(expected_backend));
+        credit_state_for_roots(
+            &expected_state,
+            &coinbase,
+            U256::from(2_000_000_000_000_000_000u128),
+        )
+        .unwrap();
+        assert_eq!(roots.state_root, expected_state.state_root().unwrap());
+        assert_eq!(roots.receipts_root, EMPTY_TRIE_HASH);
+        assert_eq!(roots.logs_bloom, [0u8; 256]);
+        assert_eq!(roots.gas_used, 0);
+    }
+
+    #[test]
     fn fork_at_same_height_records_evidence() {
         let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let mut canonical = fake_block(1, H256::ZERO);
@@ -3078,6 +3703,34 @@ mod tests {
         state.debit_slash_stake(&validator, U256::from(250u64));
         let rec = state.stake_table().get(&validator).unwrap().unwrap();
         assert_eq!(rec.amount_wei, U256::from(750u64));
+    }
+
+    #[test]
+    fn latest_validator_address_by_index_reads_dpos_epoch_set() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let first = Address::new([0xa1; 20]);
+        let second = Address::new([0xb2; 20]);
+        let entries = vec![
+            ValidatorEntry {
+                address: first,
+                stake_wei: U256::from(1_000u64),
+                bls_pubkey: None,
+                vrf_pubkey: None,
+            },
+            ValidatorEntry {
+                address: second,
+                stake_wei: U256::from(900u64),
+                bls_pubkey: None,
+                vrf_pubkey: None,
+            },
+        ];
+        dpos::persist_validator_set(&state.backend(), 7, &entries).unwrap();
+
+        assert_eq!(
+            state.latest_validator_address_by_index(1),
+            Some((7, second))
+        );
+        assert_eq!(state.latest_validator_address_by_index(2), None);
     }
 
     #[test]
@@ -3170,6 +3823,74 @@ mod tests {
         assert_eq!(
             acc.balance, expected,
             "block 1 must mint {expected} wei subsidy to beneficiary",
+        );
+    }
+
+    #[test]
+    fn elected_beneficiary_receives_subsidy_after_dpos_election() {
+        let mut spec = ChainSpec::mainnet();
+        spec.epoch_length_blocks = 2;
+        spec.min_validator_stake_wei = 1;
+        spec.validators_per_epoch = 1;
+        let backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let state = NodeState::new(spec, backend);
+
+        let elected = Address::new([0xe1; 20]);
+        state
+            .stake_table()
+            .bond(&elected, U256::from(1_000u64))
+            .unwrap();
+
+        let b1 = fake_block(1, H256::ZERO);
+        let b2 = fake_block(2, b1.hash());
+        state.commit_block(&b1);
+        state.commit_block(&b2);
+        assert!(
+            state.async_active_validator_set_test_helper().is_some(),
+            "block 2 must establish the DPoS reward-eligible set",
+        );
+
+        let mut b3 = fake_block(3, b2.hash());
+        b3.header.beneficiary = elected;
+        state.commit_block(&b3);
+
+        let acc = state.state().account(&elected).unwrap().unwrap();
+        assert_eq!(
+            acc.balance,
+            U256::from(2_000_000_000_000_000_000u128),
+            "elected staker must receive the block subsidy",
+        );
+    }
+
+    #[test]
+    fn non_elected_beneficiary_gets_no_subsidy_after_dpos_election() {
+        let mut spec = ChainSpec::mainnet();
+        spec.epoch_length_blocks = 2;
+        spec.min_validator_stake_wei = 1;
+        spec.validators_per_epoch = 1;
+        let backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let state = NodeState::new(spec, backend);
+
+        let elected = Address::new([0xe1; 20]);
+        let outsider = Address::new([0xdd; 20]);
+        state
+            .stake_table()
+            .bond(&elected, U256::from(1_000u64))
+            .unwrap();
+
+        let b1 = fake_block(1, H256::ZERO);
+        let b2 = fake_block(2, b1.hash());
+        state.commit_block(&b1);
+        state.commit_block(&b2);
+
+        let mut b3 = fake_block(3, b2.hash());
+        b3.header.beneficiary = outsider;
+        state.commit_block(&b3);
+
+        let maybe_acc = state.state().account(&outsider).unwrap();
+        assert!(
+            maybe_acc.is_none_or(|acc| acc.balance.is_zero()),
+            "non-elected beneficiary must not receive the subsidy",
         );
     }
 

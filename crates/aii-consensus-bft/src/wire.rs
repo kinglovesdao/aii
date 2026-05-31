@@ -46,7 +46,7 @@ use aii_crypto::vrf::VrfProof;
 use aii_types::{Address, H256};
 use thiserror::Error;
 
-use crate::bft::{LeaderProof, PrecommitVote, PrevoteVote};
+use crate::bft::{LeaderProof, PrecommitCertificate, PrecommitVote, PrevoteVote};
 
 /// Tag byte for [`BftMessage::Proposal`].
 pub const TAG_PROPOSAL: u8 = 0x00;
@@ -54,6 +54,22 @@ pub const TAG_PROPOSAL: u8 = 0x00;
 pub const TAG_PREVOTE: u8 = 0x01;
 /// Tag byte for [`BftMessage::Precommit`].
 pub const TAG_PRECOMMIT: u8 = 0x02;
+/// Tag byte for [`BftMessage::BlockRequest`] (v0.0.93 block-sync).
+pub const TAG_BLOCK_REQUEST: u8 = 0x03;
+/// Tag byte for [`BftMessage::BlockResponse`] (v0.0.93 block-sync).
+pub const TAG_BLOCK_RESPONSE: u8 = 0x04;
+
+/// Encoded size of a [`BftMessage::BlockRequest`] — `tag ‖ height_be8`.
+pub const BLOCK_REQUEST_LEN: usize = 1 + 8;
+/// Fixed-prefix size of a [`BftMessage::BlockResponse`] — `tag ‖ len_be4`.
+pub const BLOCK_RESPONSE_HEADER_LEN: usize = 1 + 4;
+/// Minimum encoded size of a [`BftMessage::BlockResponse`] (empty body cap).
+pub const BLOCK_RESPONSE_MIN_LEN: usize = BLOCK_RESPONSE_HEADER_LEN + BLOCK_CERT_LEN;
+/// Fixed encoded size of a [`PrecommitCertificate`] inside `BlockResponse`.
+pub const BLOCK_CERT_LEN: usize = 32 + 8 + 4 + 16 + 96;
+/// Hard cap on the RLP block bytes carried in a `BlockResponse`. Shares
+/// the proposal-body ceiling — a full block is body + a small header.
+pub const MAX_BLOCK_RESPONSE_LEN: usize = MAX_PROPOSAL_BODY_LEN + 64 * 1024;
 
 /// Fixed-prefix size of a `Proposal` message — tag + height + round +
 /// block_hash + leader proof + coinbase. Constant across releases.
@@ -103,6 +119,30 @@ pub enum BftMessage {
     Prevote(PrevoteVote),
     /// One validator's PRE-COMMIT.
     Precommit(PrecommitVote),
+    /// v0.0.93 block-sync: "send me the committed block at `height`".
+    ///
+    /// Broadcast by a validator that has fallen behind (its head is
+    /// below a height it sees peers voting/proposing at). Any peer
+    /// whose recent-block cache holds that height answers with a
+    /// [`BftMessage::BlockResponse`]. This closes the "restart →
+    /// 1 block behind → can never catch up over gossip → stall" hole:
+    /// before v0.0.93 gossip carried only current-round messages and a
+    /// lagging validator could only recover via an HTTP `--bootnode`
+    /// cold-sync.
+    BlockRequest {
+        /// Committed height the requester wants.
+        height: u64,
+    },
+    /// v0.0.93 block-sync: a committed block, in answer to a
+    /// [`BftMessage::BlockRequest`]. `block_bytes` is the RLP encoding
+    /// of [`aii_block::Block`]. The certificate must verify against the
+    /// current validator set before the requester may adopt the block.
+    BlockResponse {
+        /// RLP-encoded committed [`aii_block::Block`].
+        block_bytes: Vec<u8>,
+        /// 2/3+ stake BFT finality proof for `block_bytes`.
+        certificate: PrecommitCertificate,
+    },
 }
 
 impl BftMessage {
@@ -113,6 +153,8 @@ impl BftMessage {
             Self::Proposal { .. } => TAG_PROPOSAL,
             Self::Prevote(_) => TAG_PREVOTE,
             Self::Precommit(_) => TAG_PRECOMMIT,
+            Self::BlockRequest { .. } => TAG_BLOCK_REQUEST,
+            Self::BlockResponse { .. } => TAG_BLOCK_RESPONSE,
         }
     }
 
@@ -123,6 +165,10 @@ impl BftMessage {
         match self {
             Self::Proposal { body_bytes, .. } => PROPOSAL_MIN_LEN + body_bytes.len(),
             Self::Prevote(_) | Self::Precommit(_) => VOTE_LEN,
+            Self::BlockRequest { .. } => BLOCK_REQUEST_LEN,
+            Self::BlockResponse { block_bytes, .. } => {
+                BLOCK_RESPONSE_HEADER_LEN + block_bytes.len() + BLOCK_CERT_LEN
+            }
         }
     }
 
@@ -166,6 +212,20 @@ impl BftMessage {
                 encode_vote_body(&mut buf, v.block_hash, v.height, v.round, v.validator_index);
                 buf.extend_from_slice(&v.bls_sig.to_compressed());
             }
+            Self::BlockRequest { height } => {
+                buf.push(TAG_BLOCK_REQUEST);
+                buf.extend_from_slice(&height.to_be_bytes());
+            }
+            Self::BlockResponse {
+                block_bytes,
+                certificate,
+            } => {
+                buf.push(TAG_BLOCK_RESPONSE);
+                let len = u32::try_from(block_bytes.len()).unwrap_or(u32::MAX);
+                buf.extend_from_slice(&len.to_be_bytes());
+                buf.extend_from_slice(block_bytes);
+                encode_precommit_certificate(&mut buf, certificate);
+            }
         }
         buf
     }
@@ -179,6 +239,8 @@ impl BftMessage {
             TAG_PROPOSAL => decode_proposal(bytes),
             TAG_PREVOTE => decode_vote(bytes, TAG_PREVOTE),
             TAG_PRECOMMIT => decode_vote(bytes, TAG_PRECOMMIT),
+            TAG_BLOCK_REQUEST => decode_block_request(bytes),
+            TAG_BLOCK_RESPONSE => decode_block_response(bytes),
             other => Err(CodecError::UnknownTag(other)),
         }
     }
@@ -288,6 +350,78 @@ fn decode_vote(bytes: &[u8], tag: u8) -> Result<BftMessage, CodecError> {
     }
 }
 
+fn decode_block_request(bytes: &[u8]) -> Result<BftMessage, CodecError> {
+    if bytes.len() != BLOCK_REQUEST_LEN {
+        return Err(CodecError::WrongLength {
+            expected: BLOCK_REQUEST_LEN,
+            got: bytes.len(),
+        });
+    }
+    let height = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
+    Ok(BftMessage::BlockRequest { height })
+}
+
+fn decode_block_response(bytes: &[u8]) -> Result<BftMessage, CodecError> {
+    if bytes.len() < BLOCK_RESPONSE_MIN_LEN {
+        return Err(CodecError::WrongLength {
+            expected: BLOCK_RESPONSE_MIN_LEN,
+            got: bytes.len(),
+        });
+    }
+    let len = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+    if len > MAX_BLOCK_RESPONSE_LEN {
+        return Err(CodecError::BlockResponseTooLarge {
+            max: MAX_BLOCK_RESPONSE_LEN,
+            got: len,
+        });
+    }
+    let expected_total = BLOCK_RESPONSE_HEADER_LEN + len + BLOCK_CERT_LEN;
+    if bytes.len() != expected_total {
+        return Err(CodecError::WrongLength {
+            expected: expected_total,
+            got: bytes.len(),
+        });
+    }
+    let block_bytes = bytes[BLOCK_RESPONSE_HEADER_LEN..BLOCK_RESPONSE_HEADER_LEN + len].to_vec();
+    let cert_start = BLOCK_RESPONSE_HEADER_LEN + len;
+    let certificate = decode_precommit_certificate(&bytes[cert_start..])?;
+    Ok(BftMessage::BlockResponse {
+        block_bytes,
+        certificate,
+    })
+}
+
+fn encode_precommit_certificate(buf: &mut Vec<u8>, cert: &PrecommitCertificate) {
+    buf.extend_from_slice(cert.block_hash.as_bytes());
+    buf.extend_from_slice(&cert.height.to_be_bytes());
+    buf.extend_from_slice(&cert.round.to_be_bytes());
+    buf.extend_from_slice(&cert.signer_bitmap.to_be_bytes());
+    buf.extend_from_slice(&cert.aggregated_sig.to_compressed());
+}
+
+fn decode_precommit_certificate(bytes: &[u8]) -> Result<PrecommitCertificate, CodecError> {
+    if bytes.len() != BLOCK_CERT_LEN {
+        return Err(CodecError::WrongLength {
+            expected: BLOCK_CERT_LEN,
+            got: bytes.len(),
+        });
+    }
+    let block_hash = H256::new(bytes[0..32].try_into().unwrap());
+    let height = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
+    let round = u32::from_be_bytes(bytes[40..44].try_into().unwrap());
+    let signer_bitmap = u128::from_be_bytes(bytes[44..60].try_into().unwrap());
+    let sig_bytes: [u8; 96] = bytes[60..156].try_into().unwrap();
+    let aggregated_sig =
+        bls::Signature::from_compressed(&sig_bytes).map_err(|_| CodecError::InvalidBlsSignature)?;
+    Ok(PrecommitCertificate {
+        block_hash,
+        height,
+        round,
+        signer_bitmap,
+        aggregated_sig,
+    })
+}
+
 /// Errors produced by [`BftMessage::decode`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CodecError {
@@ -323,6 +457,15 @@ pub enum CodecError {
         /// Length the encoded body claimed.
         got: usize,
     },
+
+    /// `BlockResponse` block bytes would exceed [`MAX_BLOCK_RESPONSE_LEN`].
+    #[error("BFT block response too large: max {max}, got {got}")]
+    BlockResponseTooLarge {
+        /// Maximum bytes accepted (== [`MAX_BLOCK_RESPONSE_LEN`]).
+        max: usize,
+        /// Length the encoded block claimed.
+        got: usize,
+    },
 }
 
 #[cfg(test)]
@@ -347,6 +490,17 @@ mod tests {
     fn sample_precommit() -> PrecommitVote {
         let sk = bls_sk(2);
         PrecommitVote::sign(&sk, H256::new([0xcd; 32]), 7, 3, 1)
+    }
+
+    fn sample_certificate() -> PrecommitCertificate {
+        let vote = sample_precommit();
+        PrecommitCertificate {
+            block_hash: vote.block_hash,
+            height: vote.height,
+            round: vote.round,
+            signer_bitmap: 1u128 << vote.validator_index,
+            aggregated_sig: vote.bls_sig,
+        }
     }
 
     fn sample_proposal() -> BftMessage {
@@ -535,6 +689,159 @@ mod tests {
         assert_eq!(out.round, v.round);
         assert_eq!(out.validator_index, v.validator_index);
         assert_eq!(out.bls_sig.to_compressed(), v.bls_sig.to_compressed());
+    }
+
+    #[test]
+    fn block_request_round_trips() {
+        let m = BftMessage::BlockRequest { height: 359_215 };
+        assert_eq!(m.tag(), TAG_BLOCK_REQUEST);
+        assert_eq!(m.encoded_len(), BLOCK_REQUEST_LEN);
+        let bytes = m.encode();
+        assert_eq!(bytes.len(), BLOCK_REQUEST_LEN);
+        assert_eq!(bytes[0], TAG_BLOCK_REQUEST);
+        let BftMessage::BlockRequest { height } = BftMessage::decode(&bytes).unwrap() else {
+            panic!("variant mismatch");
+        };
+        assert_eq!(height, 359_215);
+    }
+
+    #[test]
+    fn block_response_round_trips() {
+        let block_bytes: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+        let certificate = sample_certificate();
+        let m = BftMessage::BlockResponse {
+            block_bytes: block_bytes.clone(),
+            certificate: certificate.clone(),
+        };
+        assert_eq!(m.tag(), TAG_BLOCK_RESPONSE);
+        assert_eq!(
+            m.encoded_len(),
+            BLOCK_RESPONSE_HEADER_LEN + block_bytes.len() + BLOCK_CERT_LEN,
+        );
+        let bytes = m.encode();
+        assert_eq!(bytes[0], TAG_BLOCK_RESPONSE);
+        let BftMessage::BlockResponse {
+            block_bytes: out,
+            certificate: out_cert,
+        } = BftMessage::decode(&bytes).unwrap()
+        else {
+            panic!("variant mismatch");
+        };
+        assert_eq!(out, block_bytes);
+        assert_eq!(out_cert.block_hash, certificate.block_hash);
+        assert_eq!(out_cert.height, certificate.height);
+        assert_eq!(out_cert.round, certificate.round);
+        assert_eq!(out_cert.signer_bitmap, certificate.signer_bitmap);
+        assert_eq!(
+            out_cert.aggregated_sig.to_compressed(),
+            certificate.aggregated_sig.to_compressed(),
+        );
+    }
+
+    #[test]
+    fn block_request_wrong_length_rejected() {
+        let mut bytes = BftMessage::BlockRequest { height: 1 }.encode();
+        bytes.pop();
+        assert_eq!(
+            BftMessage::decode(&bytes).unwrap_err(),
+            CodecError::WrongLength {
+                expected: BLOCK_REQUEST_LEN,
+                got: BLOCK_REQUEST_LEN - 1,
+            },
+        );
+    }
+
+    #[test]
+    fn block_response_length_mismatch_rejected() {
+        let mut bytes = BftMessage::BlockResponse {
+            block_bytes: vec![0u8; 16],
+            certificate: sample_certificate(),
+        }
+        .encode();
+        let total = bytes.len();
+        bytes.pop();
+        assert_eq!(
+            BftMessage::decode(&bytes).unwrap_err(),
+            CodecError::WrongLength {
+                expected: total,
+                got: total - 1,
+            },
+        );
+    }
+
+    #[test]
+    fn block_response_oversized_rejected() {
+        let mut bytes = BftMessage::BlockResponse {
+            block_bytes: vec![0u8; 8],
+            certificate: sample_certificate(),
+        }
+        .encode();
+        let claimed = u32::try_from(MAX_BLOCK_RESPONSE_LEN + 1).unwrap();
+        bytes[1..5].copy_from_slice(&claimed.to_be_bytes());
+        assert_eq!(
+            BftMessage::decode(&bytes).unwrap_err(),
+            CodecError::BlockResponseTooLarge {
+                max: MAX_BLOCK_RESPONSE_LEN,
+                got: MAX_BLOCK_RESPONSE_LEN + 1,
+            },
+        );
+    }
+
+    #[test]
+    fn real_block_response_round_trips_through_rlp() {
+        use aii_block::{Block, BlockBody};
+        use alloy_rlp::{Decodable, Encodable};
+        // Build a minimal real block, RLP-encode it, ship it in a
+        // BlockResponse, decode the message, RLP-decode back to a Block.
+        let block = sample_block_for_sync();
+        let mut rlp = Vec::new();
+        block.encode(&mut rlp);
+        let msg = BftMessage::BlockResponse {
+            block_bytes: rlp.clone(),
+            certificate: sample_certificate(),
+        };
+        let wire = msg.encode();
+        let BftMessage::BlockResponse { block_bytes, .. } = BftMessage::decode(&wire).unwrap()
+        else {
+            panic!("variant mismatch");
+        };
+        let mut s: &[u8] = &block_bytes;
+        let decoded = Block::decode(&mut s).unwrap();
+        assert_eq!(decoded, block);
+        let _ = BlockBody::default(); // keep import used if block has empty body
+    }
+
+    fn sample_block_for_sync() -> aii_block::Block {
+        use aii_block::{
+            consts::{EMPTY_LIST_HASH, EMPTY_TRIE_HASH},
+            Block, BlockBody, Bloom, Header,
+        };
+        use aii_types::{Address, U256};
+        Block {
+            header: Header {
+                parent_hash: H256::new([0x11; 32]),
+                ommers_hash: EMPTY_LIST_HASH,
+                beneficiary: Address::new([0x22; 20]),
+                state_root: EMPTY_TRIE_HASH,
+                transactions_root: EMPTY_TRIE_HASH,
+                receipts_root: EMPTY_TRIE_HASH,
+                logs_bloom: Bloom::ZERO,
+                difficulty: U256::from(0u64),
+                number: 359_215,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_000,
+                extra_data: vec![],
+                mix_hash: H256::new([0x33; 32]),
+                nonce: [0u8; 8],
+                base_fee_per_gas: U256::from(1_000_000_000u64),
+                withdrawals_root: EMPTY_TRIE_HASH,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                parent_beacon_block_root: None,
+            },
+            body: BlockBody::default(),
+        }
     }
 
     #[test]
