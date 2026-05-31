@@ -19,6 +19,7 @@
 #![warn(missing_docs)]
 
 pub mod bft;
+pub mod capacity;
 pub mod coordinator;
 pub mod engine;
 pub mod gossip;
@@ -28,6 +29,10 @@ pub use bft::{
     LeaderProof, Phase, PolcCertificate, PrecommitCertificate, PrecommitTallier, PrecommitVote,
     PrevoteTallier, PrevoteVote, TallyState, Validator, ValidatorSet, MAX_VALIDATORS,
     PRECOMMIT_DOMAIN, PREVOTE_DOMAIN,
+};
+pub use capacity::{
+    capacity_budget, equal_stake_quorum_votes, max_wire_proposal_bytes, vote_messages_per_round,
+    CapacityBudget, CapacityError, FINALITY_TARGET_SECS, VOTE_PHASES_PER_ROUND,
 };
 pub use coordinator::RoundCoordinator;
 pub use engine::{AdvanceOutput, BftConfig, BftEngine, PLACEHOLDER_TX_GAS};
@@ -296,6 +301,12 @@ pub enum BftError {
     /// debugging a misbehaving peer.
     #[error("invalid proposal body: {0}")]
     InvalidProposalBody(String),
+
+    /// Validator-set rotation was attempted while a round is in flight.
+    /// The host must wait until the current height is committed/harvested
+    /// so old-set votes cannot be mixed with new-set votes.
+    #[error("cannot rotate validator set while a round is active")]
+    ActiveRoundInProgress,
 }
 
 #[cfg(test)]

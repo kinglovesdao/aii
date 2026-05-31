@@ -18,6 +18,9 @@ DATA_DIR="${DATA_DIR:-/usr/local/var/aiid}"
 LOG_FILE="${LOG_FILE:-/usr/local/var/log/aiid.log}"
 PLIST="/Library/LaunchDaemons/org.aii.aiid.plist"
 BOOTNODE="${BOOTNODE:-http://8.211.135.234:8545}"
+DISCOVERY_SEEDS="${DISCOVERY_SEEDS:-8.211.135.234:30310,106.14.223.128:30310}"
+DISCOVERY_ADVERTISE="${DISCOVERY_ADVERTISE:-}"
+BFT_ADVERTISE="${BFT_ADVERTISE:-}"
 SRC_REPO="https://github.com/kinglovesdao/aii.git"
 MODE="${1:-validator}"
 
@@ -59,7 +62,14 @@ if [[ "$MODE" != "--observer" && ! -f "$DATA_DIR/keystore.json" ]]; then
 fi
 
 ARGS_OBS="--data-dir $DATA_DIR/data --rpc 0.0.0.0:8545 --testnet --bootnode $BOOTNODE"
-ARGS_VAL="$ARGS_OBS --bft --genesis $DATA_DIR/genesis.json --keystore $DATA_DIR/keystore.json --bft-listen 0.0.0.0:30311 --peers 8.211.135.234:30311,106.14.223.128:30311"
+ADVERTISE_ARGS=""
+if [[ -n "$DISCOVERY_ADVERTISE" ]]; then
+  ADVERTISE_ARGS="$ADVERTISE_ARGS --discovery-advertise $DISCOVERY_ADVERTISE"
+fi
+if [[ -n "$BFT_ADVERTISE" ]]; then
+  ADVERTISE_ARGS="$ADVERTISE_ARGS --bft-advertise $BFT_ADVERTISE"
+fi
+ARGS_VAL="$ARGS_OBS --bft --genesis $DATA_DIR/genesis.json --keystore $DATA_DIR/keystore.json --bft-listen 0.0.0.0:30311$ADVERTISE_ARGS --peers 8.211.135.234:30311,106.14.223.128:30311"
 ARGS="$ARGS_VAL"
 [[ "$MODE" == "--observer" ]] && ARGS="$ARGS_OBS"
 
@@ -77,6 +87,10 @@ sudo tee "$PLIST" >/dev/null <<PLIST_EOF
 <plist version="1.0">
 <dict>
     <key>Label</key>            <string>org.aii.aiid</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AII_DISCOVERY_SEEDS</key><string>$DISCOVERY_SEEDS</string>
+    </dict>
     <key>ProgramArguments</key> <array>$PROG_ARGS_XML</array>
     <key>RunAtLoad</key>        <true/>
     <key>KeepAlive</key>        <true/>

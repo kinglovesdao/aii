@@ -37,7 +37,7 @@ use aii_block::tx::Tx;
 use aii_block::{Block, BlockBody, Bloom, Hashable, Header, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
 use aii_consensus_iface::{ConsensusError, Engine, EngineProgress};
 use aii_crypto::{bls, vrf};
-use aii_types::{Address, H256, U256};
+use aii_types::{Address, BlsPubKey, H256, U256};
 
 /// Gas cost charged per included tx in the v0.0.37 placeholder
 /// pipeline (no actual EVM execution — every tx is treated as a
@@ -164,6 +164,8 @@ pub struct BftEngine {
 }
 
 struct BftEngineState {
+    validator_set: ValidatorSet,
+    my_index: u32,
     head_hash: H256,
     head_number: u64,
     head_timestamp: u64,
@@ -183,12 +185,69 @@ struct BftEngineState {
     detector: crate::slashing::EquivocationDetector,
     /// Evidence not yet drained by the host.
     pending_evidence: Vec<crate::slashing::EquivocationEvidence>,
+    /// v0.0.72: prevotes that arrived too early to be tallied — e.g.
+    /// before any coordinator exists, or before the proposal has
+    /// transitioned the coordinator into [`crate::bft::Phase::Prevoting`].
+    /// Drained by [`BftEngine::drain_pending_votes`] after every state
+    /// mutation that could unblock them.
+    pending_prevotes: Vec<PrevoteVote>,
+    /// v0.0.72: precommits that arrived too early. Same pattern as
+    /// [`Self::pending_prevotes`] but for the precommit phase. The
+    /// proposer in a fast leader frequently has its precommit reach
+    /// remote validators before they themselves have tallied enough
+    /// prevotes to transition phase — without this buffer the
+    /// precommit would be rejected with `WrongPhase` and the round
+    /// would stall.
+    pending_precommits: Vec<PrecommitVote>,
+    /// v0.0.93 block-sync: a bounded cache of the most recently
+    /// committed full blocks and their BFT finality certificates, keyed
+    /// by height. Populated on every harvest (and on adopt of a
+    /// peer-supplied certified block) so this node can answer a peer's
+    /// [`crate::wire::BftMessage::BlockRequest`] without reaching back
+    /// into host storage. Capped at [`RECENT_BLOCKS_CAP`] entries — the
+    /// oldest are evicted.
+    recent_blocks: std::collections::BTreeMap<u64, RecentCommittedBlock>,
+}
+
+#[derive(Clone)]
+struct RecentCommittedBlock {
+    block: Block,
+    certificate: PrecommitCertificate,
+}
+
+/// Number of recently-committed blocks the engine keeps cached to
+/// serve [`crate::wire::BftMessage::BlockRequest`].
+///
+/// Small: a lagging validator is typically only 1–2 blocks behind (it
+/// restarted), and anything further behind should HTTP cold-sync via
+/// `--bootnode`.
+pub const RECENT_BLOCKS_CAP: usize = 64;
+
+fn cache_recent_block(
+    map: &mut std::collections::BTreeMap<u64, RecentCommittedBlock>,
+    block: Block,
+    certificate: PrecommitCertificate,
+) {
+    map.insert(
+        block.header.number,
+        RecentCommittedBlock { block, certificate },
+    );
+    while map.len() > RECENT_BLOCKS_CAP {
+        // Evict the lowest height.
+        if let Some((&oldest, _)) = map.iter().next() {
+            map.remove(&oldest);
+        } else {
+            break;
+        }
+    }
 }
 
 impl BftEngine {
     /// Construct from config + genesis block.
     pub fn new(config: BftConfig, genesis: &Block) -> Self {
         let state = BftEngineState {
+            validator_set: config.validator_set.clone(),
+            my_index: config.my_index,
             head_hash: genesis.hash(),
             head_number: genesis.header.number,
             head_timestamp: genesis.header.timestamp,
@@ -197,6 +256,57 @@ impl BftEngine {
             proposal: None,
             detector: crate::slashing::EquivocationDetector::new(),
             pending_evidence: Vec::new(),
+            pending_prevotes: Vec::new(),
+            pending_precommits: Vec::new(),
+            recent_blocks: std::collections::BTreeMap::new(),
+        };
+        Self {
+            config,
+            state: Arc::new(Mutex::new(state)),
+            pending_txs: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Resume from a recovered chain head (v0.0.70).
+    ///
+    /// Use this when the node is restarting and has read the
+    /// last-committed block out of persistent storage. The engine
+    /// continues at `head.number + 1` round 0 rather than restarting
+    /// from genesis.
+    ///
+    /// The seed for the next leader election is derived from the
+    /// recovered block's `mix_hash` (which the producer set to the
+    /// proposing validator's VRF output, per the v0.0.34+ wire
+    /// format). For `head.number == 0` (genesis recovery), the seed
+    /// falls back to `config.initial_seed` — matching [`Self::new`].
+    ///
+    /// In-memory round / locked / vote state is NOT persisted yet —
+    /// after a single-validator restart the BFT engine still needs
+    /// ~⅔-stake worth of peers to be co-restarting before liveness
+    /// resumes. That fix is task v0.0.71-A. v0.0.70 only restores
+    /// chain CONTINUITY (head height) on restart, not BFT
+    /// in-flight state.
+    #[must_use]
+    pub fn from_recovered(config: BftConfig, head: &Block) -> Self {
+        let seed = if head.header.number == 0 {
+            config.initial_seed
+        } else {
+            *head.header.mix_hash.as_bytes()
+        };
+        let state = BftEngineState {
+            validator_set: config.validator_set.clone(),
+            my_index: config.my_index,
+            head_hash: head.hash(),
+            head_number: head.header.number,
+            head_timestamp: head.header.timestamp,
+            seed,
+            coordinator: None,
+            proposal: None,
+            detector: crate::slashing::EquivocationDetector::new(),
+            pending_evidence: Vec::new(),
+            pending_prevotes: Vec::new(),
+            pending_precommits: Vec::new(),
+            recent_blocks: std::collections::BTreeMap::new(),
         };
         Self {
             config,
@@ -242,7 +352,7 @@ impl BftEngine {
     /// `true` iff this engine is configured with a single-validator set.
     #[must_use]
     pub fn is_single_validator(&self) -> bool {
-        self.config.validator_set.size() == 1
+        self.state.lock().validator_set.size() == 1
     }
 
     /// This node's coinbase — i.e. the address that becomes the
@@ -255,6 +365,13 @@ impl BftEngine {
         self.config.coinbase
     }
 
+    /// This node's BLS public key in the 48-byte wire form used by
+    /// genesis and keyed DPoS validator-set records.
+    #[must_use]
+    pub fn my_bls_pubkey(&self) -> BlsPubKey {
+        BlsPubKey::new(self.config.my_bls_sk.public_key().to_compressed())
+    }
+
     /// Current `(height, round, Phase)` if a coordinator is active.
     #[must_use]
     pub fn current_round_state(&self) -> Option<(u64, u32, crate::bft::Phase)> {
@@ -262,6 +379,50 @@ impl BftEngine {
         g.coordinator
             .as_ref()
             .map(|c| (c.height(), c.round(), c.phase()))
+    }
+
+    /// Force-advance the coordinator for the next-to-commit height to
+    /// `target_round` (v0.0.71).
+    ///
+    /// Use this on startup after [`Self::from_recovered`] when the
+    /// host has loaded a persisted `{height, round}` snapshot — the
+    /// engine creates a fresh coordinator at the recovered height
+    /// then calls [`crate::coordinator::RoundCoordinator::fire_timeout`]
+    /// `target_round` times so the local round matches what the rest
+    /// of the validator set is on. Without this, a restarted
+    /// validator would come up at round 0 while live peers are at
+    /// round R, and their votes would not combine into a quorum
+    /// until the local engine itself had timed out R times — a
+    /// ~5..30 s liveness hole per restart.
+    ///
+    /// No-op when `target_round == 0`. Idempotent: calling twice for
+    /// the same height + round is observationally identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BftError::WrongHeight`] only when the coordinator is
+    /// already initialized for a different height — i.e. the caller
+    /// attempted to fast-forward after a vote has already arrived
+    /// for this round. The typical startup-time call site cannot hit
+    /// this branch because no votes have been ingested yet.
+    pub fn fast_forward_to_round(&self, target_round: u32) -> Result<(), BftError> {
+        let mut g = self.state.lock();
+        let next_height = g.head_number + 1;
+        // Drop any prior coordinator for an old height (defensive — the
+        // engine resets coordinator to None on commit, so this only
+        // matters if the host called this method twice without an
+        // intervening commit).
+        if let Some(existing) = g.coordinator.as_ref() {
+            if existing.height() != next_height {
+                return Err(BftError::WrongHeight);
+            }
+        }
+        let mut coord = RoundCoordinator::new(next_height, g.seed, g.validator_set.clone());
+        for _ in 0..target_round {
+            coord.fire_timeout();
+        }
+        g.coordinator = Some(coord);
+        Ok(())
     }
 
     /// Leader index for the active round (if any).
@@ -273,8 +434,8 @@ impl BftEngine {
 
     /// This node's index inside its `validator_set`.
     #[must_use]
-    pub const fn my_index(&self) -> usize {
-        self.config.my_index as usize
+    pub fn my_index(&self) -> usize {
+        self.state.lock().my_index as usize
     }
 
     /// `true` iff this node would be the elected leader for the
@@ -285,14 +446,47 @@ impl BftEngine {
     pub fn would_be_leader_next_height(&self) -> bool {
         let g = self.state.lock();
         let next_h = g.head_number.saturating_add(1);
-        let leader = self.config.validator_set.select_leader(next_h, 0, &g.seed);
-        leader == self.config.my_index as usize
+        let leader = g.validator_set.select_leader(next_h, 0, &g.seed);
+        leader == g.my_index as usize
     }
 
     /// Validator-set size in force.
     #[must_use]
     pub fn validator_set_size(&self) -> usize {
-        self.config.validator_set.size()
+        self.state.lock().validator_set.size()
+    }
+
+    /// Replace the active validator set at a safe epoch boundary.
+    ///
+    /// Rotation is only accepted when no coordinator/proposal is active,
+    /// which is the post-harvest boundary after a height commits. That
+    /// keeps votes collected under the old set from being interpreted
+    /// under a new set.
+    ///
+    /// # Errors
+    /// Returns [`BftError::ActiveRoundInProgress`] if a round is in
+    /// flight, or [`BftError::ValidatorIndexOutOfBounds`] if `my_index`
+    /// is not a member of `validator_set`.
+    pub fn rotate_validator_set(
+        &self,
+        validator_set: ValidatorSet,
+        my_index: u32,
+    ) -> Result<(), BftError> {
+        if (my_index as usize) >= validator_set.size() {
+            return Err(BftError::ValidatorIndexOutOfBounds {
+                index: my_index,
+                size: validator_set.size(),
+            });
+        }
+        let mut g = self.state.lock();
+        if g.coordinator.is_some() || g.proposal.is_some() {
+            return Err(BftError::ActiveRoundInProgress);
+        }
+        g.pending_prevotes.clear();
+        g.pending_precommits.clear();
+        g.validator_set = validator_set;
+        g.my_index = my_index;
+        Ok(())
     }
 
     /// Reconstruct an empty-body block under this engine's own coinbase
@@ -362,6 +556,7 @@ impl BftEngine {
             return None;
         }
         let (block, proof) = g.proposal.clone()?;
+        let certificate = g.coordinator.as_ref()?.certificate().cloned()?;
         let block_hash = block.hash();
         g.head_hash = block_hash;
         g.head_number = block.header.number;
@@ -369,7 +564,78 @@ impl BftEngine {
         g.seed = proof.vrf_output;
         g.coordinator = None;
         g.proposal = None;
+        // v0.0.93: cache the committed block and certificate so peers
+        // that fell behind can fetch verified finality over gossip.
+        cache_recent_block(&mut g.recent_blocks, block.clone(), certificate);
         Some(block)
+    }
+
+    /// Current committed head height. (v0.0.93 block-sync helper.)
+    #[must_use]
+    pub fn head_number(&self) -> u64 {
+        self.state.lock().head_number
+    }
+
+    /// v0.0.93 block-sync: return the committed block and finality
+    /// certificate cached at `height`, if this engine has it. Used to
+    /// answer a peer's [`crate::wire::BftMessage::BlockRequest`].
+    /// Returns `None` when the height is outside the recent-block cache
+    /// window.
+    #[must_use]
+    pub fn committed_block_at(&self, height: u64) -> Option<(Block, PrecommitCertificate)> {
+        let g = self.state.lock();
+        g.recent_blocks
+            .get(&height)
+            .map(|entry| (entry.block.clone(), entry.certificate.clone()))
+    }
+
+    /// v0.0.93 block-sync: adopt a peer-supplied committed `block` as
+    /// the new head, but ONLY when it extends the current head by
+    /// exactly one (`block.number == head+1` and
+    /// `block.parent_hash == head_hash`) AND carries a BFT precommit
+    /// certificate that verifies against the current validator set. This
+    /// is the catch-up path for a validator that fell one block behind
+    /// (e.g. after a restart): it lets the engine advance its head — and
+    /// roll the leader seed forward from the block's `mix_hash` (the
+    /// proposer's VRF output, per the v0.0.34+ header convention) — so
+    /// it can rejoin the current round instead of stalling the whole set.
+    ///
+    /// Any in-flight coordinator/proposal for the now-superseded height
+    /// is cleared. Returns the adopted block on success.
+    ///
+    /// # Errors
+    /// - [`BftError::WrongHeight`] if `block.number != head+1` or the
+    ///   certificate height differs from the block height.
+    /// - [`BftError::ProposalHashMismatch`] if `block.parent_hash`
+    ///   does not match the current head hash or the certificate targets
+    ///   a different block hash.
+    /// - [`BftError::InvalidBlsSignature`] if the certificate does not
+    ///   verify against the current validator set.
+    pub fn adopt_synced_block(
+        &self,
+        block: Block,
+        certificate: PrecommitCertificate,
+    ) -> Result<Block, BftError> {
+        let mut g = self.state.lock();
+        let block_hash = block.hash();
+        if block.header.number != g.head_number + 1 || certificate.height != block.header.number {
+            return Err(BftError::WrongHeight);
+        }
+        if block.header.parent_hash != g.head_hash || certificate.block_hash != block_hash {
+            return Err(BftError::ProposalHashMismatch);
+        }
+        certificate.verify(&g.validator_set)?;
+        g.head_hash = block_hash;
+        g.head_number = block.header.number;
+        g.head_timestamp = block.header.timestamp;
+        g.seed = *block.header.mix_hash.as_bytes();
+        // The block we were coordinating for this height is now moot.
+        g.coordinator = None;
+        g.proposal = None;
+        g.pending_prevotes.clear();
+        g.pending_precommits.clear();
+        cache_recent_block(&mut g.recent_blocks, block.clone(), certificate);
+        Ok(block)
     }
 
     /// Build a proposal for the current round and feed it to our own
@@ -383,10 +649,11 @@ impl BftEngine {
     /// identically.
     pub fn cast_proposal(&self) -> Result<(Block, LeaderProof), BftError> {
         let mut g = self.state.lock();
-        self.ensure_coordinator(&mut g);
+        Self::ensure_coordinator(&mut g);
+        let my_index = g.my_index;
         let coord = g.coordinator.as_mut().expect("ensured");
         let leader_idx = coord.leader_index();
-        if leader_idx != self.config.my_index as usize {
+        if leader_idx != my_index as usize {
             return Err(BftError::NotLeader {
                 round: coord.round(),
                 expected: u32::try_from(leader_idx).unwrap_or(u32::MAX),
@@ -436,6 +703,7 @@ impl BftEngine {
     /// the host to broadcast.
     pub fn cast_prevote(&self) -> Result<PrevoteVote, BftError> {
         let mut g = self.state.lock();
+        let my_index = g.my_index;
         let coord = g
             .coordinator
             .as_mut()
@@ -450,7 +718,7 @@ impl BftEngine {
             block_hash,
             coord.height(),
             coord.round(),
-            self.config.my_index,
+            my_index,
         );
         coord.submit_prevote(vote.clone())?;
         Ok(vote)
@@ -460,6 +728,7 @@ impl BftEngine {
     /// the host to broadcast.
     pub fn cast_precommit(&self) -> Result<PrecommitVote, BftError> {
         let mut g = self.state.lock();
+        let my_index = g.my_index;
         let coord = g
             .coordinator
             .as_mut()
@@ -478,7 +747,7 @@ impl BftEngine {
             block_hash,
             coord.height(),
             coord.round(),
-            self.config.my_index,
+            my_index,
         );
         coord.submit_precommit(vote.clone())?;
         Ok(vote)
@@ -492,11 +761,14 @@ impl BftEngine {
         leader_proof: LeaderProof,
     ) -> Result<(), BftError> {
         let mut g = self.state.lock();
-        self.ensure_coordinator(&mut g);
+        Self::ensure_coordinator(&mut g);
         let coord = g.coordinator.as_mut().expect("ensured");
         let block_hash = block.hash();
         coord.submit_proposal(block_hash, &leader_proof)?;
         g.proposal = Some((block, leader_proof));
+        // v0.0.72: a proposal transition unlocks any pending votes
+        // that arrived ahead of it.
+        Self::drain_pending_votes(&mut g);
         Ok(())
     }
 
@@ -505,32 +777,132 @@ impl BftEngine {
     /// the same `(height, round)` for two different block hashes,
     /// the evidence is parked on `pending_evidence` for the host to
     /// drain.
+    ///
+    /// v0.0.72: when the vote arrives before the coordinator exists
+    /// or is in the wrong phase / round, the vote is buffered on
+    /// `pending_prevotes` rather than rejected. Buffered votes are
+    /// re-applied on the next state transition (proposal arrival,
+    /// timeout, phase change) that could unblock them. Stale votes
+    /// (height < `head_number + 1`) are dropped silently.
     pub fn submit_remote_prevote(&self, vote: PrevoteVote) -> Result<(), BftError> {
         let mut g = self.state.lock();
         if let Some(ev) = g.detector.record_prevote(vote.clone()) {
             g.pending_evidence.push(ev);
         }
-        let coord = g
-            .coordinator
-            .as_mut()
-            .ok_or(BftError::NoActiveCoordinator)?;
-        coord.submit_prevote(vote)?;
+        // Drop stale votes (for an already-committed height).
+        if vote.height <= g.head_number {
+            return Ok(());
+        }
+        match g.coordinator.as_mut() {
+            None => {
+                g.pending_prevotes.push(vote);
+            }
+            Some(coord) => match coord.submit_prevote(vote.clone()) {
+                Ok(()) => {
+                    // Submission may have transitioned phase — drain
+                    // any precommits that were waiting for this.
+                    Self::drain_pending_votes(&mut g);
+                }
+                Err(BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight) => {
+                    g.pending_prevotes.push(vote);
+                }
+                Err(e) => return Err(e),
+            },
+        }
         Ok(())
     }
 
     /// Ingest a peer's PRE-COMMIT. Same dual-feed pattern as
-    /// [`submit_remote_prevote`].
+    /// [`submit_remote_prevote`], with the same v0.0.72 buffering
+    /// semantics — early arrivals are queued on `pending_precommits`
+    /// and replayed when the coordinator transitions to
+    /// [`crate::bft::Phase::Precommitting`].
     pub fn submit_remote_precommit(&self, vote: PrecommitVote) -> Result<(), BftError> {
         let mut g = self.state.lock();
         if let Some(ev) = g.detector.record_precommit(vote.clone()) {
             g.pending_evidence.push(ev);
         }
-        let coord = g
-            .coordinator
-            .as_mut()
-            .ok_or(BftError::NoActiveCoordinator)?;
-        coord.submit_precommit(vote)?;
+        if vote.height <= g.head_number {
+            return Ok(());
+        }
+        match g.coordinator.as_mut() {
+            None => {
+                g.pending_precommits.push(vote);
+            }
+            Some(coord) => match coord.submit_precommit(vote.clone()) {
+                Ok(()) => {
+                    Self::drain_pending_votes(&mut g);
+                }
+                Err(BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight) => {
+                    g.pending_precommits.push(vote);
+                }
+                Err(e) => return Err(e),
+            },
+        }
         Ok(())
+    }
+
+    /// Re-apply every buffered prevote / precommit to the active
+    /// coordinator. Called after any state mutation that might have
+    /// transitioned the coordinator into a state where previously-
+    /// rejected votes become valid (proposal arrival, prevote tally
+    /// crossing quorum, precommit tally crossing quorum, timeout
+    /// advancing the round, …).
+    ///
+    /// Votes still rejected stay in the buffer; votes that succeed
+    /// or are now stale (height <= committed head) are removed.
+    /// Recursion is bounded by the fact that each successful drain
+    /// removes one element from the buffer.
+    fn drain_pending_votes(g: &mut BftEngineState) {
+        // Each iteration runs both buffers through the coordinator
+        // once. The outer loop reruns whenever at least one vote was
+        // successfully applied — because a successful prevote may
+        // transition the phase to Precommitting, which unblocks
+        // previously-buffered precommits, and vice versa. Bounded
+        // by the fact that each iteration must apply at least one
+        // buffered vote to repeat, so total iterations is capped by
+        // the total buffer size.
+        loop {
+            // Pre-flight: drop stale (already-committed) buffered votes.
+            let head = g.head_number;
+            g.pending_prevotes.retain(|v| v.height > head);
+            g.pending_precommits.retain(|v| v.height > head);
+            let Some(coord) = g.coordinator.as_mut() else {
+                return;
+            };
+            let prevotes = std::mem::take(&mut g.pending_prevotes);
+            let mut leftover_prev: Vec<PrevoteVote> = Vec::new();
+            let mut applied_any = false;
+            for v in prevotes {
+                match coord.submit_prevote(v.clone()) {
+                    Ok(()) => {
+                        applied_any = true;
+                    }
+                    Err(
+                        BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight,
+                    ) => leftover_prev.push(v),
+                    Err(_) => {} // signature / dedup errors — drop
+                }
+            }
+            g.pending_prevotes = leftover_prev;
+            let precommits = std::mem::take(&mut g.pending_precommits);
+            let mut leftover_pc: Vec<PrecommitVote> = Vec::new();
+            for v in precommits {
+                match coord.submit_precommit(v.clone()) {
+                    Ok(()) => {
+                        applied_any = true;
+                    }
+                    Err(
+                        BftError::WrongPhase { .. } | BftError::WrongRound | BftError::WrongHeight,
+                    ) => leftover_pc.push(v),
+                    Err(_) => {}
+                }
+            }
+            g.pending_precommits = leftover_pc;
+            if !applied_any {
+                return;
+            }
+        }
     }
 
     /// Drain every equivocation record the detector has observed
@@ -546,21 +918,23 @@ impl BftEngine {
     /// to the next round and drop the captured proposal.
     pub fn tick_timeout(&self) -> Result<(), BftError> {
         let mut g = self.state.lock();
-        self.ensure_coordinator(&mut g);
+        Self::ensure_coordinator(&mut g);
         let coord = g.coordinator.as_mut().expect("ensured");
         coord.fire_timeout();
         g.proposal = None;
+        // v0.0.72: round change unblocks buffered votes for the new round.
+        Self::drain_pending_votes(&mut g);
         Ok(())
     }
 
     /// Lazy: instantiate a fresh `RoundCoordinator` for `head_number + 1`
     /// if none is active.
-    fn ensure_coordinator(&self, g: &mut BftEngineState) {
+    fn ensure_coordinator(g: &mut BftEngineState) {
         if g.coordinator.is_none() {
             g.coordinator = Some(RoundCoordinator::new(
                 g.head_number + 1,
                 g.seed,
-                self.config.validator_set.clone(),
+                g.validator_set.clone(),
             ));
         }
     }
@@ -650,11 +1024,11 @@ impl BftEngine {
     /// ourselves. Only valid in single-validator mode.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn advance_single(&self) -> Result<AdvanceOutput, BftError> {
-        let vs_size = self.config.validator_set.size();
+        let mut g = self.state.lock();
+        let vs_size = g.validator_set.size();
         if vs_size != 1 {
             return Err(BftError::NotSingleValidator(vs_size));
         }
-        let mut g = self.state.lock();
         let new_number = g.head_number.checked_add(1).ok_or(BftError::Overflow)?;
         let new_timestamp = g.head_timestamp + self.config.slot_seconds;
         let seed = g.seed;
@@ -737,21 +1111,21 @@ impl BftEngine {
 
         // Drive the coordinator: submit proposal, prevote, precommit
         // — all signed by ourselves.
-        let mut coord = RoundCoordinator::new(new_number, seed, self.config.validator_set.clone());
+        let mut coord = RoundCoordinator::new(new_number, seed, g.validator_set.clone());
         coord.submit_proposal(block_hash, &leader_proof)?;
         coord.submit_prevote(PrevoteVote::sign(
             &self.config.my_bls_sk,
             block_hash,
             new_number,
             0,
-            self.config.my_index,
+            g.my_index,
         ))?;
         coord.submit_precommit(PrecommitVote::sign(
             &self.config.my_bls_sk,
             block_hash,
             new_number,
             0,
-            self.config.my_index,
+            g.my_index,
         ))?;
         let certificate = coord
             .certificate()
@@ -763,6 +1137,7 @@ impl BftEngine {
         g.head_number = new_number;
         g.head_timestamp = new_timestamp;
         g.seed = leader_proof.vrf_output;
+        cache_recent_block(&mut g.recent_blocks, block.clone(), certificate.clone());
 
         Ok(AdvanceOutput {
             block,
@@ -803,6 +1178,13 @@ impl Engine for BftEngine {
             .proposal
             .clone()
             .ok_or(ConsensusError::InvalidBlock("committed with no proposal"))?;
+        let certificate = g
+            .coordinator
+            .as_ref()
+            .and_then(|coord| coord.certificate().cloned())
+            .ok_or(ConsensusError::InvalidBlock(
+                "committed with no certificate",
+            ))?;
         let block_hash = block.hash();
         g.head_hash = block_hash;
         g.head_number = block.header.number;
@@ -810,6 +1192,7 @@ impl Engine for BftEngine {
         g.seed = proof.vrf_output;
         g.coordinator = None;
         g.proposal = None;
+        cache_recent_block(&mut g.recent_blocks, block, certificate);
         Ok(EngineProgress::NewBlock(block_hash))
     }
 
@@ -952,6 +1335,43 @@ mod tests {
     }
 
     #[test]
+    fn rotate_validator_set_at_idle_boundary_updates_size_and_index() {
+        let engine = BftEngine::new(single_validator_config(), &genesis());
+        let cfg = three_validator_config_as_validator_0();
+        let new_set = cfg.validator_set;
+
+        engine.rotate_validator_set(new_set, 0).unwrap();
+
+        assert_eq!(engine.validator_set_size(), 3);
+        assert_eq!(engine.my_index(), 0);
+        assert!(!engine.is_single_validator());
+    }
+
+    #[test]
+    fn rotate_validator_set_rejects_out_of_bounds_index() {
+        let engine = BftEngine::new(single_validator_config(), &genesis());
+        let new_set = three_validator_config_as_validator_0().validator_set;
+
+        let err = engine.rotate_validator_set(new_set, 99).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BftError::ValidatorIndexOutOfBounds { index: 99, size: 3 },
+        ));
+    }
+
+    #[test]
+    fn rotate_validator_set_rejects_active_round() {
+        let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
+        let _ = engine.cast_proposal();
+        let new_set = single_validator_config().validator_set;
+
+        let err = engine.rotate_validator_set(new_set, 0).unwrap_err();
+
+        assert_eq!(err, BftError::ActiveRoundInProgress);
+    }
+
+    #[test]
     fn advance_single_increments_height() {
         let engine = BftEngine::new(single_validator_config(), &genesis());
         let out = engine.advance_single().unwrap();
@@ -1026,6 +1446,72 @@ mod tests {
         let h_trait = <BftEngine as Engine>::head(&engine);
         let (h_internal, _) = engine.head();
         assert_eq!(h_trait, h_internal);
+    }
+
+    /// v0.0.70 `from_recovered` resumes at the recovered block's
+    /// height + 1 rather than restarting from genesis.
+    #[test]
+    fn from_recovered_resumes_at_head_plus_one() {
+        // Produce block 1 from a fresh engine to get a "recovered" block.
+        let g = genesis();
+        let warm = BftEngine::new(single_validator_config(), &g);
+        let out = warm.advance_single().unwrap();
+        let recovered = out.block;
+        assert_eq!(recovered.header.number, 1);
+
+        // Construct a new engine via from_recovered using that block.
+        let cold = BftEngine::from_recovered(single_validator_config(), &recovered);
+        let (head_hash, head_number) = cold.head();
+        assert_eq!(head_number, 1);
+        assert_eq!(head_hash, recovered.hash());
+
+        // Next advance produces block 2 (not block 1 again).
+        let next = cold.advance_single().unwrap();
+        assert_eq!(next.block.header.number, 2);
+        assert_eq!(next.block.header.parent_hash, recovered.hash());
+    }
+
+    /// v0.0.71 `fast_forward_to_round` lands the coordinator at the
+    /// supplied round (advancing through the expected count of
+    /// timeouts) and does not affect the chain head.
+    #[test]
+    fn fast_forward_to_round_lands_at_target() {
+        let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
+        engine.fast_forward_to_round(4).unwrap();
+        let (height, round, _phase) = engine
+            .current_round_state()
+            .expect("coordinator must exist after fast_forward");
+        assert_eq!(height, 1);
+        assert_eq!(round, 4);
+        // Head must not have moved — fast-forward is a coordinator-
+        // local operation.
+        let (_, head_n) = engine.head();
+        assert_eq!(head_n, 0);
+    }
+
+    /// `fast_forward_to_round(0)` is a no-op for the round number
+    /// but still creates the coordinator (so subsequent ticks see
+    /// "I'm at round 0 for this height").
+    #[test]
+    fn fast_forward_to_round_zero_creates_coordinator_at_round_zero() {
+        let engine = BftEngine::new(three_validator_config_as_validator_0(), &genesis());
+        engine.fast_forward_to_round(0).unwrap();
+        let (height, round, _phase) = engine.current_round_state().unwrap();
+        assert_eq!(height, 1);
+        assert_eq!(round, 0);
+    }
+
+    /// `from_recovered` against a genesis-only chain matches `new`.
+    #[test]
+    fn from_recovered_with_genesis_block_matches_new() {
+        let g = genesis();
+        let from_new = BftEngine::new(single_validator_config(), &g);
+        let from_recv = BftEngine::from_recovered(single_validator_config(), &g);
+        assert_eq!(from_new.head(), from_recv.head());
+        // And both can produce block 1.
+        let _ = from_new.advance_single().unwrap();
+        let out_recv = from_recv.advance_single().unwrap();
+        assert_eq!(out_recv.block.header.number, 1);
     }
 
     #[test]
@@ -1344,6 +1830,145 @@ mod tests {
         let p = <BftEngine as Engine>::step(&mut e0).unwrap();
         assert!(matches!(p, EngineProgress::NewBlock(_)));
         assert_eq!(e0.head().1, 1);
+    }
+
+    /// v0.0.72 — a peer's prevote arriving BEFORE we've seen the
+    /// proposal must be buffered, not rejected with
+    /// `NoActiveCoordinator`. After the proposal arrives the
+    /// coordinator is created and the buffered prevote is replayed.
+    #[test]
+    fn prevote_arriving_before_proposal_is_buffered_and_replayed() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+
+        // Leader: proposal + own prevote.
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        let leader_prevote = engines[leader].cast_prevote().unwrap();
+
+        // Pick a follower that hasn't seen anything yet.
+        let follower = (0..3).find(|i| *i != leader).unwrap();
+
+        // PRE-v0.0.72 this would return Err(NoActiveCoordinator).
+        // POST-v0.0.72 it must buffer and return Ok.
+        engines[follower]
+            .submit_remote_prevote(leader_prevote)
+            .expect("early prevote must be buffered, not rejected");
+        assert!(
+            engines[follower].current_round_state().is_none(),
+            "follower must not yet have a coordinator"
+        );
+
+        // Deliver the proposal — drain_pending_votes should re-submit
+        // the buffered prevote, so after this the follower's tally
+        // already has the leader's prevote on file.
+        engines[follower]
+            .submit_remote_proposal(block.clone(), proof.clone())
+            .unwrap();
+        let phase = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(
+            phase,
+            crate::bft::Phase::Prevoting,
+            "must be in Prevoting after proposal lands"
+        );
+
+        // The follower casts its own prevote, then receives the third
+        // validator's prevote — that's 3 of 3 prevotes, quorum forms,
+        // phase transitions to Precommitting.
+        let _follower_pv = engines[follower].cast_prevote().unwrap();
+        let third = (0..3).find(|i| *i != leader && *i != follower).unwrap();
+        engines[third].submit_remote_proposal(block, proof).unwrap();
+        let third_pv = engines[third].cast_prevote().unwrap();
+        engines[follower].submit_remote_prevote(third_pv).unwrap();
+        let phase = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(
+            phase,
+            crate::bft::Phase::Precommitting,
+            "buffered prevote was replayed; quorum reached"
+        );
+    }
+
+    /// v0.0.72 — a peer's precommit arriving while we're still in
+    /// Prevoting must be buffered (WrongPhase is not a rejection
+    /// path anymore). After we transition to Precommitting the
+    /// buffered precommit gets re-applied.
+    #[test]
+    fn precommit_arriving_during_prevoting_is_buffered_and_replayed() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let leader = vs.select_leader(1, 0, &[0x77; 32]);
+        let engines: Vec<BftEngine> = (0..3).map(|i| engine_for(i, &vs, &keys, &g)).collect();
+
+        let (block, proof) = engines[leader].cast_proposal().unwrap();
+        let leader_pv = engines[leader].cast_prevote().unwrap();
+        let other_indices: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+        let follower = other_indices[0];
+        let third = other_indices[1];
+
+        // Bring third online with a prevote of its own.
+        engines[third]
+            .submit_remote_proposal(block.clone(), proof.clone())
+            .unwrap();
+        let third_pv = engines[third].cast_prevote().unwrap();
+        engines[leader]
+            .submit_remote_prevote(third_pv.clone())
+            .unwrap();
+
+        // Drive the leader to Precommitting by also feeding the follower's prevote.
+        engines[follower]
+            .submit_remote_proposal(block, proof)
+            .unwrap();
+        let follower_pv = engines[follower].cast_prevote().unwrap();
+        engines[leader].submit_remote_prevote(follower_pv).unwrap();
+        let leader_precommit = engines[leader].cast_precommit().unwrap();
+
+        // Follower is currently in Prevoting (only saw the proposal + its own prevote).
+        let phase_before = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(phase_before, crate::bft::Phase::Prevoting);
+
+        // The early precommit arrives.
+        engines[follower]
+            .submit_remote_precommit(leader_precommit)
+            .expect("early precommit must be buffered, not rejected");
+        // Still in Prevoting — the precommit can't tally yet.
+        assert_eq!(
+            engines[follower].current_round_state().unwrap().2,
+            crate::bft::Phase::Prevoting
+        );
+
+        // Now feed enough prevotes to transition follower to Precommitting.
+        engines[follower].submit_remote_prevote(leader_pv).unwrap();
+        engines[follower].submit_remote_prevote(third_pv).unwrap();
+        // POLC formed → Precommitting; drain_pending_votes runs and
+        // the buffered leader precommit is replayed.
+        let phase_after = engines[follower].current_round_state().unwrap().2;
+        assert_eq!(phase_after, crate::bft::Phase::Precommitting);
+        // The follower can now cast its own precommit.
+        let _ = engines[follower].cast_precommit().unwrap();
+    }
+
+    /// v0.0.72 — buffered vote for a height we've already committed
+    /// past is silently dropped, not retained forever.
+    #[test]
+    fn stale_buffered_votes_are_dropped() {
+        let (vs, keys) = multi_validator_setup(3);
+        let g = genesis();
+        let engine = engine_for(0, &vs, &keys, &g);
+        // Construct an artificial PRECOMMIT for height 0 (already
+        // committed — genesis IS at head=0). Submission must succeed
+        // (Ok) but the vote must not stick around in the buffer.
+        let v = PrecommitVote::sign(
+            &keys[0].0,
+            H256::ZERO,
+            0, // stale
+            0,
+            0,
+        );
+        engine.submit_remote_precommit(v).unwrap();
+        // Submission is silent — verify by ticking timeout (no panic)
+        // and by checking head unchanged.
+        assert_eq!(engine.head().1, 0);
     }
 
     #[test]

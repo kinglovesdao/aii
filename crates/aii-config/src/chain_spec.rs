@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 pub const AII_CHAIN_ID: u64 = 99;
 /// AII testnet chain id (off-by-one for parity with reth/erigon conventions).
 pub const AII_TESTNET_CHAIN_ID: u64 = 9999;
+/// Maximum number of validators that may be active in one DPoS/BFT epoch.
+///
+/// The BFT vote bitmaps encode validators in a fixed-width set, so chain
+/// configuration must reject larger elected sets before a node starts.
+pub const MAX_ACTIVE_VALIDATORS: u32 = 128;
 
 /// Chain-wide parameters that never change after genesis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,8 +118,23 @@ impl ChainSpec {
         if self.block_time_seconds == 0 {
             return Err("block_time_seconds must be > 0");
         }
+        if self.block_time_seconds > 30 {
+            return Err("block_time_seconds must be <= 30");
+        }
         if self.initial_gas_limit < 5_000_000 {
             return Err("initial_gas_limit must be >= 5_000_000");
+        }
+        if self.epoch_length_blocks == 0 {
+            return Err("epoch_length_blocks must be > 0");
+        }
+        if self.validators_per_epoch == 0 {
+            return Err("validators_per_epoch must be > 0");
+        }
+        if self.validators_per_epoch > MAX_ACTIVE_VALIDATORS {
+            return Err("validators_per_epoch must be <= MAX_ACTIVE_VALIDATORS");
+        }
+        if self.min_validator_stake_wei == 0 {
+            return Err("min_validator_stake_wei must be > 0");
         }
         Ok(())
     }
@@ -199,6 +219,44 @@ mod tests {
         let mut bad = ChainSpec::mainnet();
         bad.initial_gas_limit = 100_000;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn block_time_above_thirty_seconds_rejected() {
+        let mut bad = ChainSpec::mainnet();
+        bad.block_time_seconds = 31;
+        assert_eq!(bad.validate(), Err("block_time_seconds must be <= 30"));
+    }
+
+    #[test]
+    fn zero_epoch_length_rejected() {
+        let mut bad = ChainSpec::mainnet();
+        bad.epoch_length_blocks = 0;
+        assert_eq!(bad.validate(), Err("epoch_length_blocks must be > 0"));
+    }
+
+    #[test]
+    fn zero_validators_per_epoch_rejected() {
+        let mut bad = ChainSpec::mainnet();
+        bad.validators_per_epoch = 0;
+        assert_eq!(bad.validate(), Err("validators_per_epoch must be > 0"));
+    }
+
+    #[test]
+    fn too_many_active_validators_rejected() {
+        let mut bad = ChainSpec::mainnet();
+        bad.validators_per_epoch = MAX_ACTIVE_VALIDATORS + 1;
+        assert_eq!(
+            bad.validate(),
+            Err("validators_per_epoch must be <= MAX_ACTIVE_VALIDATORS")
+        );
+    }
+
+    #[test]
+    fn zero_min_validator_stake_rejected() {
+        let mut bad = ChainSpec::mainnet();
+        bad.min_validator_stake_wei = 0;
+        assert_eq!(bad.validate(), Err("min_validator_stake_wei must be > 0"));
     }
 
     #[test]

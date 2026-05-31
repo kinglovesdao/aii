@@ -10,31 +10,39 @@
 
 pub mod bft_bootstrap;
 pub mod bft_p2p;
+pub mod bft_state;
+pub mod discovery_bootstrap;
 pub mod dpos;
 pub mod governance;
+#[cfg(unix)]
+pub mod head_watchdog;
+pub mod peer_cache;
 pub mod precompile;
+#[cfg(unix)]
+pub mod release_install;
+pub mod release_store;
 pub mod staking;
 pub mod sync;
+pub mod validator_registry;
 
-pub use dpos::{elect_active_set, latest_validator_set, ValidatorEntry};
+pub use dpos::{
+    elect_active_set, elect_registered_active_set, latest_validator_set, ValidatorEntry,
+};
 pub use governance::{Governance, Proposal, ProposalStatus, Vote};
 pub use precompile::{dispatch as precompile_dispatch, PrecompileOutcome, PRECOMPILE_ADDR};
 pub use staking::{StakeRecord, StakeTable};
 pub use sync::bootstrap_sync_from_peer;
+pub use validator_registry::{ValidatorKeys, ValidatorRegistry};
+
+const BFT_STAKE_WEIGHT_UNIT_WEI: u128 = 1_000_000_000_000_000_000;
 
 /// `BlockExecutor` adapter built on top of a live [`NodeState`].
 ///
-/// Today's impl is the half-step "consult-current-state" mode.
-/// The engine asks for post-execution roots **before** consensus,
-/// but the oracle returns the current `state_root` (i.e. the
-/// post-block-(N-1) state, not the post-block-N state). Hash
-/// stability still wins — both leader and followers compute the
-/// same answer because every node starts the round at the same
-/// head state.
-///
-/// A future iteration applies the body against a state snapshot
-/// before answering, so the header truly locks to the post-block-N
-/// state. The trait surface stays unchanged.
+/// Proposal execution is isolated: the adapter copies the execution
+/// column families into a temporary RocksDB instance, applies the
+/// proposed body there, and returns the resulting Yellow-Paper roots.
+/// The live chain state is only mutated later, after consensus
+/// finalises the block and `commit_block` runs.
 pub struct NodeStateExecutor {
     state: Arc<NodeState>,
 }
@@ -51,23 +59,325 @@ impl aii_consensus_iface::BlockExecutor for NodeStateExecutor {
     fn execute_for_proposal(
         &self,
         body: &BlockBody,
-        _coinbase: Address,
-        _block_number: u64,
+        coinbase: Address,
+        block_number: u64,
     ) -> Result<aii_consensus_iface::PostBlockRoots, aii_consensus_iface::ConsensusError> {
-        let state_root = self
-            .state
-            .state()
-            .state_root()
-            .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
-        // Pre-execution receipts_root = empty (no receipts have been
-        // computed for this body yet). Same for the bloom.
-        Ok(aii_consensus_iface::PostBlockRoots {
-            state_root,
-            receipts_root: aii_block::EMPTY_TRIE_HASH,
-            logs_bloom: [0u8; 256],
-            gas_used: (body.transactions.len() as u64) * 21_000,
-        })
+        let temp_backend = Arc::new(
+            RocksDbBackend::open_in_temp()
+                .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?,
+        );
+        copy_execution_backend(&self.state.backend, &temp_backend)?;
+        let temp_state = Arc::new(StateDb::new(Arc::clone(&temp_backend)));
+        execute_body_for_roots(
+            &self.state.spec,
+            &temp_backend,
+            &temp_state,
+            body,
+            coinbase,
+            block_number,
+        )
     }
+}
+
+fn copy_execution_backend(
+    src: &Arc<RocksDbBackend>,
+    dst: &Arc<RocksDbBackend>,
+) -> Result<(), aii_consensus_iface::ConsensusError> {
+    for cf in [
+        ColumnFamily::State,
+        ColumnFamily::Code,
+        ColumnFamily::AccountStorage,
+        ColumnFamily::Meta,
+    ] {
+        for kv in src.iter(cf) {
+            let (key, value) =
+                kv.map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+            dst.put(cf, &key, &value)
+                .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn credit_state_for_roots(
+    state: &Arc<StateDb<RocksDbBackend>>,
+    addr: &Address,
+    delta: U256,
+) -> Result<(), aii_consensus_iface::ConsensusError> {
+    if delta.is_zero() {
+        return Ok(());
+    }
+    let mut acc = state
+        .account(addr)
+        .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?
+        .unwrap_or(aii_state::Account::EMPTY);
+    acc.balance = acc.balance.saturating_add(delta);
+    state
+        .set_account(addr, &acc)
+        .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))
+}
+
+fn beneficiary_may_receive_block_subsidy_on_backend(
+    backend: &Arc<RocksDbBackend>,
+    beneficiary: &Address,
+) -> bool {
+    match latest_validator_set(backend) {
+        Ok(Some((_epoch, entries))) => entries.iter().any(|entry| entry.address == *beneficiary),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_body_for_roots(
+    spec: &ChainSpec,
+    backend: &Arc<RocksDbBackend>,
+    state: &Arc<StateDb<RocksDbBackend>>,
+    body: &BlockBody,
+    coinbase: Address,
+    block_number: u64,
+) -> Result<aii_consensus_iface::PostBlockRoots, aii_consensus_iface::ConsensusError> {
+    use aii_block::tx::{TxEip1559, TxLegacy};
+
+    let mut cumulative_gas_used: u64 = 0;
+    let mut receipts: Vec<Receipt> = Vec::new();
+    for tx in &body.transactions {
+        let tx_type = match tx {
+            Tx::Legacy(_) => TxType::Legacy,
+            Tx::Eip1559(_) => TxType::Eip1559,
+            Tx::Eip4844(_) => TxType::Eip4844,
+        };
+        let Ok(sender) = tx.recover_signer(spec.chain_id) else {
+            continue;
+        };
+        let (to, value, data, gas_limit, gas_price) = match tx {
+            Tx::Legacy(TxLegacy {
+                to,
+                value,
+                data,
+                gas_limit,
+                gas_price,
+                ..
+            }) => (*to, *value, data.clone(), *gas_limit, *gas_price),
+            Tx::Eip1559(TxEip1559 {
+                to,
+                value,
+                data,
+                gas_limit,
+                max_fee_per_gas,
+                ..
+            }) => (*to, *value, data.clone(), *gas_limit, *max_fee_per_gas),
+            Tx::Eip4844(_) => continue,
+        };
+        if to == Some(precompile::PRECOMPILE_ADDR) {
+            let table = StakeTable::new(Arc::clone(backend));
+            let registry = ValidatorRegistry::new(Arc::clone(backend));
+            let gov = Governance::new(Arc::clone(backend));
+            let success = precompile::dispatch(
+                &table,
+                &registry,
+                &gov,
+                sender,
+                value,
+                &data,
+                block_number,
+                spec.unbonding_period_blocks,
+            )
+            .is_ok();
+            let gas_charged = 21_000u64;
+            cumulative_gas_used = cumulative_gas_used.saturating_add(gas_charged);
+            let fee = U256::from(gas_charged).saturating_mul(gas_price);
+            credit_state_for_roots(state, &coinbase, fee)?;
+            receipts.push(Receipt {
+                tx_type,
+                status: success,
+                cumulative_gas_used,
+                logs_bloom: Bloom::ZERO,
+                logs: vec![],
+            });
+            continue;
+        }
+        let Ok(summary) =
+            aii_evm::execute_with_revm(state, sender, to, value, data, gas_limit, gas_price)
+        else {
+            continue;
+        };
+        cumulative_gas_used = cumulative_gas_used.saturating_add(summary.gas_used);
+        let fee = U256::from(summary.gas_used).saturating_mul(gas_price);
+        credit_state_for_roots(state, &coinbase, fee)?;
+        let mut tx_bloom = Bloom::ZERO;
+        for log in &summary.logs {
+            tx_bloom.accrue(log.address.as_bytes());
+            for topic in &log.topics {
+                tx_bloom.accrue(topic.as_bytes());
+            }
+        }
+        receipts.push(Receipt {
+            tx_type,
+            status: summary.success,
+            cumulative_gas_used,
+            logs_bloom: tx_bloom,
+            logs: summary.logs,
+        });
+    }
+    let subsidy_wei = spec.block_reward_at(block_number);
+    if subsidy_wei > 0 && beneficiary_may_receive_block_subsidy_on_backend(backend, &coinbase) {
+        credit_state_for_roots(state, &coinbase, U256::from(subsidy_wei))?;
+    }
+    let state_root = state
+        .state_root()
+        .map_err(|e| aii_consensus_iface::ConsensusError::Io(e.to_string()))?;
+    let receipts_root = aii_state::receipts_root(&receipts);
+    let mut block_bloom = Bloom::ZERO;
+    for receipt in &receipts {
+        for log in &receipt.logs {
+            block_bloom.accrue(log.address.as_bytes());
+            for topic in &log.topics {
+                block_bloom.accrue(topic.as_bytes());
+            }
+        }
+    }
+    Ok(aii_consensus_iface::PostBlockRoots {
+        state_root,
+        receipts_root,
+        logs_bloom: block_bloom.0,
+        gas_used: cumulative_gas_used,
+    })
+}
+
+/// Convert a keyed DPoS epoch record into the BFT runtime validator set.
+///
+/// Every entry must carry BLS and VRF pubkeys. Wei-denominated stake is
+/// converted into whole-AII voting weight for the BFT engine's `u64`
+/// domain, with sub-token stakes rounded up to one unit so low-stake
+/// local tests still have non-zero weight. Values that remain too large
+/// after scaling are rejected instead of silently truncating.
+///
+/// # Errors
+/// Returns BFT validation errors for missing/malformed keys, oversized
+/// stake values, empty sets, or oversized validator sets.
+pub fn bft_validator_set_from_entries(
+    entries: &[ValidatorEntry],
+) -> Result<aii_consensus_bft::ValidatorSet, aii_consensus_bft::BftError> {
+    let mut validators = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(bls_pubkey) = entry.bls_pubkey else {
+            return Err(aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: i,
+                kind: "bls",
+            });
+        };
+        let Some(vrf_pubkey) = entry.vrf_pubkey else {
+            return Err(aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: i,
+                kind: "vrf",
+            });
+        };
+        let bls_pubkey = aii_crypto::bls::PublicKey::from_compressed(bls_pubkey.as_bytes())
+            .map_err(|_| aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: i,
+                kind: "bls",
+            })?;
+        let vrf_pubkey =
+            aii_crypto::vrf::PublicKey::from_bytes(vrf_pubkey.as_bytes()).map_err(|_| {
+                aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                    index: i,
+                    kind: "vrf",
+                }
+            })?;
+        let stake = bft_stake_weight_from_wei(entry.stake_wei)?;
+        validators.push(aii_consensus_bft::Validator {
+            bls_pubkey,
+            vrf_pubkey,
+            stake,
+        });
+    }
+    aii_consensus_bft::ValidatorSet::new(validators)
+}
+
+fn bft_stake_weight_from_wei(stake_wei: U256) -> Result<u64, aii_consensus_bft::BftError> {
+    let unit = U256::from(BFT_STAKE_WEIGHT_UNIT_WEI);
+    let weight = stake_wei / unit;
+    let weight = if weight.is_zero() {
+        U256::from(1u64)
+    } else {
+        weight
+    };
+    u64::try_from(weight).map_err(|_| aii_consensus_bft::BftError::TotalStakeOverflow)
+}
+
+/// Find this node's validator index inside a keyed DPoS epoch record.
+///
+/// Returns `None` for legacy stake-only records or when the local key is
+/// not a member of the elected set.
+#[must_use]
+pub fn bft_my_index_from_entries(
+    entries: &[ValidatorEntry],
+    local_bls_pubkey: &aii_types::BlsPubKey,
+) -> Option<u32> {
+    entries
+        .iter()
+        .position(|entry| entry.bls_pubkey.as_ref() == Some(local_bls_pubkey))
+        .and_then(|idx| u32::try_from(idx).ok())
+}
+
+/// Result of trying to align a running BFT engine with the latest
+/// on-chain DPoS validator-set record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BftDposRotation {
+    /// No DPoS epoch record has been persisted yet.
+    NoActiveSet,
+    /// A DPoS epoch exists, but this node's BLS key is not part of it.
+    LocalKeyMissing {
+        /// Epoch number of the latest persisted DPoS validator set.
+        epoch: u64,
+        /// Number of validators in that epoch record.
+        validators: usize,
+    },
+    /// The engine accepted the latest DPoS validator set.
+    Rotated {
+        /// Epoch number of the latest persisted DPoS validator set.
+        epoch: u64,
+        /// Number of validators in that epoch record.
+        validators: usize,
+        /// This node's index inside the BFT runtime validator set.
+        my_index: u32,
+    },
+}
+
+/// Rotate `engine` to the latest persisted keyed DPoS validator set,
+/// if one exists and includes this node's BLS key.
+///
+/// This is used during `aiid --bft` startup before choosing the
+/// single-validator or gossip-driven runtime path. Without it, a node
+/// bootstrapped from a single-validator genesis can keep running the
+/// single-validator producer after a later DPoS epoch has elected a
+/// multi-validator set, until the operator manually rewrites genesis.
+///
+/// # Errors
+/// Propagates storage errors and BFT validator-set validation errors.
+pub fn rotate_bft_engine_to_latest_dpos(
+    engine: &aii_consensus_bft::BftEngine,
+    state: &NodeState,
+) -> Result<BftDposRotation, Box<dyn std::error::Error + Send + Sync>> {
+    let Some((epoch, entries)) = latest_validator_set(&state.backend)? else {
+        return Ok(BftDposRotation::NoActiveSet);
+    };
+    let local_bls_pubkey = engine.my_bls_pubkey();
+    let Some(my_index) = bft_my_index_from_entries(&entries, &local_bls_pubkey) else {
+        return Ok(BftDposRotation::LocalKeyMissing {
+            epoch,
+            validators: entries.len(),
+        });
+    };
+    let validator_set = bft_validator_set_from_entries(&entries)?;
+    let validators = validator_set.size();
+    engine.rotate_validator_set(validator_set, my_index)?;
+    Ok(BftDposRotation::Rotated {
+        epoch,
+        validators,
+        my_index,
+    })
 }
 
 use aii_block::tx::Tx;
@@ -85,7 +395,7 @@ use aii_types::{Address, H256, U256};
 use alloy_rlp::{Decodable, Encodable};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Meta-CF key holding the canonical chain head as a big-endian u64.
@@ -171,6 +481,37 @@ pub struct NodeState {
     blocks: RwLock<BlockStore>,
     /// Mempool for incoming signed transactions (v0.0.37).
     tx_pool: TxPool,
+    /// Latest signed release manifest accepted via the v0.0.75
+    /// `aii_announceRelease` RPC. `None` on a fresh node.
+    latest_release: RwLock<Option<aii_crypto::release::ReleaseManifest>>,
+    /// Directory the node was launched with. Used by v0.0.76
+    /// release-binary store helpers to resolve
+    /// `<data-dir>/releases/<version>`. `None` until the host
+    /// (`aiid` main) calls [`NodeState::set_data_dir`]; in that
+    /// state release-store ops fail-soft (RPC returns
+    /// `accepted: false`) rather than panicking.
+    data_dir: RwLock<Option<std::path::PathBuf>>,
+    /// HTTP-RPC URLs of peer nodes used for cross-node release
+    /// propagation (v0.0.77). Populated from `aiid --update-peers`
+    /// at startup. Empty means "this node accepts announcements
+    /// but never re-broadcasts" — useful for leaf clients.
+    update_peers: RwLock<Vec<String>>,
+    /// When `true`, accepting a release manifest whose binary is
+    /// already in `<data-dir>/releases/<version>` triggers an
+    /// atomic install + execve self-restart (v0.0.78). Operator
+    /// opt-in via `aiid --auto-install-releases`; default `false`
+    /// because in-place restarts are disruptive and most
+    /// production operators want to schedule the swap.
+    auto_install_releases: AtomicBool,
+    /// Test-only override (v0.0.78): when `Some`,
+    /// [`RpcState::install_release`] uses this path as the
+    /// install target instead of `/proc/self/exe`, and skips
+    /// the `execve` self-restart spawn. Required because
+    /// otherwise integration tests that exercise install would
+    /// actually swap the test-runner binary and `exec` it,
+    /// which is catastrophic for `cargo test`. Production
+    /// always leaves this `None`.
+    install_target_override: RwLock<Option<std::path::PathBuf>>,
 }
 
 /// Headers + bodies keyed by hash and number, plus an insertion-order
@@ -204,6 +545,11 @@ impl NodeState {
             backend,
             blocks: RwLock::new(BlockStore::default()),
             tx_pool: TxPool::new(100_000),
+            latest_release: RwLock::new(None),
+            data_dir: RwLock::new(None),
+            update_peers: RwLock::new(Vec::new()),
+            auto_install_releases: AtomicBool::new(false),
+            install_target_override: RwLock::new(None),
         })
     }
 
@@ -303,6 +649,11 @@ impl NodeState {
                 tx_index,
             }),
             tx_pool: TxPool::new(100_000),
+            latest_release: RwLock::new(None),
+            data_dir: RwLock::new(None),
+            update_peers: RwLock::new(Vec::new()),
+            auto_install_releases: AtomicBool::new(false),
+            install_target_override: RwLock::new(None),
         }))
     }
 
@@ -453,20 +804,57 @@ impl NodeState {
         }
         let epoch = block_number / epoch_len;
         let table = self.stake_table();
-        let elected = match elect_active_set(
+        let registry = self.validator_registry();
+        let registered = match elect_registered_active_set(
             &table,
+            &registry,
             U256::from(self.spec.min_validator_stake_wei),
             self.spec.validators_per_epoch,
         ) {
             Ok(set) => set,
             Err(e) => {
-                tracing::warn!(error = %e, "elect_active_set failed — skipping epoch");
-                return;
+                tracing::warn!(
+                    error = %e,
+                    "elect_registered_active_set failed — trying legacy election"
+                );
+                Vec::new()
             }
+        };
+        let elected = if registered.is_empty() {
+            match elect_active_set(
+                &table,
+                U256::from(self.spec.min_validator_stake_wei),
+                self.spec.validators_per_epoch,
+            ) {
+                Ok(set) => set,
+                Err(e) => {
+                    tracing::warn!(error = %e, "elect_active_set failed — skipping epoch");
+                    return;
+                }
+            }
+        } else {
+            registered
         };
         if let Err(e) = dpos::persist_validator_set(&self.backend, epoch, &elected) {
             tracing::error!(error = %e, "persist_validator_set failed");
             return;
+        }
+        if elected
+            .iter()
+            .all(|entry| entry.bls_pubkey.is_some() && entry.vrf_pubkey.is_some())
+        {
+            match bft_validator_set_from_entries(&elected) {
+                Ok(set) => tracing::info!(
+                    epoch,
+                    validators = set.size(),
+                    "DPoS validator set is BFT-runtime ready",
+                ),
+                Err(e) => tracing::warn!(
+                    epoch,
+                    error = %e,
+                    "DPoS validator set cannot be converted to BFT runtime set",
+                ),
+            }
         }
         tracing::info!(
             epoch,
@@ -606,6 +994,23 @@ impl NodeState {
         }
     }
 
+    fn beneficiary_may_receive_block_subsidy(&self, beneficiary: &Address) -> bool {
+        match latest_validator_set(&self.backend) {
+            Ok(Some((_epoch, entries))) => {
+                entries.iter().any(|entry| entry.address == *beneficiary)
+            }
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!(
+                    beneficiary = ?beneficiary,
+                    error = %e,
+                    "validator reward eligibility check failed",
+                );
+                false
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_block_txs(&self, block: &Block) {
         use aii_block::tx::{TxEip1559, TxLegacy};
@@ -667,9 +1072,11 @@ impl NodeState {
             // state and doesn't run EVM bytecode.
             if to == Some(precompile::PRECOMPILE_ADDR) {
                 let table = self.stake_table();
+                let registry = self.validator_registry();
                 let gov = self.governance();
                 let outcome = precompile::dispatch(
                     &table,
+                    &registry,
                     &gov,
                     sender,
                     value,
@@ -769,8 +1176,15 @@ impl NodeState {
         // controlled by ChainSpec; testnets can disable halving by
         // setting `block_reward_halving_interval = u64::MAX`.
         let subsidy_wei = self.spec.block_reward_at(block.header.number);
-        if subsidy_wei > 0 {
+        if subsidy_wei > 0 && self.beneficiary_may_receive_block_subsidy(&block.header.beneficiary)
+        {
             self.credit(&block.header.beneficiary, U256::from(subsidy_wei));
+        } else if subsidy_wei > 0 {
+            tracing::warn!(
+                block = block.header.number,
+                beneficiary = ?block.header.beneficiary,
+                "block subsidy skipped for non-elected beneficiary",
+            );
         }
         self.persist_receipts(block.hash(), &receipts);
         // Compute + persist Yellow-Paper sidecar roots so light
@@ -894,10 +1308,6 @@ impl NodeState {
     /// `Meta:slash:<vidx>:<height>:<phase>`; duplicate records for
     /// the same `(validator, height, phase)` triple overwrite (idempotent).
     ///
-    /// Future releases will, in addition to recording the slash, debit
-    /// the offending validator's staked balance — that requires the
-    /// DPoS stake table from C.6 / E.3. For now the record itself is
-    /// the slashing primitive.
     /// Optional slash-debit hook. When invoked together with
     /// [`Self::record_slashing`], this debits the offending
     /// validator's bond by `slash_amount_wei` (saturating at zero).
@@ -910,6 +1320,21 @@ impl NodeState {
                 tracing::error!(error = %e, "slash debit failed");
             }
         }
+    }
+
+    /// Resolve a BFT validator index against the latest persisted DPoS
+    /// epoch set.
+    ///
+    /// Returns `None` when no epoch set exists or the index is outside
+    /// the current elected validator set.
+    #[must_use]
+    pub fn latest_validator_address_by_index(
+        &self,
+        validator_index: u32,
+    ) -> Option<(u64, Address)> {
+        let (epoch, entries) = latest_validator_set(&self.backend).ok().flatten()?;
+        let idx = usize::try_from(validator_index).ok()?;
+        entries.get(idx).map(|entry| (epoch, entry.address))
     }
 
     /// Append an equivocation record to the slashing index. Idempotent
@@ -1031,6 +1456,143 @@ impl NodeState {
         self.head.load(Ordering::Relaxed)
     }
 
+    /// Record the runtime data directory (v0.0.76).
+    ///
+    /// Called by `aiid` early in `main()` so the
+    /// release-binary-store helpers can resolve
+    /// `<data-dir>/releases/<version>` paths. Calling this on a
+    /// node that already has a data-dir set overwrites the
+    /// previous value (idempotent for the common "set once at
+    /// startup" call site).
+    pub fn set_data_dir(&self, dir: std::path::PathBuf) {
+        if let Ok(mut g) = self.data_dir.write() {
+            *g = Some(dir);
+        }
+    }
+
+    /// Record the list of peer HTTP-RPC URLs used for v0.0.77
+    /// release-manifest propagation + binary auto-fetch.
+    ///
+    /// `aiid --update-peers HTTP1,HTTP2,…` calls this once at
+    /// startup. Passing an empty `Vec` disables outbound
+    /// propagation (the node still accepts announcements but
+    /// doesn't re-broadcast).
+    pub fn set_update_peers(&self, peers: Vec<String>) {
+        if let Ok(mut g) = self.update_peers.write() {
+            *g = peers;
+        }
+    }
+
+    /// Read the current update-peer list. Returns an empty vec on
+    /// a node that hasn't called [`Self::set_update_peers`].
+    #[must_use]
+    pub fn update_peers(&self) -> Vec<String> {
+        self.update_peers
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Toggle automatic in-place upgrade on release acceptance
+    /// (v0.0.78).
+    ///
+    /// When `true`, [`RpcState::record_release_announcement`]
+    /// schedules an atomic install + execve self-restart as soon
+    /// as the version's binary lands in
+    /// `<data-dir>/releases/<version>`. Operator opt-in via
+    /// `aiid --auto-install-releases`.
+    pub fn set_auto_install_releases(&self, on: bool) {
+        self.auto_install_releases.store(on, Ordering::Relaxed);
+    }
+
+    /// Read the auto-install flag. Default `false` on a node that
+    /// hasn't called [`Self::set_auto_install_releases`].
+    #[must_use]
+    pub fn auto_install_releases(&self) -> bool {
+        self.auto_install_releases.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: redirect the v0.0.78 install target away from
+    /// `/proc/self/exe` to `path`, and suppress the `execve`
+    /// self-restart task. Used by `aii-node` integration tests
+    /// so they can exercise install without overwriting the
+    /// test runner. Calling this in production is a footgun —
+    /// the manual restart path is gone, so an in-place upgrade
+    /// would write the new binary to `path` and never restart.
+    #[doc(hidden)]
+    pub fn set_install_target_for_tests(&self, path: std::path::PathBuf) {
+        if let Ok(mut g) = self.install_target_override.write() {
+            *g = Some(path);
+        }
+    }
+
+    /// Trigger the v0.0.78 auto-install path iff the conditions
+    /// are met: auto-install is on, `data_dir` is known, the
+    /// binary for `version` is cached locally, and the locally-
+    /// known latest manifest matches `version`. Returns silently
+    /// when any condition fails — fail-closed by design, since
+    /// the operator opted in.
+    ///
+    /// Invoked from `record_release_announcement` and
+    /// `import_release_binary` so the auto-install fires the
+    /// moment both (manifest, binary) are in hand, regardless of
+    /// which arrived first.
+    #[cfg(unix)]
+    async fn maybe_auto_install_release(&self, version: &str) {
+        if !self.auto_install_releases() {
+            return;
+        }
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        if !crate::release_store::binary_path(&dir, version).exists() {
+            return;
+        }
+        let manifest = self.latest_release.read().ok().and_then(|g| g.clone());
+        let Some(m) = manifest else {
+            return;
+        };
+        if m.version != version {
+            return;
+        }
+        tracing::info!(
+            version = version,
+            "auto-install conditions met; invoking install_release",
+        );
+        let outcome = <Self as aii_rpc::RpcState>::install_release(self, version).await;
+        tracing::info!(
+            scheduled = outcome.scheduled,
+            reason = %outcome.reason,
+            restart_in_secs = outcome.restart_in_secs,
+            "auto-install result",
+        );
+    }
+
+    /// Read the full [`Block`] at height `n`, reconstructed from the
+    /// in-memory `by_number → hash → header / body` indices.
+    ///
+    /// Added in v0.0.70 so the startup path can pass the recovered
+    /// head block into [`aii_consensus_bft::BftEngine::from_recovered`]
+    /// — letting the BFT engine resume at `n+1` instead of starting
+    /// over from genesis.
+    #[must_use]
+    pub fn block_by_number(&self, n: u64) -> Option<Block> {
+        let guard = self.blocks.read().ok()?;
+        let hash = guard.by_number.get(&n).copied()?;
+        let header = guard.by_hash.get(&hash).cloned()?;
+        let body = guard.body_by_hash.get(&hash).cloned().unwrap_or_default();
+        Some(Block { header, body })
+    }
+
+    /// Convenience wrapper: full [`Block`] at the current head.
+    /// Returns `None` if the chain is empty or the head index is
+    /// inconsistent.
+    #[must_use]
+    pub fn head_block(&self) -> Option<Block> {
+        let n = self.head_block_number_sync();
+        self.block_by_number(n)
+    }
+
     /// Test-only: peek the in-memory `number → hash` map. Used by the
     /// cold-join sync test to verify byte-identical block
     /// reconstruction across producer/consumer pairs.
@@ -1068,6 +1630,13 @@ impl NodeState {
     #[must_use]
     pub fn stake_table(&self) -> StakeTable {
         StakeTable::new(Arc::clone(&self.backend))
+    }
+
+    /// Construct a fresh `ValidatorRegistry` view bound to this node's
+    /// backend. Cheap — the inner `RocksDbBackend` Arc is shared.
+    #[must_use]
+    pub fn validator_registry(&self) -> ValidatorRegistry {
+        ValidatorRegistry::new(Arc::clone(&self.backend))
     }
 
     /// Construct a fresh `Governance` view bound to this node's
@@ -1154,6 +1723,50 @@ fn parse_hash_str(s: &str) -> Option<H256> {
 
 fn parse_hash_h256(s: &str) -> Option<H256> {
     parse_hash_str(s)
+}
+
+/// Build an [`aii_rpc::EthBlockResponse`] from already-read
+/// `BlockStore` indices (v0.0.90 helper, used by both
+/// `eth_block_by_number` and `eth_block_by_hash`).
+///
+/// Caller holds the `RwLockReadGuard<BlockStore>` so we
+/// don't take a second lock.
+fn eth_block_response_from_indices(
+    chain_id: u64,
+    store: &BlockStore,
+    block_hash: H256,
+    full_transactions: bool,
+) -> Option<aii_rpc::EthBlockResponse> {
+    let header = store.by_hash.get(&block_hash)?;
+    let body = store.body_by_hash.get(&block_hash)?;
+    let header_view = header_to_view(block_hash, header);
+    let block_number_hex = format!("0x{:x}", header.number);
+    let block_hash_hex = format!("0x{}", hex::encode(block_hash.as_bytes()));
+    let transactions = if full_transactions {
+        let full: Vec<aii_rpc::EthTxResponse> = body
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(idx, tx)| aii_rpc::EthTxResponse {
+                tx: tx_to_view(tx, chain_id),
+                block_hash: block_hash_hex.clone(),
+                block_number: block_number_hex.clone(),
+                transaction_index: format!("0x{idx:x}"),
+            })
+            .collect();
+        aii_rpc::EthBlockTxs::Full(full)
+    } else {
+        let hashes: Vec<String> = body
+            .transactions
+            .iter()
+            .map(|tx| format!("0x{}", hex::encode(tx.hash().as_bytes())))
+            .collect();
+        aii_rpc::EthBlockTxs::Hashes(hashes)
+    };
+    Some(aii_rpc::EthBlockResponse {
+        header: header_view,
+        transactions,
+    })
 }
 
 fn tx_to_view(tx: &Tx, chain_id: u64) -> TxView {
@@ -1336,6 +1949,46 @@ impl RpcState for NodeState {
         Some((tx_to_view(tx, chain_id), block_number))
     }
 
+    async fn eth_transaction_by_hash(&self, hash_hex: &str) -> Option<aii_rpc::EthTxResponse> {
+        // v0.0.90: same lookup as transaction_by_hash, but
+        // expose the in-block index + block hash too.
+        let chain_id = self.spec.chain_id;
+        let h = parse_hash_h256(hash_hex)?;
+        let s = self.blocks.read().ok()?;
+        let (block_number, idx) = *s.tx_index.get(&h)?;
+        let block_hash = *s.by_number.get(&block_number)?;
+        let body = s.body_by_hash.get(&block_hash)?;
+        let tx = body.transactions.get(idx)?;
+        Some(aii_rpc::EthTxResponse {
+            tx: tx_to_view(tx, chain_id),
+            block_hash: format!("0x{}", hex::encode(block_hash.as_bytes())),
+            block_number: format!("0x{block_number:x}"),
+            transaction_index: format!("0x{idx:x}"),
+        })
+    }
+
+    async fn eth_block_by_number(
+        &self,
+        n: u64,
+        full_transactions: bool,
+    ) -> Option<aii_rpc::EthBlockResponse> {
+        // Resolve number → hash → header → body, then build the
+        // composite eth_getBlockByX response.
+        let s = self.blocks.read().ok()?;
+        let block_hash = *s.by_number.get(&n)?;
+        eth_block_response_from_indices(self.spec.chain_id, &s, block_hash, full_transactions)
+    }
+
+    async fn eth_block_by_hash(
+        &self,
+        hash_hex: &str,
+        full_transactions: bool,
+    ) -> Option<aii_rpc::EthBlockResponse> {
+        let block_hash = parse_hash_h256(hash_hex)?;
+        let s = self.blocks.read().ok()?;
+        eth_block_response_from_indices(self.spec.chain_id, &s, block_hash, full_transactions)
+    }
+
     async fn logs_in_range(&self, filter: &LogFilter) -> Vec<LogEntryView> {
         let head = self.head.load(Ordering::Relaxed);
         let from = filter
@@ -1479,6 +2132,12 @@ impl RpcState for NodeState {
                 .map(|e| ValidatorEntryView {
                     address: format!("0x{}", hex::encode(e.address.as_bytes())),
                     stake_wei: format!("0x{:x}", e.stake_wei),
+                    bls_pubkey: e
+                        .bls_pubkey
+                        .map(|pk| format!("0x{}", hex::encode(pk.as_bytes()))),
+                    vrf_pubkey: e
+                        .vrf_pubkey
+                        .map(|pk| format!("0x{}", hex::encode(pk.as_bytes()))),
                 })
                 .collect(),
         })
@@ -1609,16 +2268,598 @@ impl RpcState for NodeState {
             code_hash: format!("0x{}", hex::encode(acc.code_hash.as_bytes())),
         })
     }
+
+    async fn release_binary_bytes(&self, version: &str) -> Option<Vec<u8>> {
+        let dir = self.data_dir.read().ok()?.clone()?;
+        crate::release_store::load_binary(&dir, version)
+            .ok()
+            .flatten()
+    }
+
+    async fn import_release_binary(&self, version: &str, bytes: Vec<u8>) -> (bool, String) {
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return (
+                false,
+                "node has no data_dir configured (set_data_dir not called)".into(),
+            );
+        };
+        // Cross-check against the locally-known latest manifest.
+        // We refuse to store a binary whose version doesn't match a
+        // manifest we've already verified — otherwise a peer could
+        // dump arbitrary bytes into our cache.
+        let manifest = self.latest_release.read().ok().and_then(|g| g.clone());
+        let Some(m) = manifest else {
+            return (
+                false,
+                "no verified manifest known for any version yet".into(),
+            );
+        };
+        if m.version != version {
+            return (
+                false,
+                format!(
+                    "version mismatch: latest known manifest is {} but import is for {}",
+                    m.version, version
+                ),
+            );
+        }
+        // Hand off to the store, which re-verifies sha256 before writing.
+        match crate::release_store::store_verified_binary(&dir, version, &m.sha256_hex, &bytes) {
+            Ok(path) => {
+                tracing::info!(
+                    version = version,
+                    path = %path.display(),
+                    bytes = bytes.len(),
+                    "imported release binary",
+                );
+                #[cfg(unix)]
+                self.maybe_auto_install_release(version).await;
+                (true, String::new())
+            }
+            Err(e) => (false, format!("{e}")),
+        }
+    }
+
+    async fn record_release_announcement(
+        &self,
+        manifest: aii_crypto::release::ReleaseManifest,
+    ) -> bool {
+        let version_for_auto_install = {
+            let Ok(mut guard) = self.latest_release.write() else {
+                return false;
+            };
+            // Only accept a strictly newer manifest. Compare on
+            // (timestamp_unix, version-string) — timestamp first so a
+            // backdated re-sign of the same version cannot displace the
+            // live one.
+            if let Some(current) = guard.as_ref() {
+                let strictly_newer = manifest.timestamp_unix > current.timestamp_unix
+                    || (manifest.timestamp_unix == current.timestamp_unix
+                        && manifest.version > current.version);
+                if !strictly_newer {
+                    return false;
+                }
+            }
+            tracing::info!(
+                version = %manifest.version,
+                ts = manifest.timestamp_unix,
+                "accepted release announcement",
+            );
+            let v = manifest.version.clone();
+            *guard = Some(manifest);
+            v
+        };
+        // Auto-install path (v0.0.78): if the binary for the
+        // newly-accepted version already lives in our cache (e.g.
+        // because gossip pushed it before the manifest landed),
+        // fire the install + execve here. Lock guard above is
+        // dropped first so install_release can re-read state.
+        #[cfg(unix)]
+        self.maybe_auto_install_release(&version_for_auto_install)
+            .await;
+        true
+    }
+
+    async fn latest_release(&self) -> Option<aii_crypto::release::ReleaseManifest> {
+        self.latest_release.read().ok()?.clone()
+    }
+
+    async fn update_peers_for_release(&self) -> Vec<String> {
+        self.update_peers()
+    }
+
+    async fn code_at(&self, addr: &Address) -> Vec<u8> {
+        // v0.0.89: look up the account's code_hash, then resolve
+        // the runtime bytes via the Code CF. EOAs and
+        // non-existent accounts return empty.
+        let Ok(Some(acc)) = self.state.account(addr) else {
+            return Vec::new();
+        };
+        match self.state.code_get(&acc.code_hash) {
+            Ok(Some(bytes)) => bytes,
+            _ => Vec::new(),
+        }
+    }
+
+    async fn storage_at(&self, addr: &Address, slot: &aii_types::H256) -> aii_types::H256 {
+        // v0.0.89: pass through to StateDb. Unset slots return
+        // H256::ZERO at the storage layer; we propagate.
+        self.state
+            .storage_get(addr, slot)
+            .unwrap_or(aii_types::H256::ZERO)
+    }
+
+    async fn estimate_gas(
+        &self,
+        req: aii_rpc::SimulateCallParams,
+    ) -> Result<u64, aii_rpc::SimulateCallError> {
+        // v0.0.89: same simulation path as eth_call, but we
+        // report the gas counter instead of the return bytes.
+        // For a reverting tx we still propagate the revert
+        // reason — matches geth's behaviour (estimateGas
+        // surfaces reverts so wallets show the right error).
+        match aii_evm::simulate_with_revm(
+            &self.state,
+            req.from,
+            Some(req.to),
+            req.value,
+            req.data,
+            req.gas_limit,
+            req.gas_price,
+        ) {
+            Ok(sim) => {
+                if sim.success {
+                    Ok(sim.gas_used)
+                } else {
+                    Err(aii_rpc::SimulateCallError::Reverted(
+                        sim.revert_reason
+                            .unwrap_or_else(|| "execution failed".to_string()),
+                    ))
+                }
+            }
+            Err(e) => Err(aii_rpc::SimulateCallError::Evm(e.to_string())),
+        }
+    }
+
+    async fn simulate_call(
+        &self,
+        req: aii_rpc::SimulateCallParams,
+    ) -> Result<Vec<u8>, aii_rpc::SimulateCallError> {
+        // v0.0.88: route eth_call into aii_evm::simulate_with_revm.
+        // The simulation runs against the live committed state but
+        // never writes back — see simulate_with_revm's contract.
+        match aii_evm::simulate_with_revm(
+            &self.state,
+            req.from,
+            Some(req.to),
+            req.value,
+            req.data,
+            req.gas_limit,
+            req.gas_price,
+        ) {
+            Ok(sim) => {
+                if sim.success {
+                    Ok(sim.return_data)
+                } else {
+                    Err(aii_rpc::SimulateCallError::Reverted(
+                        sim.revert_reason
+                            .unwrap_or_else(|| "execution failed".to_string()),
+                    ))
+                }
+            }
+            Err(e) => Err(aii_rpc::SimulateCallError::Evm(e.to_string())),
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)] // v0.0.78-v0.0.85 layered safety checks
+    async fn install_release(&self, version: &str) -> aii_rpc::InstallOutcome {
+        const RESTART_DELAY_SECS: u64 = 2;
+
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: "node has no data_dir configured (set_data_dir not called)".into(),
+                restart_in_secs: 0,
+            };
+        };
+        let staged = crate::release_store::binary_path(&dir, version);
+        if !staged.exists() {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: format!(
+                    "no cached binary for version {version} at {} — run aii_importReleaseBinary first",
+                    staged.display()
+                ),
+                restart_in_secs: 0,
+            };
+        }
+        // Test-only path: when the override is set, install to
+        // the override and skip execve so the test runner stays
+        // alive.
+        let override_target = self
+            .install_target_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone());
+        let target = if let Some(p) = override_target.clone() {
+            p
+        } else {
+            match crate::release_install::current_aiid_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    return aii_rpc::InstallOutcome {
+                        scheduled: false,
+                        reason: format!("cannot resolve current_exe: {e}"),
+                        restart_in_secs: 0,
+                    };
+                }
+            }
+        };
+        // v0.0.80 safety net: snapshot the currently-running
+        // binary at `<data-dir>/releases/.previous` BEFORE we
+        // clobber it. Lets `aii_rollbackRelease` restore the
+        // pre-install state if the new binary turns out to be
+        // bad. Snapshot failure is non-fatal — we'd rather ship
+        // the new binary without rollback than refuse the
+        // install over a transient I/O hiccup.
+        let releases_dir = dir.join(crate::release_store::RELEASES_SUBDIR);
+        match crate::release_install::save_previous(&target, &releases_dir) {
+            Ok(path) => {
+                tracing::info!(
+                    snapshot = %path.display(),
+                    "pre-install snapshot saved for rollback",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "pre-install snapshot failed; rollback will be unavailable for this install",
+                );
+            }
+        }
+        // v0.0.85 boot-health record: capture current head + version
+        // so the post-execve startup path can check the new binary
+        // actually reached a healthy state. Cleared on confirm,
+        // consumed for rollback on failure. Write failure is
+        // non-fatal (same rationale as save_previous).
+        let install_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let pre_install_head = self.head_block_number_sync();
+        let pending = crate::release_install::BootPending {
+            version: version.to_string(),
+            pre_install_head,
+            install_ts,
+        };
+        match crate::release_install::write_boot_pending(&releases_dir, &pending) {
+            Ok(path) => {
+                tracing::info!(
+                    sentinel = %path.display(),
+                    pre_install_head,
+                    "boot-pending sentinel written",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "boot-pending sentinel write failed; auto-rollback will be unavailable for this install",
+                );
+            }
+        }
+        if let Err(e) = crate::release_install::install_binary(&staged, &target) {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: format!("install failed: {e}"),
+                restart_in_secs: 0,
+            };
+        }
+        tracing::info!(
+            version = version,
+            target = %target.display(),
+            restart_in_secs = RESTART_DELAY_SECS,
+            test_mode = override_target.is_some(),
+            "release installed; self-restart scheduled",
+        );
+        if override_target.is_none() {
+            // IMPORTANT: pass `target` into the spawn instead of
+            // re-resolving via current_exe() inside the closure.
+            // After `rename(2)`, `/proc/self/exe` carries a
+            // literal " (deleted)" suffix that `execve` rejects
+            // with ENOENT — see `release_install::exec_self_at`
+            // for the full rationale.
+            let exec_target = target;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                let err = crate::release_install::exec_self_at(&exec_target);
+                tracing::error!(
+                    error = %err,
+                    target = %exec_target.display(),
+                    "execve self failed; node continues on old binary",
+                );
+            });
+        }
+        aii_rpc::InstallOutcome {
+            scheduled: true,
+            reason: String::new(),
+            restart_in_secs: RESTART_DELAY_SECS,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn rollback_release(&self) -> aii_rpc::InstallOutcome {
+        const RESTART_DELAY_SECS: u64 = 2;
+
+        let Some(dir) = self.data_dir.read().ok().and_then(|g| g.clone()) else {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: "node has no data_dir configured (set_data_dir not called)".into(),
+                restart_in_secs: 0,
+            };
+        };
+        let releases_dir = dir.join(crate::release_store::RELEASES_SUBDIR);
+        let override_target = self
+            .install_target_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone());
+        let target = if let Some(p) = override_target.clone() {
+            p
+        } else {
+            match crate::release_install::current_aiid_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    return aii_rpc::InstallOutcome {
+                        scheduled: false,
+                        reason: format!("cannot resolve current_exe: {e}"),
+                        restart_in_secs: 0,
+                    };
+                }
+            }
+        };
+        if let Err(e) = crate::release_install::rollback_to_previous(&releases_dir, &target) {
+            return aii_rpc::InstallOutcome {
+                scheduled: false,
+                reason: format!("rollback failed: {e}"),
+                restart_in_secs: 0,
+            };
+        }
+        tracing::info!(
+            target = %target.display(),
+            restart_in_secs = RESTART_DELAY_SECS,
+            test_mode = override_target.is_some(),
+            "release rolled back to .previous; self-restart scheduled",
+        );
+        if override_target.is_none() {
+            let exec_target = target;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                let err = crate::release_install::exec_self_at(&exec_target);
+                tracing::error!(
+                    error = %err,
+                    target = %exec_target.display(),
+                    "execve self after rollback failed; node continues on rolled-back binary",
+                );
+            });
+        }
+        aii_rpc::InstallOutcome {
+            scheduled: true,
+            reason: String::new(),
+            restart_in_secs: RESTART_DELAY_SECS,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aii_block::{BlockBody, Bloom, EMPTY_LIST_HASH, EMPTY_TRIE_HASH};
+    use aii_config::MAX_ACTIVE_VALIDATORS;
     use aii_state::Account;
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
+
+    #[test]
+    fn configured_active_validator_cap_matches_bft_vote_bitmap_cap() {
+        assert_eq!(
+            MAX_ACTIVE_VALIDATORS as usize,
+            aii_consensus_bft::MAX_VALIDATORS
+        );
+    }
+
+    #[test]
+    fn keyed_dpos_entries_convert_to_bft_validator_set() {
+        let bls = aii_crypto::bls::SecretKey::from_ikm(&[0x44; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let vrf = aii_crypto::vrf::SecretKey::generate();
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xa1; 20]),
+            stake_wei: U256::from(1_000u64) * U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+            bls_pubkey: Some(aii_types::BlsPubKey::new(bls.public_key().to_compressed())),
+            vrf_pubkey: Some(aii_types::VrfPubKey::new(vrf.public_key().to_bytes())),
+        }];
+
+        let set = bft_validator_set_from_entries(&entries).unwrap();
+
+        assert_eq!(set.size(), 1);
+        assert_eq!(set.total_stake(), 1_000);
+    }
+
+    #[test]
+    fn sub_token_dpos_stake_converts_to_nonzero_bft_weight() {
+        let bls = aii_crypto::bls::SecretKey::from_ikm(&[0x45; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let vrf = aii_crypto::vrf::SecretKey::generate();
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xa1; 20]),
+            stake_wei: U256::from(1_000u64),
+            bls_pubkey: Some(aii_types::BlsPubKey::new(bls.public_key().to_compressed())),
+            vrf_pubkey: Some(aii_types::VrfPubKey::new(vrf.public_key().to_bytes())),
+        }];
+
+        let set = bft_validator_set_from_entries(&entries).unwrap();
+
+        assert_eq!(set.total_stake(), 1);
+    }
+
+    #[test]
+    fn local_bls_key_finds_dpos_bft_index() {
+        let bls_a = aii_crypto::bls::SecretKey::from_ikm(&[0x46; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let bls_b = aii_crypto::bls::SecretKey::from_ikm(&[0x47; 32], b"aii-dpos-to-bft")
+            .expect("bls keygen");
+        let local = aii_types::BlsPubKey::new(bls_b.public_key().to_compressed());
+        let entries = vec![
+            ValidatorEntry {
+                address: Address::new([0xa1; 20]),
+                stake_wei: U256::from(1_000u64),
+                bls_pubkey: Some(aii_types::BlsPubKey::new(
+                    bls_a.public_key().to_compressed(),
+                )),
+                vrf_pubkey: None,
+            },
+            ValidatorEntry {
+                address: Address::new([0xb2; 20]),
+                stake_wei: U256::from(1_000u64),
+                bls_pubkey: Some(local),
+                vrf_pubkey: None,
+            },
+        ];
+
+        assert_eq!(bft_my_index_from_entries(&entries, &local), Some(1));
+    }
+
+    #[test]
+    fn stake_only_dpos_entries_do_not_convert_to_bft_validator_set() {
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xa1; 20]),
+            stake_wei: U256::from(1_000u64),
+            bls_pubkey: None,
+            vrf_pubkey: None,
+        }];
+
+        let err = bft_validator_set_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            err,
+            aii_consensus_bft::BftError::InvalidValidatorPubkey {
+                index: 0,
+                kind: "bls",
+            }
+        );
+    }
+
+    fn test_bft_engine_from_keys(
+        bls: aii_crypto::bls::SecretKey,
+        vrf: aii_crypto::vrf::SecretKey,
+    ) -> aii_consensus_bft::BftEngine {
+        let validator_set =
+            aii_consensus_bft::ValidatorSet::new(vec![aii_consensus_bft::Validator {
+                bls_pubkey: bls.public_key(),
+                vrf_pubkey: vrf.public_key(),
+                stake: 1,
+            }])
+            .unwrap();
+        let cfg = aii_consensus_bft::BftConfig {
+            validator_set,
+            my_index: 0,
+            my_bls_sk: bls,
+            my_vrf_sk: vrf,
+            initial_seed: [0x55; 32],
+            coinbase: Address::new([0xc0; 20]),
+            gas_limit: 30_000_000,
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            slot_seconds: 3,
+            executor: None,
+        };
+        aii_consensus_bft::BftEngine::new(cfg, &fake_block(0, H256::ZERO))
+    }
+
+    #[test]
+    fn startup_dpos_rotation_turns_single_genesis_engine_into_multi_validator() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let local_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x48; 32], b"aii-dpos-to-bft")
+            .expect("local bls");
+        let local_vrf = aii_crypto::vrf::SecretKey::generate();
+        let remote_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x49; 32], b"aii-dpos-to-bft")
+            .expect("remote bls");
+        let remote_vrf = aii_crypto::vrf::SecretKey::generate();
+        let engine = test_bft_engine_from_keys(local_bls.clone(), local_vrf.clone());
+        assert!(engine.is_single_validator());
+
+        let entries = vec![
+            ValidatorEntry {
+                address: Address::new([0xa1; 20]),
+                stake_wei: U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+                bls_pubkey: Some(aii_types::BlsPubKey::new(
+                    local_bls.public_key().to_compressed(),
+                )),
+                vrf_pubkey: Some(aii_types::VrfPubKey::new(local_vrf.public_key().to_bytes())),
+            },
+            ValidatorEntry {
+                address: Address::new([0xb2; 20]),
+                stake_wei: U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+                bls_pubkey: Some(aii_types::BlsPubKey::new(
+                    remote_bls.public_key().to_compressed(),
+                )),
+                vrf_pubkey: Some(aii_types::VrfPubKey::new(
+                    remote_vrf.public_key().to_bytes(),
+                )),
+            },
+        ];
+        let backend = state.backend();
+        dpos::persist_validator_set(&backend, 3, &entries).unwrap();
+
+        let outcome = rotate_bft_engine_to_latest_dpos(&engine, &state).unwrap();
+
+        assert_eq!(
+            outcome,
+            BftDposRotation::Rotated {
+                epoch: 3,
+                validators: 2,
+                my_index: 0,
+            }
+        );
+        assert!(!engine.is_single_validator());
+        assert_eq!(engine.validator_set_size(), 2);
+    }
+
+    #[test]
+    fn startup_dpos_rotation_reports_missing_local_key() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let local_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x4a; 32], b"aii-dpos-to-bft")
+            .expect("local bls");
+        let local_vrf = aii_crypto::vrf::SecretKey::generate();
+        let remote_bls = aii_crypto::bls::SecretKey::from_ikm(&[0x4b; 32], b"aii-dpos-to-bft")
+            .expect("remote bls");
+        let remote_vrf = aii_crypto::vrf::SecretKey::generate();
+        let engine = test_bft_engine_from_keys(local_bls, local_vrf);
+        let entries = vec![ValidatorEntry {
+            address: Address::new([0xb2; 20]),
+            stake_wei: U256::from(BFT_STAKE_WEIGHT_UNIT_WEI),
+            bls_pubkey: Some(aii_types::BlsPubKey::new(
+                remote_bls.public_key().to_compressed(),
+            )),
+            vrf_pubkey: Some(aii_types::VrfPubKey::new(
+                remote_vrf.public_key().to_bytes(),
+            )),
+        }];
+        let backend = state.backend();
+        dpos::persist_validator_set(&backend, 9, &entries).unwrap();
+
+        let outcome = rotate_bft_engine_to_latest_dpos(&engine, &state).unwrap();
+
+        assert_eq!(
+            outcome,
+            BftDposRotation::LocalKeyMissing {
+                epoch: 9,
+                validators: 1,
+            }
+        );
+        assert!(engine.is_single_validator());
+    }
 
     #[tokio::test]
     async fn end_to_end_chain_id_query() {
@@ -1630,6 +2871,452 @@ mod tests {
         let client = HttpClientBuilder::default().build(url).unwrap();
         let chain_id: String = client.request("eth_chainId", rpc_params![]).await.unwrap();
         assert_eq!(chain_id, "0x63"); // 99
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.88 eth_call: a plain value-transfer simulation
+    /// returns 0x (empty return data) and leaves the
+    /// underlying state untouched.
+    #[tokio::test]
+    async fn eth_call_value_transfer_returns_empty_and_state_unchanged() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xaa; 20]);
+        let bob = aii_types::Address::new([0xbb; 20]);
+        let alice_balance = aii_types::U256::from(1_000_000_000_000_000_000_u128);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: alice_balance,
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        let req = serde_json::json!({
+            "from": format!("0x{}", hex::encode(alice.as_bytes())),
+            "to":   format!("0x{}", hex::encode(bob.as_bytes())),
+            "value": "0x16345785d8a0000", // 0.1 AII
+        });
+        let result: String = client
+            .request("eth_call", rpc_params![req, "latest"])
+            .await
+            .unwrap();
+        assert_eq!(result, "0x", "value-transfer call has empty return data");
+
+        // State must be untouched.
+        let alice_after = state.state.account(&alice).unwrap().unwrap();
+        assert_eq!(
+            alice_after.balance, alice_balance,
+            "eth_call must not modify sender balance",
+        );
+        let bob_after = state.state.account(&bob).unwrap();
+        assert!(
+            bob_after.is_none() || bob_after.unwrap().balance == aii_types::U256::ZERO,
+            "eth_call must not modify recipient balance",
+        );
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByNumber for a committed block:
+    /// returns the header + an empty tx list (when the body
+    /// has no transactions).
+    #[tokio::test]
+    async fn eth_get_block_by_number_committed_block_returns_header_and_empty_txs() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let block = fake_block(7, H256::ZERO);
+        let expected_hash = block.hash();
+        state.commit_block(&block);
+
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByNumber", rpc_params!["0x7", false])
+            .await
+            .unwrap();
+        let resp = resp.expect("block must exist");
+        assert_eq!(resp.header.number, "0x7");
+        assert_eq!(
+            resp.header.hash,
+            format!("0x{}", hex::encode(expected_hash.as_bytes()))
+        );
+        match resp.transactions {
+            aii_rpc::EthBlockTxs::Hashes(h) => assert!(h.is_empty()),
+            aii_rpc::EthBlockTxs::Full(_) => panic!("full_transactions=false must yield hashes"),
+        }
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByNumber with the "latest" tag
+    /// resolves to the highest committed block.
+    #[tokio::test]
+    async fn eth_get_block_by_number_latest_tag_returns_head() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        for n in 1..=4 {
+            // parent_hash is irrelevant for this test — we only
+            // care that "latest" resolves to the highest height.
+            state.commit_block(&fake_block(n, H256::ZERO));
+        }
+        state.set_head(4);
+
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByNumber", rpc_params!["latest", false])
+            .await
+            .unwrap();
+        let resp = resp.expect("latest tag must resolve");
+        assert_eq!(resp.header.number, "0x4");
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByHash mirrors eth_getBlockByNumber.
+    #[tokio::test]
+    async fn eth_get_block_by_hash_returns_block() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let block = fake_block(3, H256::ZERO);
+        let block_hash = block.hash();
+        state.commit_block(&block);
+
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        let hash_hex = format!("0x{}", hex::encode(block_hash.as_bytes()));
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByHash", rpc_params![hash_hex.clone(), false])
+            .await
+            .unwrap();
+        let resp = resp.expect("block must exist");
+        assert_eq!(resp.header.number, "0x3");
+        assert_eq!(resp.header.hash, hash_hex);
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getTransactionByHash on an unknown hash
+    /// returns null.
+    #[tokio::test]
+    async fn eth_get_transaction_by_hash_unknown_returns_null() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let resp: Option<aii_rpc::EthTxResponse> = client
+            .request(
+                "eth_getTransactionByHash",
+                rpc_params![format!("0x{}", "ab".repeat(32))],
+            )
+            .await
+            .unwrap();
+        assert!(resp.is_none());
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.90 eth_getBlockByNumber against an unknown block
+    /// returns null (not an error).
+    #[tokio::test]
+    async fn eth_get_block_by_number_unknown_returns_null() {
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let (addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let resp: Option<aii_rpc::EthBlockResponse> = client
+            .request("eth_getBlockByNumber", rpc_params!["0x999", false])
+            .await
+            .unwrap();
+        assert!(resp.is_none());
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.89 eth_estimateGas for a value transfer should
+    /// be exactly 21,000 (intrinsic gas, no execution beyond
+    /// the transfer itself).
+    #[tokio::test]
+    async fn eth_estimate_gas_value_transfer_is_21000() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa2; 20]);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: aii_types::U256::from(1_000_000_000_000_000_000_u128),
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let req = serde_json::json!({
+            "from": format!("0x{}", hex::encode(alice.as_bytes())),
+            "to": "0x000000000000000000000000000000000000bbbb",
+        });
+        let gas_hex: String = client
+            .request("eth_estimateGas", rpc_params![req, "latest"])
+            .await
+            .unwrap();
+        let gas = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(
+            gas, 21_000,
+            "value transfer must be exactly 21k intrinsic gas"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.89 eth_getCode against an EOA returns "0x"
+    /// (empty). Against a deployed contract, returns the
+    /// runtime bytecode.
+    #[tokio::test]
+    async fn eth_get_code_eoa_and_contract() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa3; 20]);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: aii_types::U256::from(1_000_000_000_000_000_000_u128),
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // Deploy a tiny contract whose runtime is just 0x6077 (PUSH1 0x77 — incomplete but parseable as bytes).
+        let runtime: Vec<u8> = vec![0x60, 0x77, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            None,
+            aii_types::U256::ZERO,
+            init,
+            500_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+        let contract = deploy.deployed_contract.unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        // EOA → "0x".
+        let eoa_code: String = client
+            .request(
+                "eth_getCode",
+                rpc_params![format!("0x{}", hex::encode(alice.as_bytes())), "latest"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(eoa_code, "0x", "EOA must have empty code");
+
+        // Contract → runtime bytes hex.
+        let contract_code: String = client
+            .request(
+                "eth_getCode",
+                rpc_params![format!("0x{}", hex::encode(contract.as_bytes())), "latest"],
+            )
+            .await
+            .unwrap();
+        let bytes = hex::decode(contract_code.trim_start_matches("0x")).unwrap();
+        assert_eq!(bytes, runtime, "contract code must round-trip exactly");
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.89 eth_getStorageAt: unset slot returns
+    /// `0x000…000`; after a write via revm, the slot returns
+    /// the committed value.
+    #[tokio::test]
+    async fn eth_get_storage_at_returns_committed_value() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa4; 20]);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: aii_types::U256::from(1_000_000_000_000_000_000_u128),
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // Deploy a contract whose runtime SSTOREs 0xdead to
+        // slot 0 then returns. Init wraps + CODECOPY.
+        // Runtime:
+        //   PUSH2 0xde 0xad → wait, simpler to PUSH2 0xdead then SSTORE
+        // Use: PUSH2 0xdead PUSH1 0x00 SSTORE STOP
+        let runtime: Vec<u8> = vec![
+            0x61, 0xde, 0xad, // PUSH2 0xdead
+            0x60, 0x00, // PUSH1 0x00
+            0x55, //       SSTORE
+            0x00, //       STOP
+        ];
+        let len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            None,
+            aii_types::U256::ZERO,
+            init,
+            500_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+        let contract = deploy.deployed_contract.unwrap();
+
+        // Run the contract once so it SSTOREs.
+        let _ = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            Some(contract),
+            aii_types::U256::ZERO,
+            vec![],
+            100_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+
+        // Slot 0 → 0xdead (left-padded to 32 bytes).
+        let v0: String = client
+            .request(
+                "eth_getStorageAt",
+                rpc_params![
+                    format!("0x{}", hex::encode(contract.as_bytes())),
+                    "0x0",
+                    "latest"
+                ],
+            )
+            .await
+            .unwrap();
+        let mut expected = [0u8; 32];
+        expected[30] = 0xde;
+        expected[31] = 0xad;
+        assert_eq!(v0, format!("0x{}", hex::encode(expected)));
+
+        // Slot 1 (unset) → all zeros.
+        let v1: String = client
+            .request(
+                "eth_getStorageAt",
+                rpc_params![
+                    format!("0x{}", hex::encode(contract.as_bytes())),
+                    "0x1",
+                    "latest"
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(v1, format!("0x{}", "00".repeat(32)));
+        handle.stop().unwrap();
+    }
+
+    /// v0.0.88 eth_call against a contract that returns a
+    /// constant: the return data round-trips back through the
+    /// RPC as hex.
+    #[tokio::test]
+    async fn eth_call_against_deployed_contract_returns_constant() {
+        use aii_state::Account;
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let alice = aii_types::Address::new([0xa1; 20]);
+        let alice_balance = aii_types::U256::from(1_000_000_000_000_000_000_u128);
+        state
+            .state
+            .set_account(
+                &alice,
+                &Account {
+                    nonce: 0,
+                    balance: alice_balance,
+                    ..Account::EMPTY
+                },
+            )
+            .unwrap();
+
+        // Deploy a contract whose runtime always returns 32
+        // bytes of 0x...77.
+        let runtime: Vec<u8> = vec![0x60, 0x77, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let deploy = aii_evm::execute_with_revm(
+            &state.state,
+            alice,
+            None,
+            aii_types::U256::ZERO,
+            init,
+            500_000,
+            aii_types::U256::ZERO,
+        )
+        .unwrap();
+        assert!(deploy.success);
+        let contract = deploy.deployed_contract.unwrap();
+
+        let (rpc_addr, handle) = aii_rpc::serve("127.0.0.1:0".parse().unwrap(), state.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{rpc_addr}");
+        let client = HttpClientBuilder::default().build(url).unwrap();
+        let req = serde_json::json!({
+            "from": format!("0x{}", hex::encode(alice.as_bytes())),
+            "to":   format!("0x{}", hex::encode(contract.as_bytes())),
+        });
+        let result: String = client
+            .request("eth_call", rpc_params![req, "latest"])
+            .await
+            .unwrap();
+        // 32 bytes, last byte 0x77.
+        assert_eq!(result.len(), 2 + 64); // "0x" + 64 hex chars
+        assert!(result.ends_with("77"));
         handle.stop().unwrap();
     }
 
@@ -1948,6 +3635,40 @@ mod tests {
     }
 
     #[test]
+    fn node_state_executor_returns_post_roots_without_mutating_live_state() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let live_before = state.state().state_root().unwrap();
+        let coinbase = Address::new([0xc0; 20]);
+        let executor = NodeStateExecutor::new(Arc::clone(&state));
+
+        let roots = aii_consensus_iface::BlockExecutor::execute_for_proposal(
+            &executor,
+            &BlockBody::default(),
+            coinbase,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.state().state_root().unwrap(),
+            live_before,
+            "proposal execution must not mutate live state",
+        );
+        let expected_backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let expected_state = Arc::new(StateDb::new(expected_backend));
+        credit_state_for_roots(
+            &expected_state,
+            &coinbase,
+            U256::from(2_000_000_000_000_000_000u128),
+        )
+        .unwrap();
+        assert_eq!(roots.state_root, expected_state.state_root().unwrap());
+        assert_eq!(roots.receipts_root, EMPTY_TRIE_HASH);
+        assert_eq!(roots.logs_bloom, [0u8; 256]);
+        assert_eq!(roots.gas_used, 0);
+    }
+
+    #[test]
     fn fork_at_same_height_records_evidence() {
         let state = NodeState::new_for_tests(ChainSpec::mainnet());
         let mut canonical = fake_block(1, H256::ZERO);
@@ -1982,6 +3703,34 @@ mod tests {
         state.debit_slash_stake(&validator, U256::from(250u64));
         let rec = state.stake_table().get(&validator).unwrap().unwrap();
         assert_eq!(rec.amount_wei, U256::from(750u64));
+    }
+
+    #[test]
+    fn latest_validator_address_by_index_reads_dpos_epoch_set() {
+        let state = NodeState::new_for_tests(ChainSpec::mainnet());
+        let first = Address::new([0xa1; 20]);
+        let second = Address::new([0xb2; 20]);
+        let entries = vec![
+            ValidatorEntry {
+                address: first,
+                stake_wei: U256::from(1_000u64),
+                bls_pubkey: None,
+                vrf_pubkey: None,
+            },
+            ValidatorEntry {
+                address: second,
+                stake_wei: U256::from(900u64),
+                bls_pubkey: None,
+                vrf_pubkey: None,
+            },
+        ];
+        dpos::persist_validator_set(&state.backend(), 7, &entries).unwrap();
+
+        assert_eq!(
+            state.latest_validator_address_by_index(1),
+            Some((7, second))
+        );
+        assert_eq!(state.latest_validator_address_by_index(2), None);
     }
 
     #[test]
@@ -2074,6 +3823,74 @@ mod tests {
         assert_eq!(
             acc.balance, expected,
             "block 1 must mint {expected} wei subsidy to beneficiary",
+        );
+    }
+
+    #[test]
+    fn elected_beneficiary_receives_subsidy_after_dpos_election() {
+        let mut spec = ChainSpec::mainnet();
+        spec.epoch_length_blocks = 2;
+        spec.min_validator_stake_wei = 1;
+        spec.validators_per_epoch = 1;
+        let backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let state = NodeState::new(spec, backend);
+
+        let elected = Address::new([0xe1; 20]);
+        state
+            .stake_table()
+            .bond(&elected, U256::from(1_000u64))
+            .unwrap();
+
+        let b1 = fake_block(1, H256::ZERO);
+        let b2 = fake_block(2, b1.hash());
+        state.commit_block(&b1);
+        state.commit_block(&b2);
+        assert!(
+            state.async_active_validator_set_test_helper().is_some(),
+            "block 2 must establish the DPoS reward-eligible set",
+        );
+
+        let mut b3 = fake_block(3, b2.hash());
+        b3.header.beneficiary = elected;
+        state.commit_block(&b3);
+
+        let acc = state.state().account(&elected).unwrap().unwrap();
+        assert_eq!(
+            acc.balance,
+            U256::from(2_000_000_000_000_000_000u128),
+            "elected staker must receive the block subsidy",
+        );
+    }
+
+    #[test]
+    fn non_elected_beneficiary_gets_no_subsidy_after_dpos_election() {
+        let mut spec = ChainSpec::mainnet();
+        spec.epoch_length_blocks = 2;
+        spec.min_validator_stake_wei = 1;
+        spec.validators_per_epoch = 1;
+        let backend = Arc::new(aii_storage::RocksDbBackend::open_in_temp().unwrap());
+        let state = NodeState::new(spec, backend);
+
+        let elected = Address::new([0xe1; 20]);
+        let outsider = Address::new([0xdd; 20]);
+        state
+            .stake_table()
+            .bond(&elected, U256::from(1_000u64))
+            .unwrap();
+
+        let b1 = fake_block(1, H256::ZERO);
+        let b2 = fake_block(2, b1.hash());
+        state.commit_block(&b1);
+        state.commit_block(&b2);
+
+        let mut b3 = fake_block(3, b2.hash());
+        b3.header.beneficiary = outsider;
+        state.commit_block(&b3);
+
+        let maybe_acc = state.state().account(&outsider).unwrap();
+        assert!(
+            maybe_acc.is_none_or(|acc| acc.balance.is_zero()),
+            "non-elected beneficiary must not receive the subsidy",
         );
     }
 
@@ -2245,5 +4062,503 @@ mod tests {
                 "body must restore for block {n}"
             );
         }
+    }
+
+    /// v0.0.78 install path: when both the manifest and binary are
+    /// present, and an install-target override is set (test mode),
+    /// install_release performs the atomic file swap and returns
+    /// `scheduled: true` WITHOUT spawning the `execve` self-task.
+    /// The override file ends up holding the staged bytes; the
+    /// previous override-file contents are discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_release_swaps_override_target_and_skips_exec() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"OLD CONTENTS").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Sign a manifest with the project pinned secret so
+        // record_release_announcement accepts it.
+        let payload = b"v0.0.78 atomic install body";
+        let mut tmpf = tempfile::NamedTempFile::new().unwrap();
+        tmpf.write_all(payload).unwrap();
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let manifest = sign_release(&sk, tmpf.path(), "0.0.78", 1_900_000_078).unwrap();
+        let accepted =
+            aii_rpc::RpcState::record_release_announcement(&*state, manifest.clone()).await;
+        assert!(accepted, "manifest should be accepted on a fresh node");
+
+        // Pre-stage the binary in the release store as if a prior
+        // aii_importReleaseBinary had landed it.
+        crate::release_store::store_verified_binary(
+            &data_dir,
+            "0.0.78",
+            &manifest.sha256_hex,
+            payload,
+        )
+        .unwrap();
+
+        // Trigger install. Test mode: override path is used, no execve fires.
+        let outcome = aii_rpc::RpcState::install_release(&*state, "0.0.78").await;
+        assert!(outcome.scheduled, "install should succeed: {outcome:?}");
+        assert!(outcome.restart_in_secs > 0);
+
+        // Override target now holds the staged binary contents.
+        let installed = std::fs::read(&target).unwrap();
+        assert_eq!(
+            installed, payload,
+            "install_release must atomically replace the target"
+        );
+
+        // Stale .new file should not exist after a clean install.
+        let staging_path = target.with_extension("new");
+        assert!(
+            !staging_path.exists(),
+            ".new staging file must be consumed by rename"
+        );
+    }
+
+    /// install_release fails-soft when the binary for the requested
+    /// version is not present in the release store. Nothing is
+    /// written to the target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_release_rejects_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"UNCHANGED").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir);
+        state.set_install_target_for_tests(target.clone());
+
+        let outcome = aii_rpc::RpcState::install_release(&*state, "0.0.99").await;
+        assert!(!outcome.scheduled);
+        assert!(outcome.reason.contains("no cached binary"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"UNCHANGED");
+    }
+
+    /// v0.0.85 boot-health: when head ADVANCES past the recorded
+    /// pre_install_head within the confirm window, the sentinel
+    /// is cleared and no rollback fires.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_clears_sentinel_when_head_advances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+
+        // Seed the sentinel as if a prior install had written it.
+        // install_ts = "now" so v0.0.86 stale-shortcut doesn't fire.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let pending = crate::release_install::BootPending {
+            version: "0.0.85-test".into(),
+            pre_install_head: 0,
+            install_ts: now,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+        assert!(crate::release_install::boot_pending_path(&releases_dir).exists());
+
+        // Advance head BEFORE the confirm task runs, so its
+        // post-sleep check sees an advanced head.
+        state.set_head(42);
+
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            1,    // 1 second grace window
+            3600, // restart_window_secs
+            999,  // restart_max_per_window (effectively unlimited)
+        );
+        // Wait long enough for the task to complete the sleep
+        // + the sentinel-clear.
+        h.await.unwrap();
+        assert!(
+            !crate::release_install::boot_pending_path(&releases_dir).exists(),
+            "healthy boot must clear .boot-pending"
+        );
+    }
+
+    /// v0.0.85 boot-health: when head does NOT advance, the
+    /// confirm task fires rollback_release. The override
+    /// install target gets the `.previous` bytes swapped in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_triggers_rollback_when_head_stuck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_NEW_INSTALLED").unwrap();
+        // .previous holds the bytes we'd roll back TO.
+        std::fs::write(
+            releases_dir.join(crate::release_install::PREVIOUS_NAME),
+            b"V_PREVIOUS",
+        )
+        .unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Seed the sentinel; head stays at 0.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.85-bad".into(),
+            pre_install_head: 0,
+            install_ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            1,
+            3600,
+            999,
+        );
+        h.await.unwrap();
+
+        // Rollback fired ⇒ target has the .previous bytes now.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V_PREVIOUS",
+            "rollback must restore the .previous snapshot onto the target",
+        );
+    }
+
+    /// v0.0.85 boot-health: when the sentinel is absent, the
+    /// confirm task is a no-op (typical normal-startup case).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_noop_when_no_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            1,
+            3600,
+            999,
+        );
+        h.await.unwrap();
+        // Nothing should have been created.
+        assert!(!crate::release_install::boot_pending_path(&releases_dir).exists(),);
+    }
+
+    /// v0.0.85 boot-health: confirm_secs == 0 is a no-op even
+    /// when a sentinel is present (operator hasn't opted in).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_confirm_disabled_when_secs_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+        let pending = crate::release_install::BootPending {
+            version: "0.0.85".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+        let sentinel = crate::release_install::boot_pending_path(&releases_dir);
+        assert!(sentinel.exists());
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            0, // disabled
+            3600,
+            999,
+        );
+        h.await.unwrap();
+        // Sentinel still present — confirm task didn't run.
+        assert!(sentinel.exists());
+    }
+
+    /// v0.0.86: stale-sentinel shortcut. When the sentinel's
+    /// install_ts is well in the past (>= 2× confirm_secs ago),
+    /// the boot-health task skips the sleep and triggers
+    /// rollback immediately — a node that was systemd-respawned
+    /// after the previous boot crashed shouldn't wait another
+    /// full confirm window before recovering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_stale_sentinel_triggers_immediate_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_NEW_INSTALLED").unwrap();
+        std::fs::write(
+            releases_dir.join(crate::release_install::PREVIOUS_NAME),
+            b"V_PREVIOUS",
+        )
+        .unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // install_ts = 1 (epoch+1); confirm_secs = 60 ⇒ stale
+        // threshold = 120s. Today's clock minus 1 is *way*
+        // past 120s, so the shortcut MUST fire.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.86-stale".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+
+        let start = std::time::Instant::now();
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            60, // big confirm window — proving the shortcut skipped it
+            3600,
+            999,
+        );
+        h.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V_PREVIOUS",
+            "stale-sentinel must trigger rollback even with a big confirm window",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "stale-sentinel shortcut must skip the 60s sleep (took {elapsed:?})",
+        );
+    }
+
+    /// v0.0.86: restart rate limit blocks rollback when the
+    /// rolling window is full. The target binary should be
+    /// left untouched and the operator gets an ERROR log line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_health_rate_limit_blocks_rollback_when_window_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let releases_dir = data_dir.join(crate::release_store::RELEASES_SUBDIR);
+        std::fs::create_dir_all(&releases_dir).unwrap();
+
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_NEW_INSTALLED").unwrap();
+        std::fs::write(
+            releases_dir.join(crate::release_install::PREVIOUS_NAME),
+            b"V_PREVIOUS",
+        )
+        .unwrap();
+
+        // Pre-seed the restart log with 3 events at "now" so
+        // the cap (3) is already full.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        crate::release_install::append_restart_event(&releases_dir, now, 3600).unwrap();
+        crate::release_install::append_restart_event(&releases_dir, now, 3600).unwrap();
+        crate::release_install::append_restart_event(&releases_dir, now, 3600).unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Stale sentinel ⇒ would normally rollback immediately.
+        let pending = crate::release_install::BootPending {
+            version: "0.0.86-stuck".into(),
+            pre_install_head: 0,
+            install_ts: 1,
+        };
+        crate::release_install::write_boot_pending(&releases_dir, &pending).unwrap();
+
+        let h = crate::head_watchdog::start_boot_health_confirm(
+            Arc::clone(&state),
+            releases_dir.clone(),
+            10,
+            3600,
+            3, // cap matches the pre-seeded events
+        );
+        h.await.unwrap();
+
+        // Rate limit blocked the rollback — target untouched.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V_NEW_INSTALLED",
+            "rate-limited rollback must NOT modify the target",
+        );
+    }
+
+    /// v0.0.80 explicit rollback: after one install the snapshot
+    /// of the pre-install binary lives at `.previous`. Calling
+    /// rollback restores it onto the target and leaves the
+    /// newly-installed bytes in `.previous` so a second rollback
+    /// flips back. Both swaps verified.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_release_restores_previous_after_install() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"V_ORIGINAL").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir.clone());
+        state.set_install_target_for_tests(target.clone());
+
+        // Sign + accept manifest, then stage the binary in the
+        // release store so install_release has bytes to install.
+        let payload = b"V_NEW_INSTALLED";
+        let mut tmpf = tempfile::NamedTempFile::new().unwrap();
+        tmpf.write_all(payload).unwrap();
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let manifest = sign_release(&sk, tmpf.path(), "0.0.80", 1_900_000_080).unwrap();
+        assert!(aii_rpc::RpcState::record_release_announcement(&*state, manifest.clone()).await);
+        crate::release_store::store_verified_binary(
+            &data_dir,
+            "0.0.80",
+            &manifest.sha256_hex,
+            payload,
+        )
+        .unwrap();
+
+        // Install: snapshots target (V_ORIGINAL) to .previous,
+        // then overlays payload (V_NEW_INSTALLED) onto target.
+        let out = aii_rpc::RpcState::install_release(&*state, "0.0.80").await;
+        assert!(out.scheduled, "install must succeed: {out:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        let prev_path = crate::release_install::previous_path(
+            &data_dir.join(crate::release_store::RELEASES_SUBDIR),
+        );
+        assert_eq!(
+            std::fs::read(&prev_path).unwrap(),
+            b"V_ORIGINAL",
+            "install must snapshot the pre-install bytes"
+        );
+
+        // Rollback once: target → V_ORIGINAL, .previous → V_NEW_INSTALLED.
+        let r = aii_rpc::RpcState::rollback_release(&*state).await;
+        assert!(r.scheduled, "rollback must succeed: {r:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"V_ORIGINAL");
+        assert_eq!(
+            std::fs::read(&prev_path).unwrap(),
+            payload,
+            "rollback must leave the rolled-away-from bytes in .previous"
+        );
+
+        // Rollback again: target → V_NEW_INSTALLED, .previous → V_ORIGINAL.
+        let r2 = aii_rpc::RpcState::rollback_release(&*state).await;
+        assert!(r2.scheduled);
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert_eq!(std::fs::read(&prev_path).unwrap(), b"V_ORIGINAL");
+    }
+
+    /// v0.0.80 — rollback on a fresh node (no install yet) must
+    /// fail-soft with a clear reason and leave the target alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_release_rejects_when_no_previous_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"UNTOUCHED").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir);
+        state.set_install_target_for_tests(target.clone());
+
+        let r = aii_rpc::RpcState::rollback_release(&*state).await;
+        assert!(!r.scheduled);
+        assert!(r.reason.contains("rollback failed") || r.reason.contains("snapshot"));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"UNTOUCHED",
+            "target must not be modified when rollback is rejected"
+        );
+    }
+
+    /// v0.0.78 auto-install path: when --auto-install-releases is
+    /// on, a successful manifest accept followed by a binary import
+    /// fires install_release without an explicit RPC call. The
+    /// target file ends up holding the imported bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_install_fires_when_manifest_and_binary_both_present() {
+        use aii_crypto::ed25519::SecretKey;
+        use aii_crypto::release::sign_release;
+        use std::io::Write;
+
+        const PINNED_SECRET_HEX: &str =
+            "be06b95cb0e2d44ee175cc7a475ea4e9fcab47a784d161c36978b34e28ceeb97";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let target = data_dir.join("aiid-stub-binary");
+        std::fs::write(&target, b"PREVIOUS").unwrap();
+
+        let state = NodeState::new_for_tests(ChainSpec::testnet());
+        state.set_data_dir(data_dir);
+        state.set_install_target_for_tests(target.clone());
+        state.set_auto_install_releases(true);
+        assert!(state.auto_install_releases());
+
+        let payload = b"v0.0.78 auto-install body";
+        let mut tmpf = tempfile::NamedTempFile::new().unwrap();
+        tmpf.write_all(payload).unwrap();
+        let sk = SecretKey::from_hex(PINNED_SECRET_HEX).unwrap();
+        let manifest = sign_release(&sk, tmpf.path(), "0.0.78", 1_900_000_079).unwrap();
+
+        // Step 1: announce. Binary not yet present, auto-install skips silently.
+        let ok = aii_rpc::RpcState::record_release_announcement(&*state, manifest.clone()).await;
+        assert!(ok);
+        // Target still untouched.
+        assert_eq!(std::fs::read(&target).unwrap(), b"PREVIOUS");
+
+        // Step 2: import binary. NOW both conditions hold, auto-install fires.
+        let (imp_ok, reason) =
+            aii_rpc::RpcState::import_release_binary(&*state, "0.0.78", payload.to_vec()).await;
+        assert!(imp_ok, "binary import should accept: {reason}");
+
+        // Target replaced.
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
     }
 }

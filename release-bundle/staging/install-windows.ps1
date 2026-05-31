@@ -21,6 +21,9 @@ $InstallDir = "C:\Program Files\aii"
 $DataDir    = "C:\ProgramData\aii"
 $LogFile    = "$DataDir\aiid.log"
 $Bootnode   = "http://8.211.135.234:8545"
+$DiscoverySeeds = "8.211.135.234:30310,106.14.223.128:30310"
+$DiscoveryAdvertise = if ($env:DISCOVERY_ADVERTISE) { $env:DISCOVERY_ADVERTISE } else { $env:AII_DISCOVERY_ADVERTISE }
+$BftAdvertise = if ($env:BFT_ADVERTISE) { $env:BFT_ADVERTISE } else { $env:AII_BFT_ADVERTISE }
 $Service    = "aiid"
 $SrcRepo    = "https://github.com/kinglovesdao/aii.git"
 
@@ -89,8 +92,15 @@ $ArgsVal = $ArgsObs + @(
     "--genesis", "$DataDir\genesis.json",
     "--keystore","$DataDir\keystore.json",
     "--bft-listen","0.0.0.0:30311",
+    "--discovery-seeds", $DiscoverySeeds,
     "--peers",   "8.211.135.234:30311,106.14.223.128:30311"
 )
+if ($DiscoveryAdvertise) {
+    $ArgsVal += @("--discovery-advertise", $DiscoveryAdvertise)
+}
+if ($BftAdvertise) {
+    $ArgsVal += @("--bft-advertise", $BftAdvertise)
+}
 $ExecArgs = if ($Observer) { $ArgsObs } else { $ArgsVal }
 
 $BinPath  = "`"$InstallDir\aiid.exe`" " + (($ExecArgs | ForEach-Object { "`"$_`"" }) -join " ")

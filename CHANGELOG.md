@@ -5,6 +5,1984 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.93] — 2026-05-31
+
+### Fixed — BFT block-sync over gossip: validator restart no longer stalls the chain
+
+Before v0.0.93, `BftMessage` carried only `Proposal`, `Prevote`, and
+`Precommit`. A validator that restarted and landed one committed block
+behind its peers could not fetch the missing block over gossip — the
+only recovery was an HTTP cold-sync via `--bootnode`. In a 3-of-3
+quorum this stalled the whole chain on every single-validator restart.
+
+**Two new wire variants added to `aii-consensus-bft`:**
+
+- `BlockRequest { height }` (tag `0x03`, 9 bytes): broadcast by a
+  lagging validator when it observes a peer vote/proposal at a height
+  it cannot yet reach (`remote_height > local_head + 1`). De-duplicated
+  via `RoundFlags::requested_blocks` so one block is requested at most
+  once per catch-up cycle.
+
+- `BlockResponse { block_bytes, certificate }` (tag `0x04`):
+  answer from a peer that has the committed block cached. Carries the
+  full RLP-encoded `Block` plus a `PrecommitCertificate` (⅔-stake BLS
+  aggregate + signer bitmap) so the requester can verify finality
+  independently before adopting it.
+
+**Engine changes (`aii-consensus-bft`):**
+
+- `BftEngineState::recent_blocks` — `BTreeMap<u64, Block>` capped at
+  64 entries. Populated on every `try_harvest_committed` (and
+  `adopt_synced_block`). Serves `BlockRequest` without reaching back
+  into host storage.
+
+- `engine.committed_block_at(height)` — returns
+  `Option<(Block, PrecommitCertificate)>` from the cache.
+
+- `engine.adopt_synced_block(block, certificate)` — validates that
+  `block.number == head+1`, `parent_hash` matches, and
+  `certificate.verify(validator_set)` passes; then advances head,
+  rolls the VRF seed forward from `mix_hash`, clears the coordinator,
+  caches the block. Returns the adopted block so gossip can hand it to
+  the host's `commit_block` / `set_head` path — identical to a
+  normally-harvested block.
+
+**Gossip changes (`aii-consensus-bft`):**
+
+- `dispatch_inbound`: all three prior variants now call
+  `request_catchup_if_future_height` before routing, so lag detection
+  is uniform.
+
+- `request_catchup_if_future_height`: compares `remote_height` to
+  `engine.head_number() + 1`; if behind, inserts into
+  `requested_blocks` set (de-dup) and broadcasts `BlockRequest`.
+
+- `handle_block_response`: RLP-decodes the block, verifies certificate,
+  calls `adopt_synced_block`, pushes the adopted block into
+  `harvested_blocks` so the host loop picks it up exactly like a
+  gossip-committed block.
+
+- `handle_proposal_msg` (bonus): if a Proposal arrives for a future
+  round (`round > active_round`), automatically fast-forwards to that
+  round — closes a related liveness hole where a restarted node at
+  round 0 could not catch up to peers at round R > 0 unless the
+  persisted `bft_state.json` had a non-zero round.
+
+**Verified locally:** 945 workspace tests pass; `clippy -D warnings`
+clean. Production real-condition validation (restart a single validator,
+confirm chain self-heals without `--bootnode`) is the next step before
+deploying.
+
+#### Scope discipline
+
+Out of scope: syncing more than one block at a time (current design
+requests one block per catch-up cycle, which is sufficient for the
+typical "1 block behind on restart" case; deeper catch-ups still use
+`--bootnode`); changing the consensus rules; altering the Proposal /
+Prevote / Precommit wire format.
+
+## [0.0.92] — 2026-05-30
+
+### Fixed — discovery refresh no longer stalls BFT consensus
+
+v0.0.91 ran the periodic Discovery v4 refresh **inline inside the BFT
+consensus producer loop**. `discover_once_full` is time-bounded by
+`--discovery-timeout-ms`, but while it awaited, `gossip.tick()` could
+not run — so every `--discovery-refresh-secs` the consensus engine
+stopped advancing for the whole discovery window.
+
+Reproduced with a local 2-validator A/B cluster (`aii validator keygen`
++ `aii genesis init`, distinct ports, a black-hole discovery seed so
+`discover_once_full` waits its full timeout):
+
+- **control** (`--no-discovery`): steady production, longest
+  consecutive zero-advance run = **0 s**.
+- **treatment** (discovery on, `--discovery-timeout-ms 6000
+  --discovery-refresh-secs 8`): periodic **~3–4 s consensus freeze
+  recurring ~every 7 s** (sawtooth height curve).
+
+**Fix:** the discovery refresh now runs in its own `tokio::spawn`
+task, decoupled from the consensus loop. `gossip.tick()` is never
+blocked by network discovery; discovered peers still flow back via
+`transport.add_peer` + the shared peer view + the on-disk peer cache,
+exactly as before. After the fix the treatment run also shows a
+**0 s** longest zero-advance run — identical to the control.
+
+This was NOT the cause of the earlier production chain stall (that was
+a quorum-of-3 testnet with one wedged node; only a node restart
+recovered it). It is a latent liveness tax that would matter under the
+30 s-finality / high-load target.
+
+#### Scope discipline
+
+Out of scope: the discovery wire protocol, seed lists, and the startup
+discovery pass are unchanged; only *where* the periodic refresh runs
+moved. No consensus, RPC, or storage behavior changed.
+
+## [0.0.91] — 2026-05-28
+
+### Added — public-internet discovery glue + BFT capacity budget + validator registry
+
+This release integrates ~2,500 LoC across 26 files of in-flight
+work that had been accumulating in the working tree (codex-
+authored). Three new modules + threading through the BFT
+producer + transport layers. Focused on the user-stated goal of
+"real public-internet multi-node discovery / dial verification".
+
+#### `aii-node::discovery_bootstrap` (new, 1148 lines)
+
+Glues the v0.0.17 devp2p Discovery v4 wire (`aii-net-p2p::
+discovery`) into the `aiid` startup path. On boot in `--bft`
+mode the node:
+
+1. Resolves seeds (`--discovery-seeds` CLI + `AII_DISCOVERY_SEEDS`
+   env + compile-time `TESTNET_DISCOVERY_SEEDS` /
+   `MAINNET_DISCOVERY_SEEDS` defaults like
+   `bootnodes.aii.network:30310`). Resolution tolerates DNS or
+   raw `host:port`.
+2. Loads or creates `<data-dir>/discovery.key` — a persistent
+   secp256k1 identity for Discovery v4 packet signing.
+3. Runs `discover_once_full`: ping each seed, ask for
+   `FindNode`, accept `Neighbours` replies. Newly-discovered
+   BFT TCP endpoints are merged into the v0.0.69 peer cache
+   and dialed via the BFT transport's `add_peer`.
+4. Infers public IP from `Pong.to` observed-endpoint when no
+   `--discovery-advertise` / `--bft-advertise` is set.
+5. Spawns a long-running `UdpDiscovery` responder bound to
+   `--discovery-listen` (default `0.0.0.0:30310`) that answers
+   `Ping` / `FindNode` from external callers — the node now
+   ACTS as a discovery seed for others.
+6. Every `--discovery-refresh-secs` (default 60s), re-queries
+   seeds, picks up new peers, dials them, persists the merged
+   list. Observation-driven public-IP updates take effect
+   without restart.
+
+CLI surface (new on `aiid`):
+- `--discovery-listen` (default `0.0.0.0:30310`)
+- `--discovery-advertise` (None — let observation infer)
+- `--bft-advertise` (None — let observation infer)
+- `--discovery-seeds` (None — use compile-time defaults)
+- `--no-discovery` (default false)
+- `--discovery-timeout-ms` (default 1500)
+- `--discovery-refresh-secs` (default 60; 0 to disable refresh)
+
+14 unit tests cover seed-spec merge ordering, DNS resolution,
+endpoint conversion, advertised-endpoint inference (including
+NAT / outbound-only / explicit-advertise cases), shared peer
+view (filter wildcard + dedupe), and one full `discover_once`
+loopback integration test.
+
+#### `aii-consensus-bft::capacity` (new, 210 lines)
+
+Deterministic budget calculator that encodes the protocol-level
+ceilings:
+
+- `FINALITY_TARGET_SECS = 30`
+- `MAX_VALIDATORS = 128` (BFT bitmap cap)
+- Equal-stake quorum = `(N*2)/3 + 1`
+- Full-mesh vote messages per round = `2 * N * (N-1)`
+- Leader proposal fan-out = `proposal_bytes * (N-1)`
+- Min leader uplink Mbps = `bytes * 8 / target_secs / 1e6`
+
+`capacity_budget(validators, proposal_bytes, target_secs) ->
+Result<CapacityBudget, CapacityError>` returns the full table
+or rejects oversize committees / proposals.
+
+5 unit tests including the proof that at max committee (128
+validators × 16 MiB proposal × 30s), leader uplink fits under
+~600 Mbps. The comment explicitly notes: **"These helpers do
+not replace real公网 stress testing"** — they encode the
+algebra; real-network throughput evidence still has to come
+from live load.
+
+The "10 M nodes, 30 s finality" model is **128-validator BFT
+committee + arbitrary observer-sync pool**. Active voting
+participates only in the committee; the rest sync via block
+gossip outside the quorum.
+
+#### `aii-node::validator_registry` (new, 118 lines)
+
+Persistent K/V mapping `Address → (BlsPubKey, VrfPubKey)`. Lets
+DPoS epoch transitions materialise a runtime-ready validator
+set from the on-chain stake table, by joining stake records
+with the registered runtime keys. Without it, the validator
+set would be genesis-locked. 2 tests (round-trip, missing-key
+returns None).
+
+#### Wiring & integration changes
+
+- `aii-node::lib.rs` — module declarations + re-exports for
+  `discovery_bootstrap` and `validator_registry`. New
+  `elect_registered_active_set` exposed from `dpos`. New const
+  `BFT_STAKE_WEIGHT_UNIT_WEI = 10^18`.
+- `aii-node::main.rs` — +428 lines: 9 new CLI flags, the
+  discovery startup block (seed resolution → key load → first
+  query → responder spawn), the post-startup refresh loop (60s
+  default cadence).
+- `aii-node::bft_p2p.rs` — +232 lines: transport accepts
+  runtime `add_peer` calls from the discovery refresh loop;
+  dial path now extends rather than replaces the static peer
+  set.
+- `aii-node::dpos.rs` — +170 lines: `elect_registered_active_set`
+  filters elected validators by registry presence so an
+  unregistered staker can't be voted into the active set.
+- `aii-consensus-bft::engine.rs` — +129 lines: capacity-cap
+  enforcement in `rotate_validator_set`, plus a clippy
+  redundant-clone fix.
+- `aii-cli::lib.rs` — +400 lines: validator-registry CLI plus
+  a couple of supporting helpers.
+- `aii-mcp::lib.rs` — +147 lines: MCP tool surface for the new
+  validator + discovery operations.
+- `aii-node::precompile.rs` — +115 lines: presumed registry
+  precompile (used by staking flows to register validator
+  keys on-chain).
+
+### Real-condition verification status
+
+Code merged + 450 tests pass / clippy clean. **But**: production
+nodes JP+CN (last deployed v0.0.90 binary, built at 06:17
+today) PREDATE the discovery_bootstrap.rs file appearing on
+disk (10:41 today). `ss -uln` on JP+CN confirms NO UDP 30310
+listener — the v0.0.90 binary running in production does NOT
+have this code. v0.0.91 deploy + a `ss -uln | grep 30310`
+check is the first real-condition gate.
+
+### Scope discipline
+
+Out of scope for v0.0.91:
+
+- **Recursive DHT walks.** `discover_once_full` queries each
+  seed once and accepts `Neighbours` once. A real DHT would
+  iteratively FindNode against discovered peers to expand the
+  table. Adequate for a 3-validator testnet; will be the
+  next gating issue at 10+ validators.
+- **ENR (EIP-778).** Current implementation is older devp2p v4
+  packet format. ENRs add signed endpoint records with richer
+  metadata. Compatible-but-not-implemented.
+- **NAT-PMP / UPnP / hole-punch.** Goal 2. Still gated on
+  separate work.
+- **`bootnodes.aii.network` DNS** is referenced in the
+  mainnet seed list but the domain registration is independent
+  operator work.
+
+## [0.0.90] — 2026-05-28
+
+### Added — `eth_getTransactionByHash` + `eth_getBlock{ByHash,ByNumber}`
+
+Closes the read-side gap that block explorers and indexers
+need. With v0.0.88-89's `eth_call` / `eth_estimateGas` /
+`eth_getCode` / `eth_getStorageAt` already wired, dApps work.
+This release adds the tx-lookup and block-lookup methods
+explorers (Etherscan-style) and indexers (subgraph-style)
+hit constantly.
+
+#### `aii-rpc`
+
+- New `eth_getTransactionByHash(hash)` — returns the tx body
+  + its location: `EthTxResponse { …TxView, block_hash,
+  block_number, transaction_index }`. `null` if unknown.
+- New `eth_getBlockByNumber(numberOrTag, fullTransactions)` —
+  returns `EthBlockResponse { …HeaderView, transactions }`.
+  `numberOrTag` accepts hex (`0x…`), decimal, or any of
+  `"latest" | "pending" | "safe" | "finalized" | "earliest"`.
+  AII has no separate pending state today, so `pending`
+  resolves to head. `null` if unknown.
+- New `eth_getBlockByHash(hash, fullTransactions)` — same
+  shape, looked up by 32-byte block hash.
+- New wire types: `EthTxResponse` (flatten of `TxView`),
+  `EthBlockResponse` (flatten of `HeaderView`), and
+  `EthBlockTxs` (untagged enum: array of tx hashes or array
+  of full tx objects, depending on the boolean flag).
+- New `RpcState` trait methods: `eth_transaction_by_hash`,
+  `eth_block_by_number`, `eth_block_by_hash`. All default
+  `None`; `aii-node::NodeState` overrides.
+- New private `parse_block_number_or_tag` parser; 4 unit
+  tests cover named tags, hex, decimal, and garbage rejection.
+
+#### `aii-node::NodeState`
+
+- `eth_transaction_by_hash` reuses the existing `tx_index +
+  by_number + body_by_hash` triple-lookup that
+  `transaction_by_hash` already does, and additionally
+  reports the block hash + in-block index.
+- New `eth_block_response_from_indices` helper composes
+  HeaderView + transactions list (hashes or full) from a
+  read-locked `BlockStore`. Used by both lookup paths.
+- 5 new integration tests: commit + lookup by number,
+  lookup by `"latest"` tag, lookup by hash, unknown tx hash
+  returns null, unknown block number returns null.
+
+### Wallet/explorer eth_* RPC surface — now complete
+
+```
+✓ eth_chainId               ✓ eth_call                  (v0.0.88)
+✓ eth_blockNumber           ✓ eth_estimateGas           (v0.0.89)
+✓ eth_gasPrice              ✓ eth_getCode               (v0.0.89)
+✓ eth_getBalance            ✓ eth_getStorageAt          (v0.0.89)
+✓ eth_sendRawTransaction    ✓ eth_getTransactionByHash  (v0.0.90)
+✓ eth_getTransactionReceipt ✓ eth_getBlockByNumber      (v0.0.90)
+✓ eth_getLogs               ✓ eth_getBlockByHash        (v0.0.90)
+```
+
+A stock Etherscan-clone pointed at an `aiid` endpoint can
+now render: chain stats, account balances + nonces + code,
+block listings with full or compact tx lists, transaction
+detail pages, log filters, and gas estimates for pending
+operations.
+
+### Scope discipline
+
+Out of scope for v0.0.90:
+
+- **`eth_getBlockTransactionCountByX`** — derivable from
+  `eth_getBlockByX(…, false).transactions.len()`. Cheap to
+  add when an explorer asks for it.
+- **`eth_getTransactionByBlockHashAndIndex`** — composable
+  from existing methods. Not strictly needed by current
+  clients.
+- **Block-tag historical lookup.** `eth_call`,
+  `eth_estimateGas`, `eth_getCode`, `eth_getStorageAt`,
+  `eth_getBalance` still ignore the `blockTag` argument —
+  every read runs against head state. Historical-state
+  queries need MPT + state-root pinning; separately scoped.
+- **`eth_newBlockFilter` / `eth_newPendingTransactionFilter`** —
+  push-style subscriptions. Need WebSocket transport
+  (jsonrpsee supports it; currently we only bind HTTP).
+
+Tests: +5 RPC integration + 4 block-tag parser unit. 868
+tests pass / clippy clean.
+
+## [0.0.89] — 2026-05-28
+
+### Added — `eth_estimateGas` + `eth_getCode` + `eth_getStorageAt`
+
+Closes the remaining Ethereum-JSON-RPC gap that wallet UX cares
+about. With v0.0.88's `eth_call` already wired, wallets could
+preview contract returns but still couldn't show users gas
+estimates, fetch deployed bytecode, or read storage slots
+directly. v0.0.89 lights up all three.
+
+After this release, a stock MetaMask / ethers.js / viem stack
+talking to an `aiid` node has everything it needs to display
+balances, call view functions, fetch contract code for ABI
+discovery, and pre-compute transaction gas — all the
+read-side surface dApps rely on.
+
+#### `aii-rpc`
+
+- New `eth_estimateGas(req, blockTag)` — same wire shape as
+  `eth_call`; returns `gas_used` from a simulated run as
+  `0x…` hex. Matches geth: reverts surface as JSON-RPC
+  errors so wallets can render them.
+- New `eth_getCode(address, blockTag)` — `0x…`-hex runtime
+  bytecode for a deployed contract, `"0x"` for EOAs and
+  non-existent accounts.
+- New `eth_getStorageAt(address, slot, blockTag)` — 32-byte
+  storage value at `(address, slot)` as `0x…` hex. Unset
+  slots return all zeros (EVM-spec). Accepts short slot hex
+  via left-pad (e.g., `"0x0"` for slot 0).
+- New `RpcState::code_at`, `RpcState::storage_at`,
+  `RpcState::estimate_gas` trait methods. Defaults: empty
+  vec, `H256::ZERO`, `Unsupported`. `aii-node::NodeState`
+  overrides all three.
+- New `parse_h256` hex helper with left-pad semantics.
+
+#### `aii-node::NodeState`
+
+- `code_at` → `state.account(addr).code_hash` →
+  `state.code_get(&hash)`. Returns empty for EOAs /
+  non-existent accounts.
+- `storage_at` → `state.storage_get(&addr, &slot)`. Errors
+  fall back to `H256::ZERO`.
+- `estimate_gas` → reuses `simulate_with_revm`; returns
+  `sim.gas_used` on success, `SimulateCallError::Reverted`
+  on EVM failure (so wallets get an actionable error).
+
+#### `aii-node` integration tests
+
+- `eth_estimate_gas_value_transfer_is_21000` — exact-equals
+  check on the intrinsic gas floor.
+- `eth_get_code_eoa_and_contract` — round-trip a deployed
+  contract's bytecode through the RPC.
+- `eth_get_storage_at_returns_committed_value` — deploy a
+  contract that `SSTORE`s `0xdead` into slot 0, then read it
+  back through `eth_getStorageAt`. Also asserts unset slot
+  reads as 32 bytes of zeros.
+
+### Wallet/explorer surface — current state
+
+```
+eth_chainId            ✓
+eth_blockNumber        ✓
+eth_gasPrice           ✓
+eth_getBalance         ✓
+eth_sendRawTransaction ✓
+eth_getTransactionReceipt ✓
+eth_getLogs            ✓
+eth_call               ✓ (v0.0.88)
+eth_estimateGas        ✓ (v0.0.89)
+eth_getCode            ✓ (v0.0.89)
+eth_getStorageAt       ✓ (v0.0.89)
+```
+
+A MetaMask user pointing at an `aiid` RPC endpoint can now
+view balances, call view functions, see real gas estimates,
+inspect deployed contracts, and send transactions through the
+same UX they'd get on Ethereum mainnet.
+
+### Scope discipline
+
+Out of scope for v0.0.89:
+
+- **`eth_getTransactionByHash` / `…Block…`.** Tx-lookup
+  scaffolding exists (`tx_index` in `BlockStore`) but no
+  RPC wrapper. Next slice.
+- **Block-tag handling.** All three new methods (and v0.0.88's
+  `eth_call`) ignore the `blockTag` argument — every read
+  runs against head state. Historical-state queries need MPT
+  + state-root pinning; separately scoped.
+- **EIP-1559 fee fields.** `eth_estimateGas`'s request body
+  accepts `gasPrice` but not `maxFeePerGas` /
+  `maxPriorityFeePerGas` yet. EIP-1559 fields surface when
+  the fee market lands.
+- **Gas-cap policy.** A node could refuse very-high-gas
+  `eth_call` / `eth_estimateGas` calls; today the default
+  30 M cap is purely advisory.
+
+Tests: +3 RPC integration. 859 tests pass / clippy clean.
+
+## [0.0.88] — 2026-05-28
+
+### Added — `eth_call` read-only revm simulation
+
+Before this release, wallets and explorers had no way to ask
+the node "what would this transaction return / revert with
+if I submitted it right now?" The full revm execution path
+existed since v0.0.20 (and was wired into commit at
+`crates/aii-node/src/lib.rs` line ~766) — but it always
+committed state changes, so it couldn't serve as the eth_call
+backend.
+
+v0.0.88 adds the missing read-only counterpart. Wallet
+balance queries, explorer view-function calls, and dApp
+`callStatic` requests now work against an AII node like they
+would against any Ethereum endpoint.
+
+#### `aii-evm`
+
+- New `SimulationResult { success, gas_used, return_data,
+  revert_reason, logs }` — same shape as `ExecutionSummary`
+  minus the CREATE deployment artifact, plus a `revert_reason`
+  field populated on `Revert` / `Halt`.
+- New `simulate_with_revm(state, sender, to, value, data,
+  gas_limit, gas_price) -> Result<SimulationResult, ExecError>` —
+  builds the same revm session as `execute_with_revm` and
+  calls `evm.transact()`, but **discards** the post-tx state
+  diff. The `RevmDb` adapter is read-only, so the underlying
+  `Arc<StateDb<B>>` is guaranteed untouched.
+- 3 unit tests: state-unchanged invariant under value transfer,
+  over-budget transfer doesn't silently succeed, deployed-
+  contract call returns its constant via simulation while the
+  sender's nonce stays put.
+
+#### `aii-rpc`
+
+- New `eth_call(req, blockTag)` JSON-RPC method. Returns the
+  hex-encoded return data on success; error on revert /
+  unsupported / bad input.
+- New `EthCallRequest` wire struct mirroring the Ethereum
+  JSON-RPC `eth_call` transaction object (`from`, `to`,
+  `value`, `data`, `gas`, `gasPrice` — all optional except
+  `to`).
+- New typed `SimulateCallParams` + `SimulateCallError` for the
+  trait surface. `RpcState::simulate_call` defaults to
+  `Err(SimulateCallError::Unsupported)`.
+- Hex-parsing helpers (`parse_hex_u64`, `parse_hex_u256`) for
+  the wire-level field conversions.
+
+#### `aii-node::NodeState`
+
+- Overrides `RpcState::simulate_call` to route through
+  `aii_evm::simulate_with_revm`. Reverts surface as
+  `SimulateCallError::Reverted`; revm errors as `Evm`.
+- 2 lib-level integration tests boot the full RPC server and
+  exercise the round-trip: a value-transfer call returns `0x`
+  with state unchanged, and a deployed-contract call returns
+  the 32-byte constant the contract is wired to emit.
+
+### Scope discipline
+
+Out of scope for v0.0.88:
+
+- **`eth_estimateGas`.** Lands next — it's basically
+  `simulate_with_revm` returning `gas_used` instead of
+  `return_data`. Wallet UX wants both.
+- **`eth_getCode` / `eth_getStorageAt`.** Mainly cosmetic
+  (we already store both); needs minor RPC wiring + tests.
+- **Block-tag handling.** `eth_call`'s second arg is ignored
+  today — every simulation runs against the head state.
+  Historical-state simulation needs MPT support, which is
+  separately scoped.
+- **Gas limit per simulation.** The default 30 M cap is
+  reasonable but not enforced as a node-wide policy. A
+  future slice could refuse very-high-gas eth_calls at the
+  RPC layer.
+
+Tests: +5 (3 aii-evm unit, 2 aii-node integration). 856 tests
+pass / clippy clean.
+
+## [0.0.87] — 2026-05-28
+
+### Added — multi-key release signing (pubkey rotation)
+
+The last hard requirement before mainnet: rotating the
+release-signing key without manually wiping every node. Until
+v0.0.86, `RELEASE_SIGNING_PUBKEY_HEX` was a single hex string;
+"rotation" meant "edit constant, hope nobody is mid-upgrade."
+v0.0.87 generalizes the pin to a SLICE of trusted pubkeys, and
+the auto-update verifiers accept a manifest signed by **any**
+entry.
+
+#### `aii-crypto::release`
+
+- `RELEASE_SIGNING_PUBKEYS: &[&str]` — new constant slice.
+  Initially contains the single entry that was previously in
+  `RELEASE_SIGNING_PUBKEY_HEX`.
+- `pinned_release_pubkeys() -> Vec<PublicKey>` — parses every
+  entry. Panics at startup on a malformed constant (the
+  failure surfaces during `cargo build`'s constant
+  initialization or the first call).
+- `verify_manifest_signature_any(pubkeys, manifest) -> Result<()>` —
+  returns `Ok(())` on the first key that verifies; returns the
+  last key's `ReleaseError::Crypto` when none match. Empty
+  `pubkeys` returns `ReleaseError::Hex("no pubkeys supplied")`.
+  Decodes the manifest fields ONCE per call.
+- `RELEASE_SIGNING_PUBKEY_HEX` and `pinned_release_pubkey()`
+  retained as back-compat aliases for callers that knew only
+  the single-key world. They both correspond to the FIRST
+  entry of the slice.
+- 6 new tests cover the multi-key paths: primary-first ordering
+  invariant, accept-by-primary, accept-by-secondary, reject-on-
+  unknown, empty-set returns Hex error, short-circuit
+  on first match.
+
+#### `aii-rpc`
+
+- `AiiRpcImpl::announce_release` now verifies against
+  `pinned_release_pubkeys()` instead of the single
+  `pinned_release_pubkey()`. The wire reason now reports the
+  number of pinned keys in the failure case
+  (`"signature does not verify against any of the N pinned pubkeys"`).
+- `release_poller::poll_once` uses
+  `verify_manifest_signature_any(&pinned_release_pubkeys(), …)`.
+  Same trust boundary as before, with the rotation set now
+  included.
+
+### Rotation procedure (operator-facing)
+
+To rotate from key `A` to a new key `B` without bricking the
+network:
+
+1. **Generate** `B`: `aii release keygen --out new-secret.hex`
+   produces the secret seed; copy the printed pubkey hex.
+2. **Add** `B` to `RELEASE_SIGNING_PUBKEYS` in
+   `crates/aii-crypto/src/release.rs`. Ship the workspace as
+   the next release (`vX.Y.Z`).
+3. **Roll out** the binary via the v0.0.74-86 auto-update
+   protocol. Every node ends up trusting both `A` and `B`.
+4. **Switch signing** to `B`: release manager starts signing
+   the next batch of manifests with `B`. Existing nodes
+   already accept both, so consensus doesn't notice.
+5. **Drop** `A` in a subsequent release. After that wave
+   propagates, `A` is retired.
+
+If `A` is compromised, step 3 has to happen FAST (a compromised
+key holder can still sign manifests). Operators may want to
+keep step 1-2 pre-baked into each release as a standing
+mitigation.
+
+### Scope discipline
+
+Out of scope for v0.0.87:
+
+- **On-chain rotation registry.** The pin is still compile-
+  time. A truly post-deploy rotation needs governance — most
+  likely a chain-level registry where a quorum of validators
+  can add/remove signing keys. That's a much bigger slice and
+  lands separately once `aii-config::Governance` matures.
+- **Per-key version constraints.** Currently every key in the
+  slice is trusted for every version. A future slice could
+  scope keys to version ranges (e.g., `A` for `<= 1.0`,
+  `B` for `>= 1.0`).
+
+Tests: +6 multi-key release tests. 851 tests pass / clippy clean.
+
+## [0.0.86] — 2026-05-28
+
+### Added — restart rate limit + stale-sentinel shortcut
+
+Closes the two scope-discipline items called out in the
+v0.0.85 CHANGELOG: a crash-loop guard for the auto-restart
+paths, and a fast-path for boot-health when the previous
+incarnation crashed before confirming.
+
+#### `aii-node::release_install` — rolling restart log
+
+- `RestartLog { events: Vec<u64> }` — serializable on-disk
+  log of recent auto-restart timestamps at
+  `<data-dir>/releases/.restart-log`.
+- `restart_log_path(releases_dir) -> PathBuf`.
+- `read_restart_log(releases_dir) -> RestartLog` — permissive
+  read: missing-file and unparseable-JSON both return an
+  empty log, so a fresh node always gets its first
+  auto-restart attempt.
+- `append_restart_event(releases_dir, ts, window_secs)` —
+  atomic via `.tmp` + rename, prunes to the trailing window
+  on every write.
+- `restart_allowed(log, now, window_secs, max_in_window) ->
+  bool` — pure decision function. `max_in_window == 0`
+  disables the gate (always allow). 5 unit tests on the
+  decision function + 3 on the I/O helpers.
+
+#### `aii-node::head_watchdog` — both watchdogs honor the gate
+
+- `start_head_watchdog` signature now takes
+  `(releases_dir, restart_window_secs, restart_max_per_window)`.
+  Before calling `exec_self()` on a stall, it consults the
+  shared restart log; if the rolling window is full, the
+  watchdog backs off (logs ERROR, resets its detector) and
+  leaves the operator to investigate.
+- `start_boot_health_confirm` signature gains the same two
+  rate-limit params. The same gate now guards the unhealthy-
+  boot rollback path — a binary that keeps failing won't
+  loop rollback → bad → rollback forever.
+
+#### `aii-node::head_watchdog::start_boot_health_confirm` — stale-sentinel shortcut
+
+When the boot-health task wakes and finds a `.boot-pending`
+sentinel whose `install_ts` is older than `2 ×
+confirm_secs`, the task assumes the previous incarnation
+crashed before clearing it. Rather than wait another full
+confirm window (the head wouldn't move during the parent's
+crash anyway), it skips the sleep and goes straight to the
+rate-limit gate + rollback. Cuts mean-time-to-recovery from
+`~2 × confirm_secs` to seconds when systemd respawns the
+node after a hard crash.
+
+#### `aii-node` CLI
+
+- New `--restart-window-secs N` (default `3600` = 1 h).
+- New `--restart-max-per-window N` (default `3`,
+  `0` disables the gate).
+- Operator guidance: leave the defaults unless you
+  understand the failure mode you're tuning for. The
+  defaults allow recovery from a transient stall plus one
+  retry, then bail out and wait for a human.
+
+### Full auto-update safety net (v0.0.74 → v0.0.86)
+
+```
+SIGN (74) → VERIFY (75) → STORE (76) → GOSSIP (77) → INSTALL (78)
+    └ HOTFIX (79: server body cap)
+    └ SNAPSHOT (80: .previous, reversible)
+    └ POLL (81: late-joiner re-poll)
+    └ HOTFIX (82: client body cap)
+    └ IMPLICIT-BOOTNODE (83: post-restart cold-sync)
+    └ HEAD-WATCHDOG (84: mid-flight exec_self)
+    └ BOOT-HEALTH (85: auto-rollback on unhealthy boot)
+    └ RATE-LIMIT + STALE-SHORTCUT (86: crash-loop guard + fast recovery)
+```
+
+A fully-opted-in node now survives every scenario observed
+in the cross-pacific production deploy AND every scenario the
+deferred-scope notes flagged as possible.
+
+### Scope discipline
+
+Out of scope for v0.0.86:
+
+- **Per-action rate limits** — the rolling window counts all
+  auto-restarts together; stall recoveries and rollbacks
+  share the cap. A future slice could segregate them.
+- **`aii_watchdogStatus` RPC** — restart-log + sentinel
+  state are file-only today.
+- **Release-signing pubkey rotation** — still pinned at
+  compile time.
+
+Tests: +10 (5 rate-limit unit, 3 restart-log I/O, 2 boot-health
+integration). 845 tests pass / clippy clean.
+
+## [0.0.85] — 2026-05-28
+
+### Added — boot-health watchdog (auto-rollback on unhealthy boot)
+
+Closes the highest-priority deferred item from the v0.0.78
+CHANGELOG. The auto-update protocol could, until now, ship a
+bad signed binary to every validator with no defense once the
+operator's authority-pubkey signature passed verification.
+v0.0.80 added a one-shot rollback RPC, but it still required an
+operator to notice and call it. v0.0.85 closes the loop: every
+auto-install records a sentinel, the post-execve startup waits
+out a grace window, and if the new binary fails to advance the
+head, rollback fires automatically.
+
+#### `aii-node::release_install`
+
+- `BootPending { version, pre_install_head, install_ts }` —
+  serializable record written atomically (`.tmp` + rename) at
+  `<data-dir>/releases/.boot-pending` before `install_binary`
+  clobbers the running binary.
+- `write_boot_pending(releases_dir, &BootPending) -> io::Result<PathBuf>`.
+- `read_boot_pending(releases_dir) -> io::Result<Option<BootPending>>`
+  (returns `Ok(None)` for missing-file, `InvalidData` for
+  unparseable JSON).
+- `clear_boot_pending(releases_dir) -> io::Result<()>` (idempotent).
+- `boot_pending_path(releases_dir) -> PathBuf`.
+- 5 unit tests: round-trip, missing-file, overwrite, idempotent
+  clear, malformed-data rejection.
+
+#### `aii-node::NodeState::install_release`
+
+After saving the `.previous` snapshot (v0.0.80) and BEFORE
+`install_binary` clobbers the running binary, the install
+handler now captures `(version, head_block_number_sync(),
+unix_secs)` and persists it as a `.boot-pending` sentinel.
+Write failure logs WARN and the install proceeds — same fail-
+soft contract as the snapshot path.
+
+#### `aii-node::head_watchdog::start_boot_health_confirm`
+
+New tokio task counterpart to v0.0.84's
+`start_head_watchdog`. Called once at startup with
+`(state, releases_dir, confirm_secs)`. If
+`confirm_secs == 0` or the `.boot-pending` sentinel is
+missing, the task is a no-op. Otherwise:
+
+1. Read the sentinel.
+2. Sleep `confirm_secs`.
+3. If `head_block_number_sync() > pending.pre_install_head`:
+   the new binary advanced consensus, so clear the sentinel
+   and exit healthy.
+4. Else: log ERROR and call
+   `RpcState::rollback_release(&state).await`, which uses the
+   v0.0.80 reversible `.previous` swap + the v0.0.78
+   `exec_self_at` self-restart. The rolled-back binary then
+   boots fresh; its boot-health task observes the original
+   sentinel, finds head advancing again, and clears it.
+
+#### `aii-node` CLI
+
+- New `--boot-health-secs N` (default `0` = disabled).
+  Operator guidance: at least 5× the BFT slot interval so the
+  first slow round after a restart doesn't trigger a false
+  rollback. A 1 s slot wants `60-120 s`; a 10 s slot wants
+  300 s+.
+
+#### Auto-update safety net stack
+
+```
+v0.0.74  sign manifest
+v0.0.75  pinned-pubkey verify
+v0.0.76  binary store
+v0.0.77  gossip
+v0.0.78  atomic install + execve
+v0.0.80  reversible .previous snapshot
+v0.0.81  late-joiner re-poll
+v0.0.83  implicit bootnode (post-restart cold-sync)
+v0.0.84  head-stall watchdog (mid-flight exec_self)
+v0.0.85  boot-health auto-rollback ← THIS
+```
+
+A node with the full opt-in flag set
+(`--auto-install-releases --update-peers …
+--release-poll-secs 60 --stall-recover-secs 120
+--boot-health-secs 120`) now survives:
+
+- normal upgrade (signed manifest → all 3 nodes upgrade in 30 s)
+- 1-second downtime stall during binary swap (v0.0.83)
+- mid-flight BFT head freeze (v0.0.84)
+- buggy signed binary that boots but can't keep consensus
+  going (v0.0.85, NEW)
+
+Tests: +9 (5 release_install unit, 4 NodeState lib). 835 tests
+pass / clippy clean.
+
+### Scope discipline
+
+Out of scope for v0.0.85:
+
+- **Restart-loop rate limiting.** If the rolled-back binary
+  is ALSO broken, the node loops. The current implementation
+  is fail-open — it tries; if exec_self fails it logs and
+  waits. A file-backed "max restarts per hour" cap lands
+  later.
+- **Boot health beyond head advancement.** The current signal
+  is just "did the head increment". A future slice could
+  also check RPC liveness, peer connectivity, or producer
+  participation before declaring health.
+- **Stale-sentinel rollback at startup.** Currently the
+  confirm task sleeps `confirm_secs` then checks. If a
+  systemd-restarted process finds a `.boot-pending` from
+  before its parent crashed, it still waits the full window.
+  A "this sentinel is older than 2 × confirm_secs → assume
+  failed boot, rollback now" shortcut is an obvious
+  follow-up.
+
+## [0.0.84] — 2026-05-28
+
+### Added — runtime head-stall watchdog
+
+Closes the last hole in the BFT-recovery story. The v0.0.83
+implicit bootnode lets a node recover at **startup** when it
+fell behind during a binary swap. The watchdog in this release
+handles the symmetric case: a node that was running fine for
+hours and then loses head progress (transient network
+partition, peer outage, BFT engine state divergence) is now
+self-healing too.
+
+#### `aii-node::head_watchdog` (new `cfg(unix)` module)
+
+- `StallDetector` — pure state machine: tracks `(last_head,
+  stalled_for_secs)` across `observe(current_head)` calls;
+  returns `Healthy` / `StalledBelowThreshold` / `StallTriggered`
+  depending on how long the head has been frozen. Defensive
+  guards against `stall_recover_secs == 0` (never triggers) and
+  `poll_secs == 0` (counter never advances).
+- `start_head_watchdog(state, stall_recover_secs, poll_secs)
+  -> JoinHandle<()>` — tokio task that polls the head each
+  `poll_secs`, feeds the detector, and on `StallTriggered`
+  calls `release_install::exec_self()` for a kernel-level
+  same-PID restart. The new process image then cold-syncs via
+  the v0.0.83 implicit-bootnode fallback (first
+  `--update-peers` URL) and rejoins consensus.
+- 7 unit tests cover the state machine: seed + healthy,
+  reset on advance, threshold crossing, post-trigger persistence,
+  recovery via head advance, plus both zero-input guards.
+
+#### `aii-node` CLI
+
+- New `--stall-recover-secs N` flag (default `0` = disabled).
+  When set, every `--stall-poll-secs` (default `10`) the
+  watchdog wakes, reads the head, and triggers
+  `exec_self()` if the head hasn't moved in `N` seconds.
+- Operator guidance: set `N` to **at least 5× the BFT slot
+  interval**. With a 1 s slot, `60-120 s` is a reasonable
+  starting point. Too aggressive and a slow tick triggers an
+  unnecessary restart; too loose and a true stall ties up the
+  node for minutes.
+
+### How v0.0.83 + v0.0.84 compose
+
+```
+node restarts                 node already running, head freezes
+       │                                │
+       │ (v0.0.83 fallback)             │ (v0.0.84 watchdog)
+       │                                │
+       ▼                                ▼
+bootstrap_sync_from_peer        exec_self() ──► (new process)
+       │                                                 │
+       └─────── back into BFT consensus ─────────────────┘
+```
+
+A node configured with `--update-peers http://peer:8545
+--stall-recover-secs 120` now self-heals from both
+restart-window stalls (v0.0.83) AND mid-flight stalls (v0.0.84)
+without operator intervention.
+
+### Scope discipline
+
+Out of scope for v0.0.84, explicitly:
+
+- **In-place re-sync without exec_self.** The watchdog uses
+  the heavy-but-simple "restart the process" recovery. A
+  cleaner approach would call `bootstrap_sync_from_peer` in
+  place and reset the BFT engine via `from_recovered`, but the
+  engine is owned by a producer task with no externally-exposed
+  reset hook. Adding one is a bigger refactor; the exec_self
+  path leverages the existing well-tested startup recovery.
+- **Restart-rate limiting / cooldown.** If exec_self
+  fails (which it can on some hardened kernels), the watchdog
+  resets its detector and waits for the next stall window — it
+  does NOT loop calling exec_self. But there's no file-backed
+  "max restarts per hour" cap; that lands later.
+- **Watchdog-aware metrics.** The current observability is
+  WARN/ERROR log lines. A future slice could expose
+  `aii_watchdogStatus` over RPC.
+
+## [0.0.83] — 2026-05-28
+
+### Fixed — implicit bootnode fallback from `--update-peers`
+
+The v0.0.82 cross-pacific production deploy surfaced a sharp edge
+that wasn't caught in unit tests or single-node e2e: any node that
+took **even 1 second of downtime** during a binary swap would fall
+behind by 1 block (because the other 2 validators kept reaching
+quorum without it), and then permanently strand itself because the
+BFT engine has no "I'm behind, pull blocks from a peer" fallback —
+it only knows how to vote on the next height.
+
+The cold-sync code path that handles exactly this case
+(`bootstrap_sync_from_peer`) already exists from v0.0.69, but it
+only ran when the operator explicitly set `--bootnode URL`. On the
+JP swap the systemd unit had no `--bootnode`, so the node came up
+without sync and stuck. Recovery required SSH'ing in, editing the
+unit, `daemon-reload`, and restarting.
+
+#### `aii-node::main` (binary)
+
+- New `effective_bootnode(explicit, update_peers) -> Option<String>`
+  selector: prefer `--bootnode`; otherwise fall back to the first
+  entry of `--update-peers`. Returns `None` when both are empty.
+- The startup cold-sync block now uses `effective_bootnode(...)` in
+  place of `cli.bootnode`. Same for the `--follow-seconds` loop.
+- An INFO log line announces when the implicit fallback fires, so
+  the source of the catch-up URL is unambiguous in production logs.
+
+#### Why reuse `--update-peers` instead of adding a new flag
+
+Every operator who configured the v0.0.77 release-gossip flow
+already has the right peer HTTP-RPC URLs in their systemd unit. A
+separate `--catchup-peers` flag would be one more knob to
+misconfigure — and miss the JP-style stall scenario. Asymmetric
+topologies (different bootnode than gossip peer) can still set
+`--bootnode` explicitly, which takes precedence.
+
+### Production deploy lesson (recorded for posterity)
+
+The auto-update protocol's `execve` same-PID path (v0.0.78) avoids
+this entire scenario because there's no downtime — the kernel
+hands the new binary the open BFT sockets mid-flight. But that
+path is only available once every node is already running v0.0.74+.
+The FIRST upgrade from a pre-release-RPC binary to a release-RPC
+binary always goes through a systemd stop/start, which is where
+the stall came from. With this fix, that first upgrade is
+recoverable without operator intervention as long as
+`--update-peers` is set on the unit.
+
+### Scope discipline
+
+Out of scope for v0.0.83, explicitly:
+
+- **Runtime BFT catch-up watchdog.** A node that falls behind
+  AFTER startup (e.g., due to a transient network partition) still
+  needs an external restart to trigger
+  `bootstrap_sync_from_peer`. A cleaner solution would be a tokio
+  task that periodically checks `(head_block_number, last_advance_ts)`
+  and triggers an in-place sync when stalled. The in-place sync's
+  interaction with the running BFT engine needs design work
+  (engine state would be stale after the sync), so it lands later.
+- **Multi-peer fallback order.** Currently uses
+  `update_peers[0]` unconditionally. A future slice could rotate
+  through the list on connection failure.
+
+## [0.0.82] — 2026-05-27
+
+### Fixed — v0.0.81 client-side body cap hotfix
+
+Live-testnet self-validation of the v0.0.81 late-joiner poller
+revealed that `release_poller::poll_once` and
+`release_gossip::propagate_release` build their outbound
+`HttpClient` with `HttpClientBuilder::default()`, which carries
+jsonrpsee's 10 MiB default `max_response_size`. The 16 MiB aiid
+binary hex-encodes to ~32 MiB, so the catch-up path got as far
+as accepting the manifest (small JSON), then silently failed to
+ingest the binary — `accepted_manifests=1 imported_binaries=0`,
+with `<data-dir>/releases/<version>` never created.
+
+The v0.0.79 fix bumped the SERVER's body caps to 128 MiB. The
+CLIENT side carries an independent default. Both
+`release_poller::poll_once` and
+`release_gossip::propagate_release` now build their
+`HttpClient` with `max_request_size` and `max_response_size`
+pinned to the shared `MAX_REQUEST_BODY_SIZE` /
+`MAX_RESPONSE_BODY_SIZE` constants.
+
+#### Live e2e self-validation result (post-fix)
+
+```
+04:24:31  A starts, release poller scheduled (interval=5s, peers=1)
+04:24:33  A's aii_latestRelease = null
+          [B has been pre-seeded with a signed manifest + 16 MiB binary]
+04:24:36  A accepts manifest 0.0.81-poll-test (sig verified locally)
+04:24:37  A imports 16,259,992-byte binary, sha256 verified
+04:24:37  release poll catch-up accepted_manifests=1 imported_binaries=1
+```
+
+Both `aii_latestRelease` and `<data-dir>/releases/<version>` on
+A match B after a single 5-second poll cycle.
+
+### Scope discipline
+
+This is a hotfix release; no new features. Same shape as the
+v0.0.79 fix — the failure was a quiet truncation in the
+transport layer that the unit tests couldn't catch because they
+exercise the trait via in-process calls, not real jsonrpsee
+HTTP round-trips with large bodies.
+
+## [0.0.81] — 2026-05-27
+
+### Added — late-joiner release re-poll
+
+Closes the last gap in the auto-update protocol's coverage: a
+node that was offline during the v0.0.77 manifest gossip wave
+now catches up on its own, on a configurable cadence, without
+the operator having to re-broadcast. Every validator that comes
+back online learns about pending releases within one poll
+interval and walks the same trust-bounded
+record → import → maybe-install path as the gossip flow.
+
+#### `aii-crypto::release`
+
+- New `verify_manifest_signature(pubkey, manifest) -> Result<()>`
+  that re-verifies the Ed25519 signature WITHOUT requiring the
+  binary on disk. The full `verify_release` is still the right
+  call before trusting the binary; this one is for the gap
+  between "got a manifest from a peer" and "have the binary
+  in hand."
+- `ReleaseManifest` now derives `PartialEq + Eq` so tests and
+  diff-style logging can compare manifests directly.
+
+#### `aii-rpc::release_poller` (new module)
+
+- `poll_once(state, peers) -> PollOutcome` — single best-effort
+  pass: for each peer, fetch `aii_latestRelease`, compare via
+  strict `(timestamp, version)` ordering, re-verify the
+  signature locally, then drive the host's
+  `record_release_announcement` + (when the binary is missing)
+  `aii_getReleaseBinary` → `import_release_binary` path. Same
+  trust boundary as the announce / gossip flows; never trusts
+  the peer.
+- `start_release_poller(state, peers, interval) -> JoinHandle<()>` —
+  spawns a tokio task that calls `poll_once` every `interval`.
+  Burns the first immediate `tick()` so a fast restart loop
+  doesn't slam peers with cold-start traffic; logs catch-up
+  events at INFO when either a manifest or a binary lands.
+- `PeerPollOutcome` / `PollOutcome` envelopes for callers that
+  want observability. 5 unit tests cover the strict-newer
+  comparator + a two-node integration test where node A starts
+  empty and pulls B's signed manifest + binary in a single
+  tick, plus an idempotency test (second poll is a no-op).
+
+#### `aii-node` CLI
+
+- New `--release-poll-secs N` flag (default `60`, `0` disables).
+  Only fires when `--update-peers` is also non-empty. When
+  enabled, the poller spawn happens just before the RPC server
+  starts, and the join handle is aborted alongside the producer
+  + follow handles on Ctrl-C.
+
+### End-to-end coverage (v0.0.74 → v0.0.81)
+
+The auto-update protocol now closes every reasonable failure
+mode the operator might hit:
+
+1. **Sign** (v0.0.74) — Ed25519 manifest.
+2. **Announce** (v0.0.75) — pinned-pubkey verify on any one node.
+3. **Store** (v0.0.76) — `<data-dir>/releases/<version>` cache.
+4. **Gossip** (v0.0.77) — push/pull binary across `--update-peers`.
+5. **Install** (v0.0.78) — atomic rename + execve same-PID restart.
+6. **Hotfix** (v0.0.79) — 128 MiB body cap + `exec_self_at(target)`.
+7. **Rollback** (v0.0.80) — reversible `.previous` snapshot.
+8. **Re-poll** (v0.0.81) — late-joiner catch-up cadence.
+
+A node that was offline at announce time can come back, and
+within `--release-poll-secs` it discovers the manifest, pulls
+the binary, optionally auto-installs, and (if anything goes
+wrong) the operator's recovery path is `aii release rollback`.
+
+### Scope discipline
+
+Out of scope for v0.0.81, explicitly:
+
+- **Boot-health watchdog** — auto-rollback if the new binary
+  fails to come up within N seconds. Still operator-driven.
+- **Pubkey rotation** — still pinned at compile time.
+
+## [0.0.80] — 2026-05-27
+
+### Added — pre-install snapshot + rollback safety net
+
+Closes the loop on the auto-update protocol's last remaining
+sharp edge: a bad release pushed to every validator can no
+longer brick the network with no recovery path. Every install
+now atomically snapshots the running binary to
+`<data-dir>/releases/.previous` before clobbering it, and a new
+RPC + CLI exposes one-shot rollback.
+
+The same trust boundary still applies — only a manifest signed
+with the pinned project pubkey reaches the install path — but
+the consequence of "the operator signed the wrong binary" is
+now "type `aii release rollback`" instead of "drive to the
+data center."
+
+#### `aii-node::release_install`
+
+- `PREVIOUS_NAME = ".previous"` constant — fixed filename
+  inside the release store. Dot-prefix avoids collision with a
+  real release version (all versions are semver-ish, never
+  start with `.`).
+- `previous_path(releases_dir) -> PathBuf`.
+- `save_previous(current_exe, releases_dir) -> io::Result<PathBuf>` —
+  copies the running binary into `<releases_dir>/.previous`
+  atomically via `<target>.new` + `rename(2)`, with `0o755`.
+- `rollback_to_previous(releases_dir, target) -> io::Result<PathBuf>` —
+  reversible swap. Moves `.previous` to a holding path, snaps
+  the current target into `.previous`, then installs the held
+  bytes back onto target. After the call `.previous` holds the
+  bytes we rolled away from, so a second rollback flips the
+  pair back.
+- 5 unit tests: atomic snapshot write + executable bit;
+  overwrites existing; rollback round-trip; rollback is
+  reversible via a second call; rollback returns NotFound
+  with no `.previous` and leaves the target untouched.
+
+#### `aii-node::NodeState`
+
+- `RpcState::install_release` now calls `save_previous` before
+  `install_binary`. Snapshot failure is logged at WARN and the
+  install proceeds — we'd rather ship the binary without a
+  rollback option than refuse the install over a transient
+  I/O hiccup.
+- New `RpcState::rollback_release` impl on Unix: resolves data
+  dir + target (with the v0.0.78 `install_target_override` for
+  tests), invokes `rollback_to_previous`, then spawns the same
+  `exec_self_at(target)` self-restart task.
+- 2 lib-level integration tests verify install → rollback → roll
+  forward via a second rollback, and the fail-soft path when no
+  snapshot exists.
+
+#### `aii-rpc`
+
+- New `aii_rollbackRelease() -> InstallReleaseResult` JSON-RPC
+  method. Same envelope as install for client symmetry.
+- New `RpcState::rollback_release` trait method with a
+  "not supported" default.
+- 2 RPC integration tests cover the happy path and the
+  no-snapshot rejection.
+
+#### `aii-cli`
+
+- New `aii release rollback --rpc URL` subcommand. Async
+  dispatch in `main()` (the existing sync `handle_release_cmd`
+  can't await an HTTP RPC call); pretty-prints
+  `scheduled rollback to .previous; node will restart in 2 s`
+  on success, `rollback rejected: …` on failure.
+- New `aii_cli::run_rollback_release(rpc)` helper for
+  integrators that want the typed result.
+
+### Scope discipline
+
+Out of scope for v0.0.80, explicitly:
+
+- **Boot-health watchdog** that auto-rolls-back when the new
+  binary fails to come up. The current rollback is operator-
+  initiated; an automatic rollback needs a "did I reach a
+  known-good state within N seconds of startup?" signal,
+  which couples this layer to consensus health and is best
+  shipped after the late-joiner re-poll lands.
+- **Late-joiner periodic `aii_latestRelease` poll** against
+  the update-peer list. Nodes that miss the gossip wave
+  (offline at announce time) currently have no way to
+  discover a release was made; will land in v0.0.81.
+- **Pubkey rotation.** Still pinned at compile time.
+
+## [0.0.79] — 2026-05-27
+
+### Fixed — v0.0.78 install hotfix (now actually works in production)
+
+Live-testnet self-validation of v0.0.78 surfaced two showstopper
+bugs that made the auto-update path inoperable outside the unit-
+test harness. Both are fixed here. With this release the
+end-to-end flow (sign → announce → import → atomic install →
+`execve` self-restart) has been verified against a real running
+aiid binary, with the kernel reporting the same PID across the
+upgrade and `/proc/$PID/exe` resolving cleanly to the new file.
+
+#### `aii-rpc::serve` — bump JSON-RPC body cap to 128 MiB
+
+jsonrpsee's default `max_request_body_size` is 10 MiB. The
+hex-encoded `aii_importReleaseBinary` call for a ~16 MiB aiid
+build produces a ~32 MiB request body, which the server rejected
+with `-32007 "Request is too big"`. The binary never even
+reached the import handler, let alone the install path.
+
+- `MAX_REQUEST_BODY_SIZE = 128 MiB`
+- `MAX_RESPONSE_BODY_SIZE = 128 MiB`
+- `serve()` now builds a `ServerConfig` via
+  `ServerConfig::builder().max_*_body_size(...)` and passes it
+  through `Server::builder().set_config(cfg)`. This is the
+  jsonrpsee-0.26 idiom — the builder no longer exposes the
+  per-field setters directly.
+
+#### `aii-node::release_install::exec_self_at` — pass install target explicitly
+
+After `install_binary` swaps the running binary via `rename(2)`,
+the kernel marks `/proc/self/exe` with a literal `" (deleted)"`
+suffix. `std::env::current_exe()` then returns
+`/path/to/aiid (deleted)` — a string `execve` rejects with
+`ENOENT`. The install succeeded, the new bytes were on disk,
+but the self-restart never reached the new image.
+
+- New `exec_self_at(exe: &Path) -> io::Error` that `execve`s an
+  explicit path with the current process's argv (minus arg0)
+  and env. `exec_self()` keeps the old contract via this
+  function for callers that haven't replaced their binary
+  yet.
+- `RpcState::install_release` now captures `target` BEFORE the
+  rename and moves it into the spawned restart task, which calls
+  `exec_self_at(&exec_target)` instead of re-resolving via
+  `current_exe()`.
+
+#### Live testnet self-validation log
+
+A v0.0.79-built aiid was booted with `--auto-install-releases`,
+a manifest was signed with the pinned project secret, and the
+binary was imported via `aii_importReleaseBinary`. Outcome:
+
+- Manifest accepted ✓
+- 16,199,408 byte binary written to
+  `<data-dir>/releases/<version>` ✓
+- `auto-install conditions met; invoking install_release` ✓
+- `release installed; self-restart scheduled` ✓ (binary mtime
+  flipped)
+- 2 s later: `starting aiid …` with the **same PID** — execve
+  hot-swapped the process image ✓
+- `recovered persisted chain from data_dir recovered_head=2` ✓
+- `/proc/<PID>/exe -> /tmp/aii-v0078-test/bin/aiid` (no
+  `(deleted)`) ✓
+- Chain continued producing blocks (head reached 26 within 30 s
+  of the restart) ✓
+
+### Scope discipline
+
+This is a hotfix release; no new features. The 128 MiB cap was
+chosen as a defensive ceiling rather than a permanent design
+decision — when binaries grow past that the cap moves with
+them. Streaming binary transfer (chunked import) is a future
+slice when the per-binary size makes the in-memory hex payload
+genuinely uncomfortable.
+
+## [0.0.78] — 2026-05-27
+
+### Added — atomic install + execve self-restart
+
+Fifth and final foundational slice of the auto-update protocol —
+closes the loop from "verified binary cached on disk" to "node is
+running the new binary." A validator that has accepted a manifest
+via the v0.0.75 RPC and received the matching binary via the
+v0.0.77 gossip path can now finish the upgrade itself, without
+any operator-driven systemd dance.
+
+#### `aii-node::release_install` (new module, `cfg(unix)`)
+
+- `install_binary(staged, target) -> io::Result<PathBuf>` —
+  atomically replace `target` with the bytes from `staged`. Copy
+  to `<target>.new`, `chmod 0o755`, then `rename(2)` over the
+  running binary. On Linux `rename(2)` is allowed to replace a
+  currently-executing file because the kernel keeps the inode
+  alive for the running process via its open mmap, so the live
+  `aiid` keeps serving while the directory entry already points
+  at the new bytes.
+- `current_aiid_path() -> io::Result<PathBuf>` — wraps
+  `std::env::current_exe()`.
+- `exec_self() -> io::Error` — `Command::new(current_exe).args(…).exec()`
+  replaces the running process image with the new binary while
+  **preserving the PID**. Systemd does NOT respawn the unit —
+  the upgrade is invisible to the supervisor, which is exactly
+  what we want. On `execve` failure (rare: missing binary,
+  ENOMEM) the error is returned and the node continues serving
+  from the old image.
+- 6 unit tests cover the install path: replaces target, sets
+  exec bit, creates missing target, cleans up stale `.new`,
+  propagates missing-source errors, resolves a working
+  `current_exe`. The `exec_self` path is intentionally untested
+  in unit tests (would replace the test runner); the integration
+  tests below cover the file-mutating half.
+
+#### `aii-rpc`
+
+- New `aii_installRelease(version) -> InstallReleaseResult`
+  JSON-RPC method. Returns `{ scheduled, reason, restart_in_secs }`.
+  The install (file copy + chmod + rename) happens synchronously
+  inside the handler; the `execve` runs from a spawned task with
+  a short delay so the JSON-RPC reply flushes back to the caller
+  before the process is replaced.
+- New `RpcState::install_release` trait method with a "not
+  supported" default. `aii-node::NodeState` overrides on Unix.
+- New `InstallOutcome` (trait-layer) and `InstallReleaseResult`
+  (wire-layer) structs.
+- 2 RPC integration tests verify happy path (cached binary →
+  scheduled) and rejection (missing binary).
+
+#### `aii-node::NodeState`
+
+- New fields: `auto_install_releases: AtomicBool`,
+  `install_target_override: RwLock<Option<PathBuf>>`. Override
+  is test-only (`set_install_target_for_tests`) — redirects the
+  install target away from `/proc/self/exe` and suppresses the
+  `execve` spawn so integration tests can exercise install
+  without overwriting the test runner.
+- `RpcState::install_release` impl performs the full path:
+  resolve data dir, verify staged binary exists, resolve target
+  (override or `current_exe`), call `install_binary`, spawn
+  `execve` task (skipped in test mode).
+- `record_release_announcement` and `import_release_binary`
+  both invoke a new `maybe_auto_install_release` helper after
+  their happy path. When auto-install is on AND a manifest is
+  known AND its binary is cached locally, the install fires
+  automatically — regardless of which arrived first (gossip
+  ordering doesn't matter).
+- 3 lib-level integration tests: explicit install swaps the
+  override target; install rejects missing binary; auto-install
+  fires the moment both (manifest, binary) are in hand via the
+  announce → import sequence.
+
+#### `aii-node` CLI
+
+- New `--auto-install-releases` flag. Off by default — in-place
+  restarts are disruptive and most operators want to schedule
+  the swap manually via `aii_installRelease` once they've
+  reviewed the manifest. On a validator with `--update-peers`
+  set, enabling this flag turns the validator into a fully
+  hands-off auto-updating node.
+
+### End-to-end auto-update flow (v0.0.74 → v0.0.78)
+
+The whole chain now exists:
+
+1. **Sign** (v0.0.74): `aii release sign --binary aiid --version V --secret SK`
+   produces an Ed25519-signed manifest.
+2. **Announce** (v0.0.75): the operator hits any one node with
+   `aii_announceRelease(manifest)`. That node verifies the
+   signature against the pinned project pubkey.
+3. **Gossip + fetch** (v0.0.77): the accepting node re-broadcasts
+   to its `--update-peers` and pushes the binary to peers that
+   lack it. Every receiver re-verifies signature + SHA-256.
+4. **Install + restart** (v0.0.78): each node with
+   `--auto-install-releases` set atomically swaps the running
+   binary and `execve`s into the new image. Systemd PID stays
+   the same; the supervisor sees no restart.
+
+A new release reaches the entire validator set in seconds, and
+the trust boundary at every hop is "valid Ed25519 signature from
+the pinned project pubkey + matching SHA-256."
+
+### Scope discipline
+
+Out of scope for v0.0.78, explicitly:
+
+- **Rollback / two-slot install.** If the new binary crashes on
+  start, systemd will respawn it, and the broken binary stays
+  installed. A future slice keeps `<previous-version>` cached
+  and ships a watchdog that rolls back after N failed starts.
+- **Periodic re-poll for late joiners.** A node that misses the
+  manifest gossip wave (e.g., was offline) currently has no way
+  to discover a release was made. A future slice adds a periodic
+  `aii_latestRelease` pull against the update-peer list.
+- **Pubkey rotation.** The release-signing pubkey is still
+  compiled in. Operator-driven rotation lands separately,
+  alongside the secret-management policy.
+
+## [0.0.77] — 2026-05-27
+
+### Added — release auto-gossip + auto-fetch
+
+Fourth slice of the auto-update protocol — closes the
+"manifest+binary is on one node, how do the others get it?" loop.
+After a node accepts a new manifest via `aii_announceRelease`, it
+now spawns a background task that:
+
+1. **Re-broadcasts** the manifest to every `--update-peers` URL
+   via `aii_announceRelease`. Receivers re-verify the signature
+   against their own pinned pubkey, so the hop carries no extra
+   trust. Duplicate manifests are rejected at the receiver
+   (`record_release_announcement` requires strictly-newer
+   `(timestamp, version)`), so the flood terminates within one
+   hop per peer link.
+2. **Bidirectional binary transfer**:
+   - If the local node *has* the binary, it pushes it to peers
+     that don't (`aii_importReleaseBinary`).
+   - If the local node *doesn't* have the binary, it pulls from
+     the first peer that does (`aii_getReleaseBinary`).
+   Either direction re-verifies SHA-256 against the manifest
+   before persisting.
+
+#### `aii-rpc::release_gossip`
+
+- New module owning the propagation logic.
+- `propagate_release(state, manifest, peers) -> PropagateOutcome`
+  — fire-and-forget; never panics, returns a per-peer breakdown.
+- `parse_update_peers(s) -> Vec<String>` — comma-split, normalise
+  to `http://host:port`. 3 unit tests.
+
+#### `aii-rpc`
+
+- New `RpcState::update_peers_for_release` trait method (default
+  empty); `NodeState` overrides to return the operator-supplied
+  `--update-peers` list.
+- `AiiRpcImpl::announce_release` now spawns `propagate_release`
+  on the success path when the host has any update peers
+  configured.
+- 1 new 2-node integration test (`release_gossip_two_node_propagate`)
+  that boots two RPC servers, points node A's `update_peers` at
+  node B, announces a signed manifest to A, and asserts B ends
+  up with both the manifest and the binary.
+
+#### `aii-node` (`aiid` binary)
+
+- New CLI flag `--update-peers HTTP1,HTTP2,…` (default empty).
+- `NodeState::set_update_peers` / `update_peers` setters/getters.
+- Main initialises the peer list early in `main()`, right after
+  `set_data_dir`.
+
+789 tests pass, clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.78+:
+
+- Atomic install — copy `<data-dir>/releases/<version>` over the
+  in-flight `aiid` binary, swap symlink, re-exec.
+- Self-restart via `execve` so systemd doesn't need to be poked.
+- Periodic re-poll loop for nodes that came online late and
+  missed the original gossip wave.
+
+## [0.0.76] — 2026-05-27
+
+### Added — release-binary store + `aii_getReleaseBinary` / `aii_importReleaseBinary` RPC
+
+Third slice of the auto-update protocol. v0.0.75 let peers gossip
+the *signed manifest*; v0.0.76 lets them gossip the *binary itself*.
+Verification stays first-class: a node will only serve a binary
+whose SHA-256 matches the manifest it has already verified.
+
+#### `aii-node::release_store`
+
+- New module owning `<data-dir>/releases/<version>` cache layout.
+- `store_verified_binary(dir, version, expected_sha256, bytes)`
+  recomputes SHA-256 of the bytes and only writes (atomically, via
+  `.tmp` + `rename(2)`) on a hash match. `HashMismatch` is
+  returned without ever creating the target file on mismatch.
+- `load_binary(dir, version)` returns `Ok(None)` on missing file.
+- 6 unit tests (round-trip, hash-mismatch-no-file-leak, malformed
+  hash, missing-returns-none, atomic-tmp-cleanup, accepts-`0x`
+  prefix).
+
+#### `aii-node::NodeState`
+
+- New `data_dir: RwLock<Option<PathBuf>>` field + public
+  `set_data_dir(PathBuf)` setter. `aiid` main calls it once at
+  startup so the release-store helpers can resolve paths without
+  changing the existing `NodeState::new` / `recover` signatures.
+- `RpcState::release_binary_bytes` reads from the store.
+- `RpcState::import_release_binary` cross-checks the announced
+  version against the locally-known latest manifest (refuses
+  unverified bytes), then delegates to `store_verified_binary`.
+
+#### `aii-rpc`
+
+- New `AiiRpc::get_release_binary(version) -> Option<String>` —
+  returns the binary as `0x`-prefixed hex, or `null`.
+- New `AiiRpc::import_release_binary(version, hex_bytes) -> ImportReleaseResult`
+  — accepts an externally-supplied binary, verifies its SHA-256
+  against the local manifest, and persists on success.
+- New `ImportReleaseResult { accepted, reason }` envelope.
+- New `RpcState::release_binary_bytes` and `import_release_binary`
+  trait methods (default no-ops; NodeState overrides).
+- 2 new RPC end-to-end tests:
+  - `aii_get_release_binary_missing_returns_null`
+  - `aii_import_release_binary_round_trip`
+
+785 tests pass, clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.77+:
+
+- Cross-node gossip relay of announcements — when a node accepts
+  `announce_release`, push the same manifest to its peers.
+- Auto-fetch — when a node knows the latest manifest but hasn't
+  got the binary, pull from a peer via `get_release_binary` +
+  `import_release_binary` chain.
+- Atomic install + self-restart — write the new binary over
+  `aiid-current`, signal systemd / re-exec, hand off to v0.0.78+.
+
+## [0.0.75] — 2026-05-27
+
+### Added — pinned release pubkey + `aii_announceRelease` / `aii_latestRelease` RPC
+
+Second slice of the auto-update protocol. v0.0.74 shipped the
+manifest sign/verify primitives behind a `--pubkey HEX` CLI
+argument; v0.0.75 ships the pubkey **pinned in the binary** and
+exposes the announcement+query wire over JSON-RPC so peers can
+gossip release availability.
+
+#### `aii-crypto::release` (moved from `aii-cli`)
+
+- Module moved from `aii-cli::release` into `aii-crypto::release`
+  so `aii-rpc` and `aii-node` can depend on it. `aii-cli` re-
+  exports `aii_crypto::release` under its old name for backward
+  compatibility — every prior call site keeps working.
+- New `pub const RELEASE_SIGNING_PUBKEY_HEX: &str = "f845…0669"`
+  pinning the AII Network release-signing public key. The matching
+  secret seed is held off-chain by the release manager.
+- New `pinned_release_pubkey() -> PublicKey` helper.
+
+#### `aii-cli::release`
+
+- `aii release verify --manifest M --binary B` now omits
+  `--pubkey` and defaults to the pinned key. Pass `--pubkey HEX`
+  to override (testing, key rotation drills).
+- Verify output prints the first 16 hex chars of the pubkey it
+  used so operators can confirm which trust anchor was in force.
+
+#### `aii-rpc`
+
+- New `AiiRpc::announce_release(manifest)` method. Server-side
+  the receiver verifies the Ed25519 signature against
+  `pinned_release_pubkey()` *before* handing the manifest off to
+  `RpcState::record_release_announcement` for persistence;
+  signature failures return `{ accepted: false, reason: ... }`
+  with no state mutation.
+- New `AiiRpc::latest_release()` method returning the most
+  recently accepted manifest, or `null`.
+- New `ReleaseManifestView` (wire-shape mirror of
+  `aii_crypto::release::ReleaseManifest`) + `AnnounceReleaseResult`.
+- New `RpcState::record_release_announcement` + `latest_release`
+  trait methods (default no-ops). `NodeState` overrides both to
+  persist into a new `latest_release: RwLock<Option<...>>` field.
+- 3 RPC unit tests:
+  - `aii_announce_release_rejects_unsigned_manifest`
+  - `aii_announce_release_accepts_pinned_pubkey_signature`
+  - `aii_latest_release_fresh_node_returns_null`
+
+#### `aii-node::NodeState`
+
+- New `latest_release: RwLock<Option<ReleaseManifest>>` field.
+- `record_release_announcement` accepts strictly-newer manifests
+  (compared on `(timestamp_unix, version)` lexically), rejects
+  duplicates / backdated re-signs.
+- `latest_release` returns the cloned manifest or `None`.
+
+777 tests pass, clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.76+:
+
+- Peer binary fetch — `aii_getReleaseBinary(version) -> bytes` so
+  a node that received an announcement can pull the binary from a
+  peer that already has it.
+- Atomic install — write to `<data-dir>/releases/<ver>.new`,
+  verify sha256, rename, swap symlink, re-exec.
+- Cross-node gossip relay — when `announce_release` accepts, the
+  receiver forwards the same manifest to its peers (BTC-style
+  flood with hash-dedup).
+
+## [0.0.74] — 2026-05-27
+
+### Added — signed release-manifest primitives
+
+Foundation slice for the authenticated auto-update protocol the user
+asked for during the cross-pacific testnet bring-up: any node receiving
+a peer-distributed binary update must be able to verify the binary
+hasn't been tampered with AND that the release was authorised by the
+holder of the project's release-signing key.
+
+This release ships only the cryptographic primitives + CLI; wire-level
+gossip of releases, peer binary fetch, and atomic in-place install land
+in later versions on top of this foundation.
+
+#### `aii-crypto::ed25519`
+
+- New module wrapping `ed25519-dalek` 2.x. Exposes `SecretKey`,
+  `PublicKey`, `Signature` with hex round-trip, `SecretKey::generate`,
+  `sign(msg)`, `verify(msg, sig)`. Independent from the BLS validator
+  keys (`bls.rs`) and the VRF leader-election keys (`vrf.rs`) — release
+  signing is an operator-trust signal, not a chain consensus signal.
+- New error variants: `CryptoError::Hex`, `CryptoError::BadLength`,
+  `CryptoError::Ed25519` (+ `CryptoError::ed25519` constructor).
+- 6 unit tests covering sign/verify round-trip, tamper detection, wrong
+  public key, hex round-trip with and without `0x` prefix, bad-length
+  rejection.
+
+#### `aii-cli::release`
+
+- New `ReleaseManifest { version, sha256_hex, timestamp_unix,
+  ed25519_sig_hex }` serde struct.
+- New `canonical_payload(version, sha256, ts)` helper. The signed
+  bytes carry a `"aii-release-v1\0"` domain-separation tag so the
+  same Ed25519 key cannot be misused to forge a confounder signature
+  on unrelated payloads (validator votes, etc.).
+- `sign_release(secret, binary_path, version, timestamp)` — hashes
+  the binary, assembles the manifest, signs the canonical payload.
+- `verify_release(pubkey, manifest, binary_path)` — re-hashes the
+  binary, checks against the manifest's `sha256_hex`, verifies the
+  signature against the canonical payload, returns the verified
+  binary bytes on success.
+- 6 unit tests covering happy path, tampered binary (`HashMismatch`),
+  forged version, forged timestamp, wrong pubkey, JSON round-trip.
+
+#### `aii-cli` binary — `aii release {keygen, sign, verify}`
+
+- `aii release keygen` — generates a fresh Ed25519 keypair; secret
+  seed written to `--out` (or printed alongside the public key);
+  public key always printed (so it can be pinned in CI / docs).
+- `aii release sign --binary BIN --version VER --secret HEX --out
+  release.json` — produces the signed manifest. `--secret-file` lets
+  the seed live on disk instead of in argv. `--timestamp` defaults to
+  the current Unix time.
+- `aii release verify --manifest release.json --binary BIN --pubkey
+  HEX` — full chain of checks; exits 0 on success with `ok — VERSION
+  signed at TIMESTAMP`, otherwise reports `binary hash mismatch:
+  manifest says X, computed Y` or the signature failure path.
+
+774 tests pass; clippy clean.
+
+#### Scope discipline
+
+Deferred to v0.0.75+:
+
+- Pinned public-key constant compiled into the node binary so a
+  remote verify needs no explicit `--pubkey` argument.
+- `aii_announceRelease` JSON-RPC method so a node can gossip a
+  manifest to its peers; receivers verify locally with the pinned
+  key.
+- `aii_getReleaseBinary` JSON-RPC method so a peer that's missing
+  the binary for a verified manifest can pull the bytes from a node
+  that already has them.
+- Atomic install + self-restart on a verified new release.
+
+## [0.0.73] — 2026-05-27
+
+### Fixed — gossip auto-harvests committed blocks between inbox messages
+
+v0.0.72 fixed early-arrival precommit rejection but exposed a second
+race: when the proposer races ahead of its followers (commits block
+N at t=0, broadcasts proposal for N+1 at t=50ms), the follower's
+gossip tick can dispatch the next-height proposal BEFORE its main
+loop has called `try_harvest_committed` to advance the engine's
+`head_hash`. Reconstruction then computes the new block's parent
+hash against the *old* head, gets `ProposalHashMismatch`, and the
+chain stalls at exactly block N+1. Live-tested across JP/CN/local:
+chain produced 20 blocks in ~1 second then froze with the proposer
+500 ms ahead.
+
+The fix: `BftGossip::tick()` now calls a new
+`engine.try_harvest_committed()` between every dispatched inbox
+message. Harvested blocks are stashed on an internal
+`harvested_blocks: Mutex<Vec<Block>>` buffer; the host drains them
+via the new `BftGossip::drain_harvested()` and applies them to its
+world-state storage. The engine's `head_hash` advances in lockstep
+with the inbox so subsequent proposals reconstruct against the
+correct parent.
+
+#### `aii-consensus-bft::gossip`
+
+- New `BftGossip::harvested_blocks: Mutex<Vec<Block>>` field.
+- New `BftGossip::drain_harvested() -> Vec<Block>` public API for
+  hosts.
+- New private `BftGossip::auto_harvest()` helper that pulls every
+  committed block out of the engine and pushes it onto the buffer.
+- `tick()` calls `auto_harvest()` after each inbox message AND once
+  after the drive-phase work (belt-and-braces for the rare case
+  where the local engine's own precommit was the quorum-forming
+  vote and didn't traverse the inbox).
+- Two existing gossip tests updated to drain via the new API; one
+  retained the direct `try_harvest_committed` path as a fallback.
+
+#### `aii-node` (`aiid` binary)
+
+- The multi-validator BFT loop now drains via
+  `gossip.drain_harvested()` first, then falls back to
+  `engine.try_harvest_committed()` for non-gossip paths.
+- The post-commit `bft_state.json` snapshot loop is unchanged —
+  each harvested block still resets the persisted round state to
+  `(N+1, 0)` per the v0.0.71 contract.
+
+762 tests pass; clippy clean.
+
+## [0.0.72] — 2026-05-27
+
+### Fixed — BFT engine no longer rejects early-arrival prevotes/precommits
+
+Out-of-order vote arrival was silently freezing 3-validator BFT
+whenever the proposer's precommit reached a remote validator before
+that validator had tallied enough prevotes to transition to
+`Precommitting`. The engine returned `WrongPhase` (or
+`NoActiveCoordinator` for votes that beat the proposal entirely)
+and the gossip layer dropped the message — the round then stalled
+until a timeout, every time, on every block. With cross-pacific
+network latency (the JP/CN/local testnet) this defeated all
+liveness.
+
+Diagnosed via `tracing::warn!` logs added to
+`submit_remote_{prevote,precommit}` showing CN's precommits landing
+on a still-Prevoting JP within ~20 ms of the leader's broadcast,
+ahead of JP's own prevote tally.
+
+The fix: prevotes and precommits that fail with
+`NoActiveCoordinator`, `WrongPhase`, `WrongRound`, or `WrongHeight`
+are now buffered on the engine state rather than rejected. Every
+subsequent state mutation (proposal arrival, prevote tally,
+precommit tally, round timeout) calls a new `drain_pending_votes`
+helper that re-submits the buffered votes through the coordinator
+until no more can be applied. Stale votes (for an already-
+committed height) are dropped silently.
+
+#### `aii-consensus-bft::engine`
+
+- New `BftEngineState::pending_prevotes` + `pending_precommits`
+  buffers (`Vec<PrevoteVote>` / `Vec<PrecommitVote>`).
+- `submit_remote_prevote` / `submit_remote_precommit` rewritten to
+  match on the coordinator's error and route timing-class errors
+  into the buffer; pass other errors (signature failure, dup vote)
+  through unchanged.
+- New private `drain_pending_votes(&mut BftEngineState)` helper.
+  Called from `submit_remote_proposal`, `tick_timeout`, and the
+  success paths of `submit_remote_{prevote,precommit}`. Uses a
+  bounded loop (each iteration must apply ≥1 vote to repeat) so
+  the total work is capped by total buffer size.
+- 3 new unit tests:
+  - `prevote_arriving_before_proposal_is_buffered_and_replayed`
+  - `precommit_arriving_during_prevoting_is_buffered_and_replayed`
+  - `stale_buffered_votes_are_dropped`
+
+762 tests pass; clippy clean.
+
+#### Scope discipline
+
+This release contains ONLY the buffer fix. Deferred to v0.0.73+:
+
+- Real signed auto-update protocol (Ed25519 release manifest +
+  on-chain announce + peer fetch + atomic install). Was previously
+  v0.0.72; bumped now that v0.0.72's slot is needed for the BFT
+  fix that's currently blocking testnet liveness.
+
+## [0.0.71] — 2026-05-27
+
+### Added — persistent BFT round state (single-validator restart no longer freezes consensus)
+
+Closes the second half of the chain-continuity story started in
+v0.0.70. Previously, when a single validator restarted (binary
+upgrade, OS reboot, crash recovery), the rest of the validator set
+sat at round R while the restarted node came up at round 0 — their
+votes never combined into a quorum and the chain froze until every
+validator restarted together. v0.0.71 persists the `(height, round)`
+of the active coordinator to disk on every change; on startup the
+restored node fast-forwards through `round` timeouts before
+listening for new votes, landing at the same round as the live set.
+
+#### `aii-consensus-bft`
+
+- New `BftEngine::fast_forward_to_round(target_round)`. Creates a
+  fresh coordinator at the next-to-commit height and calls
+  `RoundCoordinator::fire_timeout` `target_round` times. Idempotent
+  for `round == 0`. Errors with `BftError::WrongHeight` if a
+  coordinator for a different height is already active (defensive —
+  the typical startup-time call site cannot trigger it).
+- 2 new unit tests (`fast_forward_to_round_lands_at_target`,
+  `fast_forward_to_round_zero_creates_coordinator_at_round_zero`).
+
+#### `aii-node::bft_state`
+
+- New module persisting `BftStateSnapshot{height, round}` to
+  `<data-dir>/bft_state.json` (atomic temp + rename).
+- `load` returns `Ok(None)` for missing or malformed files — we
+  prefer round-0 startup over a crash on corrupted snapshot.
+- 4 unit tests covering load/save/round-trip/atomicity/garbage
+  tolerance.
+
+#### `aii-node` (`aiid` binary)
+
+- Startup path now reads `bft_state.json`. When the snapshot's
+  `height` matches `recovered_head + 1` and `round > 0`, calls
+  `engine.fast_forward_to_round(snap.round)` and logs
+  `restored BFT coordinator from persisted round state`.
+- Tick loop persists the current `(height, round)` every time the
+  tracked tuple changes. On each successful block commit, the
+  snapshot resets to `(N+1, 0)` so a crash before any round
+  timeout fires still recovers at the right height.
+
+#### Scope discipline
+
+Deferred to v0.0.72:
+
+- Persisting the `locked_value` / `polc` / vote tallies (BFT safety
+  state). Without this, a restarted validator could theoretically
+  vote for an incompatible block after losing its lock — fine on a
+  development testnet, must-fix before mainnet. Doing it cleanly
+  needs a serializer for the BLS/VRF certificate machinery, which
+  warrants its own release.
+- Signed binary auto-update protocol (was previously v0.0.72; still
+  the slot after lock-state persistence).
+
+## [0.0.70] — 2026-05-26
+
+### Added — chain continuity across restart (BFT engine resumes from recovered head)
+
+Fixes the silent corruption in v0.0.67–v0.0.69 where any `aiid`
+restart caused the BFT engine to ignore the persisted chain and
+start producing block 1 again, overwriting whatever RocksDB had
+already stored. This was harmless when all validators sync-restarted
+together (the new chain replaces the old) but catastrophic if a
+single operator restarted to upgrade a binary — the chain reset and
+all other validators stalled trying to vote at a height the
+restarted node didn't recognise.
+
+The fix:
+
+- New `BftEngine::from_recovered(config, head_block)` constructor.
+  Resumes the engine at `head_block.header.number + 1` round 0 with
+  `seed` derived from `head_block.header.mix_hash` (the VRF output
+  the producer carries forward across heights since v0.0.34).
+- New `bft_bootstrap::boot_bft_engine_with_recovered_head` helper
+  on top of it.
+- New `NodeState::block_by_number` + `head_block` accessors so the
+  startup path can pull the full recovered block out of the
+  in-memory index that `recover()` rebuilds.
+- `aiid` startup now checks `node_state.head_block()`; if non-`None`
+  and `number > 0`, routes through `from_recovered` instead of
+  `boot_bft_engine` (which always restarts at genesis). Logs a
+  `resuming BFT engine from recovered head` line + a new
+  `recovered_head=N` field on the `BftEngine ready` line.
+
+#### Tests
+
+Two unit tests in `aii-consensus-bft`:
+
+- `from_recovered_resumes_at_head_plus_one` — produces block 1 from
+  a fresh engine, builds a *second* engine via `from_recovered` on
+  that block, and confirms the second engine's next-advance block
+  has `number=2` and `parent_hash` matching the recovered block's
+  hash.
+- `from_recovered_with_genesis_block_matches_new` — `from_recovered`
+  against a genesis-only chain is observationally identical to
+  `new`.
+
+#### Scope discipline
+
+Deferred to v0.0.71:
+
+- Persisting round / locked_value / step so a single-validator
+  restart doesn't freeze BFT consensus while it catches up to the
+  other validators' current round. This is the next user-visible
+  fix (single-node restart still triggers a global stall for ~30 s
+  in v0.0.70).
+
+Deferred to v0.0.72:
+
+- Signed binary auto-update protocol — Ed25519 release-signing key
+  + on-chain release announce + peer-fetch with sha256 verify +
+  atomic install + self-restart. Each piece is a unit risk;
+  better as its own dedicated release once BFT continuity is
+  proven stable on the testnet.
+
+## [0.0.69] — 2026-05-26
+
+### Added — persistent peer cache + BFT gossip relay
+
+Two changes that together make the BFT network self-healing in any
+topology — a validator that has talked to the network even once can
+restart and rejoin without operator intervention; and a validator
+whose direct link to another validator dies can keep voting as long
+as *any* third validator can bridge them. This is the core of the
+"无封锁可能 / 断网了恢复立即自动组网" requirement: the network is
+robust to any single link failure and to arbitrary restarts.
+
+#### `aii-node::peer_cache`
+
+- New module persisting the dialer's last-known-good peer set to
+  `<data-dir>/peers.json` (text format, one `SocketAddr` per line).
+- On startup, `aiid` merges `--peers` with the cache and dials the
+  union; the cache is rewritten atomically (`peers.json.tmp` +
+  `rename(2)`) so a crash mid-write can never strand a half-file.
+- 6 unit tests cover round-trip, missing-file tolerance, comment +
+  garbage tolerance, dedup/sort, atomicity, merge ordering.
+
+#### `aii-node::bft_p2p` — gossip relay
+
+- New `GossipDedup` hash ring (4096-slot FIFO of keccak256
+  payloads). Every locally-originated `broadcast()` pre-seeds the
+  ring so echoes bouncing back from relayers are dropped; every
+  inbound BFT payload is checked once, and only novel payloads are
+  pushed to `inbox` AND fanned out via `out_tx` for relay.
+- `run_peer` and `run_peer_noise` both apply the same dedup-then-
+  relay path. The change is wire-compatible: no protocol bumps, no
+  new message types — relay is invisible to peers running v0.0.68
+  but cooperating peers form a self-bridging mesh.
+- Two new tests:
+  - `gossip_relay_three_node_line_topology` — proves A↔B↔C with no
+    direct A-C link still delivers A's broadcast to C.
+  - `gossip_relay_suppresses_echo_to_originator` — proves A's own
+    `broadcast()` doesn't bounce back into A's inbox after relayer
+    forwarding.
+
+#### Scope discipline
+
+Deferred to v0.0.70:
+
+- Multi-endpoint bootnode list (each validator advertises
+  `host:port1, host:port2, host:443`; dial parallel, first success
+  wins). Needs a peer-announce protocol change.
+- Peer-reflected public-IP discovery (app-layer STUN). Pairs with
+  multi-endpoint announce.
+- QUIC + Noise transport. Pairs with the multi-endpoint work.
+
+## [0.0.68] — 2026-05-26
+
+### Added — NAT-friendly BFT (outbound-only mode + 30 s idle reconnect)
+
+Validators sitting behind a home router (no NAT port forward),
+HTTP-only proxy chain (Mihomo / Clash, Cloudflare WARP, corporate
+VPN), or CGNAT'd ISP can now join the BFT set without exposing
+30311 to the public internet. The mechanism is BTC-style: bind the
+listener to a random loopback port, dial each peer via outbound
+TCP, and let every consensus message flow over the established
+outbound sockets in both directions.
+
+This closes the v0.0.65–v0.0.67 gap that forced the local 3rd node
+into observer-only mode: a node started with `--bft-outbound-only`
+needs nothing from its network except the ability to make outbound
+TCP to its peers. Once the peer is reachable the validator votes
+and proposes like any other; if the proxy / NAT drops the link,
+the new 30-second application-layer idle timeout closes the dead
+session within one block-time worth of silence and the dialer
+reconnects automatically. Net effect: "断网了一恢复就自动组网" —
+the local validator rejoins consensus on its own as soon as
+outbound TCP is back, without any operator action.
+
+#### `aii-node` (`aiid` binary)
+
+- New CLI flag `--bft-outbound-only` (default `false`). When set,
+  the BFT listener binds to `127.0.0.1:0` (kernel-assigned loopback
+  port, never exposed); all consensus traffic to `--peers` flows
+  over outbound TCP only. Compatible with `--encrypt-gossip` for a
+  Noise XX wrapped session.
+- New public constant `aii_node::bft_p2p::BFT_PEER_IDLE_TIMEOUT`
+  (= 30 s). Every BFT peer connection (plaintext or Noise) is now
+  killed when no inbound bytes arrive in this window, so the
+  dialer can immediately reconnect. Previously the read would
+  block forever, letting a half-dead session silently swallow
+  proposals and votes.
+- New ctors: `TcpBftTransport::new_outbound_only(peers)` and
+  `new_outbound_only_encrypted(peers)` for embedding the same
+  behavior into downstream binaries.
+
+#### Scope discipline
+
+Deferred to v0.0.69:
+
+- Adaptive round timeout (latency-aware scaling) — needs a latency
+  measurement infrastructure first.
+- BFT gossip relay (forward messages from peer A to peer C through
+  peer B) — needs hash-dedup data structure and care around
+  relay-driven equivocation reports.
+- Dynamic peer discovery / Kademlia-driven auto-network — full
+  "any port + any environment auto-network" is the v0.0.69 theme.
+- Hot-join validator (link to chain-stake registry instead of
+  genesis) — sits behind the v0.0.69 net layer.
+
 ## [0.0.67] — 2026-05-26
 
 ### Added — `--no-produce-blocks` + `--follow-seconds` observer mode

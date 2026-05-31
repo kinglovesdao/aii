@@ -128,6 +128,31 @@ pub fn boot_bft_engine(
     Ok((engine, genesis))
 }
 
+/// Like [`boot_bft_engine`] but resumes from `recovered_head`
+/// instead of starting at genesis (v0.0.70).
+///
+/// `recovered_head` must be the latest [`aii_block::Block`] read out
+/// of the node's persistent storage. The returned engine's
+/// `head_number` is `recovered_head.header.number` and its `seed` is
+/// derived from `recovered_head.header.mix_hash`, so the next
+/// proposal will target height `recovered_head.header.number + 1`
+/// rather than `1`.
+///
+/// If the node has never produced a block (`recovered_head.number ==
+/// 0`), this is observationally identical to [`boot_bft_engine`].
+pub fn boot_bft_engine_with_recovered_head(
+    genesis_path: &Path,
+    keystore_path: &Path,
+    coinbase: Address,
+    recovered_head: &aii_block::Block,
+) -> Result<(BftEngine, Genesis), BootstrapError> {
+    let genesis = load_genesis(genesis_path)?;
+    let keystore = load_keystore(keystore_path)?;
+    let cfg = build_bft_config(&genesis, &keystore, coinbase, None)?;
+    let engine = BftEngine::from_recovered(cfg, recovered_head);
+    Ok((engine, genesis))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
