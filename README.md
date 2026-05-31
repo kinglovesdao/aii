@@ -8,7 +8,7 @@ Spec: see `docs/superpowers/specs/2026-05-21-aii-core-design.md` and the 14-docu
 
 ## Status
 
-**v0.0.36 — Live 2-node BFT testnet + block explorer.**
+**Post-v0.0.92 development branch — live public testnet, mainnet not launched yet.**
 
 | | |
 |---|---|
@@ -17,7 +17,9 @@ Spec: see `docs/superpowers/specs/2026-05-21-aii-core-design.md` and the 14-docu
 | Validators | 2 (JP + CN), TCP gossip on port 30311 |
 | Consensus | BFT-PoS — VRF leader election + ⅔ BLS aggregate finality |
 | Block time | ~1–2 s |
-| Tests | 647 / 647 passing, `clippy -D warnings` clean |
+| RPC surface | EVM-compatible `eth_*` reads/writes plus AII explorer RPC |
+| Live validation | 300 accepted real AII transfers, 0.1–50 AII each, with receipts |
+| Mainnet status | Not launched. Phase 2 items remain: feature freeze, genesis dry run, ≥21 validator readiness, audit closure, 14-day parameter objection window. |
 
 ### Public RPC endpoints
 
@@ -54,7 +56,9 @@ Both nodes finalise the same block at every height — verified by hash agreemen
 |---|---|
 | `v0.0.34` | Multi-host BFT over TCP gossip |
 | `v0.0.35` | Pluggable consensus — BFT + PoA engines |
-| `v0.0.36` | Block explorer API (`aii_getBlockHeader`, `aii_recentBlocks`) + MCP tools + live mainnet-ready deployment |
+| `v0.0.36` | Block explorer API (`aii_getBlockHeader`, `aii_recentBlocks`) + MCP tools + live public-testnet deployment |
+| `v0.0.88`–`v0.0.90` | Wallet-facing EVM RPC: `eth_call`, `eth_estimateGas`, transaction lookup, receipts, block lookup |
+| `v0.0.91`–`v0.0.92` | Public-internet discovery, validator registry wiring, capacity budgeting, and BFT liveness hardening |
 
 ## Quickstart (developers)
 
