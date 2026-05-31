@@ -317,6 +317,22 @@ curl -s -X POST https://aii.allfund.xyz/api \
 
 ---
 
+## 🤖 AI Integration Guide
+
+> **Full walkthrough: how to operate AII with Claude, Cursor, Cline and any MCP-compatible AI agent.**
+
+[![AI Guide](https://img.shields.io/badge/📖_Read-AI_Integration_Guide-blueviolet?style=for-the-badge)](docs/ai-guide.md)
+
+| What you'll learn | Link |
+|---|---|
+| MCP setup for Claude Desktop / Cursor / Cline | [Quick Setup](docs/ai-guide.md#-quick-setup) |
+| All 12 MCP tools with example responses | [Tools Reference](docs/ai-guide.md#-mcp-tools-reference) |
+| Step-by-step AI walkthroughs (wallet, blocks, BFT planning) | [Walkthroughs](docs/ai-guide.md#-ai-operation-walkthroughs) |
+| Copy-paste prompt library | [Prompts](docs/ai-guide.md#-practical-prompts-library) |
+| Security model for AI key operations | [Security](docs/ai-guide.md#-security-model) |
+
+---
+
 ## 🌍 Multilingual Docs
 
 > Full installation and configuration guide available in 10 languages — see **[INSTALL.md](INSTALL.md)**
