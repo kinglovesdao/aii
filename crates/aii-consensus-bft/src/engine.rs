@@ -199,6 +199,47 @@ struct BftEngineState {
     /// precommit would be rejected with `WrongPhase` and the round
     /// would stall.
     pending_precommits: Vec<PrecommitVote>,
+    /// v0.0.93 block-sync: a bounded cache of the most recently
+    /// committed full blocks and their BFT finality certificates, keyed
+    /// by height. Populated on every harvest (and on adopt of a
+    /// peer-supplied certified block) so this node can answer a peer's
+    /// [`crate::wire::BftMessage::BlockRequest`] without reaching back
+    /// into host storage. Capped at [`RECENT_BLOCKS_CAP`] entries — the
+    /// oldest are evicted.
+    recent_blocks: std::collections::BTreeMap<u64, RecentCommittedBlock>,
+}
+
+#[derive(Clone)]
+struct RecentCommittedBlock {
+    block: Block,
+    certificate: PrecommitCertificate,
+}
+
+/// Number of recently-committed blocks the engine keeps cached to
+/// serve [`crate::wire::BftMessage::BlockRequest`].
+///
+/// Small: a lagging validator is typically only 1–2 blocks behind (it
+/// restarted), and anything further behind should HTTP cold-sync via
+/// `--bootnode`.
+pub const RECENT_BLOCKS_CAP: usize = 64;
+
+fn cache_recent_block(
+    map: &mut std::collections::BTreeMap<u64, RecentCommittedBlock>,
+    block: Block,
+    certificate: PrecommitCertificate,
+) {
+    map.insert(
+        block.header.number,
+        RecentCommittedBlock { block, certificate },
+    );
+    while map.len() > RECENT_BLOCKS_CAP {
+        // Evict the lowest height.
+        if let Some((&oldest, _)) = map.iter().next() {
+            map.remove(&oldest);
+        } else {
+            break;
+        }
+    }
 }
 
 impl BftEngine {
@@ -217,6 +258,7 @@ impl BftEngine {
             pending_evidence: Vec::new(),
             pending_prevotes: Vec::new(),
             pending_precommits: Vec::new(),
+            recent_blocks: std::collections::BTreeMap::new(),
         };
         Self {
             config,
@@ -264,6 +306,7 @@ impl BftEngine {
             pending_evidence: Vec::new(),
             pending_prevotes: Vec::new(),
             pending_precommits: Vec::new(),
+            recent_blocks: std::collections::BTreeMap::new(),
         };
         Self {
             config,
@@ -513,6 +556,7 @@ impl BftEngine {
             return None;
         }
         let (block, proof) = g.proposal.clone()?;
+        let certificate = g.coordinator.as_ref()?.certificate().cloned()?;
         let block_hash = block.hash();
         g.head_hash = block_hash;
         g.head_number = block.header.number;
@@ -520,7 +564,78 @@ impl BftEngine {
         g.seed = proof.vrf_output;
         g.coordinator = None;
         g.proposal = None;
+        // v0.0.93: cache the committed block and certificate so peers
+        // that fell behind can fetch verified finality over gossip.
+        cache_recent_block(&mut g.recent_blocks, block.clone(), certificate);
         Some(block)
+    }
+
+    /// Current committed head height. (v0.0.93 block-sync helper.)
+    #[must_use]
+    pub fn head_number(&self) -> u64 {
+        self.state.lock().head_number
+    }
+
+    /// v0.0.93 block-sync: return the committed block and finality
+    /// certificate cached at `height`, if this engine has it. Used to
+    /// answer a peer's [`crate::wire::BftMessage::BlockRequest`].
+    /// Returns `None` when the height is outside the recent-block cache
+    /// window.
+    #[must_use]
+    pub fn committed_block_at(&self, height: u64) -> Option<(Block, PrecommitCertificate)> {
+        let g = self.state.lock();
+        g.recent_blocks
+            .get(&height)
+            .map(|entry| (entry.block.clone(), entry.certificate.clone()))
+    }
+
+    /// v0.0.93 block-sync: adopt a peer-supplied committed `block` as
+    /// the new head, but ONLY when it extends the current head by
+    /// exactly one (`block.number == head+1` and
+    /// `block.parent_hash == head_hash`) AND carries a BFT precommit
+    /// certificate that verifies against the current validator set. This
+    /// is the catch-up path for a validator that fell one block behind
+    /// (e.g. after a restart): it lets the engine advance its head — and
+    /// roll the leader seed forward from the block's `mix_hash` (the
+    /// proposer's VRF output, per the v0.0.34+ header convention) — so
+    /// it can rejoin the current round instead of stalling the whole set.
+    ///
+    /// Any in-flight coordinator/proposal for the now-superseded height
+    /// is cleared. Returns the adopted block on success.
+    ///
+    /// # Errors
+    /// - [`BftError::WrongHeight`] if `block.number != head+1` or the
+    ///   certificate height differs from the block height.
+    /// - [`BftError::ProposalHashMismatch`] if `block.parent_hash`
+    ///   does not match the current head hash or the certificate targets
+    ///   a different block hash.
+    /// - [`BftError::InvalidBlsSignature`] if the certificate does not
+    ///   verify against the current validator set.
+    pub fn adopt_synced_block(
+        &self,
+        block: Block,
+        certificate: PrecommitCertificate,
+    ) -> Result<Block, BftError> {
+        let mut g = self.state.lock();
+        let block_hash = block.hash();
+        if block.header.number != g.head_number + 1 || certificate.height != block.header.number {
+            return Err(BftError::WrongHeight);
+        }
+        if block.header.parent_hash != g.head_hash || certificate.block_hash != block_hash {
+            return Err(BftError::ProposalHashMismatch);
+        }
+        certificate.verify(&g.validator_set)?;
+        g.head_hash = block_hash;
+        g.head_number = block.header.number;
+        g.head_timestamp = block.header.timestamp;
+        g.seed = *block.header.mix_hash.as_bytes();
+        // The block we were coordinating for this height is now moot.
+        g.coordinator = None;
+        g.proposal = None;
+        g.pending_prevotes.clear();
+        g.pending_precommits.clear();
+        cache_recent_block(&mut g.recent_blocks, block.clone(), certificate);
+        Ok(block)
     }
 
     /// Build a proposal for the current round and feed it to our own
@@ -1022,6 +1137,7 @@ impl BftEngine {
         g.head_number = new_number;
         g.head_timestamp = new_timestamp;
         g.seed = leader_proof.vrf_output;
+        cache_recent_block(&mut g.recent_blocks, block.clone(), certificate.clone());
 
         Ok(AdvanceOutput {
             block,
@@ -1062,6 +1178,13 @@ impl Engine for BftEngine {
             .proposal
             .clone()
             .ok_or(ConsensusError::InvalidBlock("committed with no proposal"))?;
+        let certificate = g
+            .coordinator
+            .as_ref()
+            .and_then(|coord| coord.certificate().cloned())
+            .ok_or(ConsensusError::InvalidBlock(
+                "committed with no certificate",
+            ))?;
         let block_hash = block.hash();
         g.head_hash = block_hash;
         g.head_number = block.header.number;
@@ -1069,6 +1192,7 @@ impl Engine for BftEngine {
         g.seed = proof.vrf_output;
         g.coordinator = None;
         g.proposal = None;
+        cache_recent_block(&mut g.recent_blocks, block, certificate);
         Ok(EngineProgress::NewBlock(block_hash))
     }
 

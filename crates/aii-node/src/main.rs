@@ -8,8 +8,8 @@ use aii_consensus_poa::{PoaConfig, PoaEngine};
 use aii_node::bft_p2p::TcpBftTransport;
 use aii_node::{bft_bootstrap, NodeState};
 use aii_storage::{KvBackend, RocksDbBackend};
-use aii_types::{Address, H256, U256};
-use clap::Parser;
+use aii_types::{Address, BlsPubKey, VrfPubKey, H256, U256};
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -252,6 +252,26 @@ struct Cli {
     /// operator a chance to intervene on a real crash-loop.
     #[arg(long, default_value = "3")]
     restart_max_per_window: u32,
+
+    /// Maintenance command. When present, aiid performs the command and exits.
+    #[command(subcommand)]
+    command: Option<MaintenanceCmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintenanceCmd {
+    /// Persist a keyed DPoS active validator set into this node's RocksDB.
+    ///
+    /// Each --validator value is:
+    /// address,stake_wei,bls_pubkey,vrf_pubkey
+    DposSet {
+        /// Epoch number for the persisted validator set record.
+        #[arg(long)]
+        epoch: u64,
+        /// Validator tuple: address,stake_wei,bls_pubkey,vrf_pubkey.
+        #[arg(long = "validator")]
+        validators: Vec<String>,
+    },
 }
 
 /// Resolve the effective bootnode URL for cold-sync and follow-loop
@@ -286,6 +306,68 @@ fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error + Send + 
                 format!("coinbase: expected 20 bytes, got {}", v.len()).into()
             })?;
     Ok(Address::new(arr))
+}
+
+fn parse_fixed_hex<const N: usize>(
+    s: &str,
+    field: &str,
+) -> Result<[u8; N], Box<dyn std::error::Error + Send + Sync>> {
+    let raw = hex::decode(s.trim_start_matches("0x")).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("{field}: bad hex: {e}").into() },
+    )?;
+    raw.try_into()
+        .map_err(|v: Vec<u8>| format!("{field}: expected {N} bytes, got {}", v.len()).into())
+}
+
+fn parse_u256(s: &str) -> Result<U256, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        U256::from_str_radix(hex, 16)
+    } else {
+        U256::from_str_radix(s, 10)
+    }
+    .map_err(|e| format!("stake_wei: invalid integer: {e}").into())
+}
+
+fn parse_validator_entry(
+    input: &str,
+) -> Result<aii_node::ValidatorEntry, Box<dyn std::error::Error + Send + Sync>> {
+    let parts: Vec<&str> = input.split(',').collect();
+    if parts.len() != 4 {
+        return Err("validator must be address,stake_wei,bls_pubkey,vrf_pubkey".into());
+    }
+    Ok(aii_node::ValidatorEntry {
+        address: parse_address(parts[0])?,
+        stake_wei: parse_u256(parts[1])?,
+        bls_pubkey: Some(BlsPubKey::new(parse_fixed_hex::<48>(
+            parts[2],
+            "bls_pubkey",
+        )?)),
+        vrf_pubkey: Some(VrfPubKey::new(parse_fixed_hex::<32>(
+            parts[3],
+            "vrf_pubkey",
+        )?)),
+    })
+}
+
+fn persist_dpos_set_command(
+    backend: &Arc<RocksDbBackend>,
+    epoch: u64,
+    validators: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if validators.is_empty() {
+        return Err("at least one --validator is required".into());
+    }
+    let entries = validators
+        .iter()
+        .map(|v| parse_validator_entry(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bft_set = aii_node::bft_validator_set_from_entries(&entries)?;
+    aii_node::dpos::persist_validator_set(backend, epoch, &entries)?;
+    println!(
+        "persisted DPoS validator set epoch={epoch} validators={}",
+        bft_set.size()
+    );
+    Ok(())
 }
 
 /// Materialise every [`aii_config::GenesisAlloc`] entry from `genesis`
@@ -383,6 +465,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     std::fs::create_dir_all(&cli.data_dir)?;
     let backend: Arc<RocksDbBackend> = Arc::new(RocksDbBackend::open(&cli.data_dir)?);
+    if let Some(command) = &cli.command {
+        match command {
+            MaintenanceCmd::DposSet { epoch, validators } => {
+                persist_dpos_set_command(&backend, *epoch, validators)?;
+            }
+        }
+        return Ok(());
+    }
 
     // If the data dir already has a head marker, replay the indexed
     // chain off disk; otherwise stand up a fresh in-memory cache on
@@ -652,7 +742,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
+            if !cli.no_discovery {
+                if let Some(boot_url) = effective_bootnode.as_deref() {
+                    match aii_node::fetch_bft_peers_from_peer(boot_url).await {
+                        Ok(rpc_peers) if !rpc_peers.is_empty() => {
+                            tracing::info!(
+                                discovered = rpc_peers.len(),
+                                bootnode = %boot_url,
+                                "HTTP bootnode peer fallback found BFT peers",
+                            );
+                            configured_peers =
+                                aii_node::peer_cache::merge(&configured_peers, &rpc_peers);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                bootnode = %boot_url,
+                                "HTTP bootnode peer fallback unavailable"
+                            );
+                        }
+                    }
+                }
+            }
             let merged_peers = aii_node::peer_cache::merge(&cached_peers, &configured_peers);
+            node_state.set_bft_peers(&merged_peers);
             if !cached_peers.is_empty() {
                 tracing::info!(
                     cached = cached_peers.len(),
@@ -755,6 +869,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let state_for_pool = node_state.clone();
             let max_txs_per_block =
                 (spec.initial_gas_limit / aii_consensus_bft::PLACEHOLDER_TX_GAS) as usize;
+            let round_timeout = Duration::from_secs(cli.slot_seconds.max(1));
             let slash_amount_wei = U256::from((spec.min_validator_stake_wei / 100).max(1));
             // Round-state persistence cadence — only write when the
             // tracked tuple actually changes.
@@ -766,6 +881,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let discovery_query_listen_for_loop = discovery_query_listen;
             let discovery_advertise_for_loop = discovery_advertise;
             let discovery_peer_view_for_loop = discovery_peer_view.clone();
+            let state_for_peer_rpc = node_state.clone();
             let advertised_bft_listen = cli.bft_listen;
             let advertise_bft_in_refresh = !cli.bft_outbound_only;
             let discovery_timeout = Duration::from_millis(cli.discovery_timeout_ms);
@@ -851,6 +967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     &discovery_peer_view_for_disc,
                                     &known_bft_peers,
                                 );
+                                state_for_peer_rpc.set_bft_peers(&known_bft_peers);
                                 if let Err(e) = aii_node::peer_cache::save(
                                     &cache_path_for_disc,
                                     &known_bft_peers,
@@ -892,6 +1009,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // v0.0.39).
             Some(tokio::spawn(async move {
                 let mut last_rotation_checked_epoch: Option<u64> = None;
+                let mut timeout_key: Option<(u64, u32)> = None;
+                let mut timeout_deadline = tokio::time::Instant::now() + round_timeout;
                 loop {
                     gossip.tick();
                     let txs = state_for_pool.tx_pool().drain_up_to(max_txs_per_block);
@@ -994,6 +1113,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let snap = aii_node::bft_state::BftStateSnapshot::new(n + 1, 0);
                         if let Err(e) = aii_node::bft_state::save(&bft_state_path_for_loop, snap) {
                             tracing::warn!(?e, "bft_state.json save (post-commit) failed");
+                        }
+                    }
+                    let current_timeout_key =
+                        engine_for_loop.current_round_state().map_or_else(
+                            || {
+                                let (_, head_number) = engine_for_loop.head();
+                                (head_number.saturating_add(1), 0)
+                            },
+                            |(height, round, _phase)| (height, round),
+                        );
+                    if timeout_key != Some(current_timeout_key) {
+                        timeout_key = Some(current_timeout_key);
+                        timeout_deadline = tokio::time::Instant::now() + round_timeout;
+                    } else if tokio::time::Instant::now() >= timeout_deadline {
+                        match engine_for_loop.tick_timeout() {
+                            Ok(()) => {
+                                let after = engine_for_loop.current_round_state();
+                                tracing::warn!(
+                                    before_height = current_timeout_key.0,
+                                    before_round = current_timeout_key.1,
+                                    after = ?after,
+                                    timeout_ms = round_timeout.as_millis(),
+                                    "BFT round timeout fired"
+                                );
+                                timeout_key = after.map(|(height, round, _phase)| (height, round));
+                                timeout_deadline = tokio::time::Instant::now() + round_timeout;
+                                gossip.tick();
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "BFT round timeout failed");
+                                timeout_deadline = tokio::time::Instant::now() + round_timeout;
+                            }
                         }
                     }
                     // v0.0.71: persist the active round whenever it

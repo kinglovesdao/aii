@@ -5,6 +5,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.93] — 2026-05-31
+
+### Fixed — BFT block-sync over gossip: validator restart no longer stalls the chain
+
+Before v0.0.93, `BftMessage` carried only `Proposal`, `Prevote`, and
+`Precommit`. A validator that restarted and landed one committed block
+behind its peers could not fetch the missing block over gossip — the
+only recovery was an HTTP cold-sync via `--bootnode`. In a 3-of-3
+quorum this stalled the whole chain on every single-validator restart.
+
+**Two new wire variants added to `aii-consensus-bft`:**
+
+- `BlockRequest { height }` (tag `0x03`, 9 bytes): broadcast by a
+  lagging validator when it observes a peer vote/proposal at a height
+  it cannot yet reach (`remote_height > local_head + 1`). De-duplicated
+  via `RoundFlags::requested_blocks` so one block is requested at most
+  once per catch-up cycle.
+
+- `BlockResponse { block_bytes, certificate }` (tag `0x04`):
+  answer from a peer that has the committed block cached. Carries the
+  full RLP-encoded `Block` plus a `PrecommitCertificate` (⅔-stake BLS
+  aggregate + signer bitmap) so the requester can verify finality
+  independently before adopting it.
+
+**Engine changes (`aii-consensus-bft`):**
+
+- `BftEngineState::recent_blocks` — `BTreeMap<u64, Block>` capped at
+  64 entries. Populated on every `try_harvest_committed` (and
+  `adopt_synced_block`). Serves `BlockRequest` without reaching back
+  into host storage.
+
+- `engine.committed_block_at(height)` — returns
+  `Option<(Block, PrecommitCertificate)>` from the cache.
+
+- `engine.adopt_synced_block(block, certificate)` — validates that
+  `block.number == head+1`, `parent_hash` matches, and
+  `certificate.verify(validator_set)` passes; then advances head,
+  rolls the VRF seed forward from `mix_hash`, clears the coordinator,
+  caches the block. Returns the adopted block so gossip can hand it to
+  the host's `commit_block` / `set_head` path — identical to a
+  normally-harvested block.
+
+**Gossip changes (`aii-consensus-bft`):**
+
+- `dispatch_inbound`: all three prior variants now call
+  `request_catchup_if_future_height` before routing, so lag detection
+  is uniform.
+
+- `request_catchup_if_future_height`: compares `remote_height` to
+  `engine.head_number() + 1`; if behind, inserts into
+  `requested_blocks` set (de-dup) and broadcasts `BlockRequest`.
+
+- `handle_block_response`: RLP-decodes the block, verifies certificate,
+  calls `adopt_synced_block`, pushes the adopted block into
+  `harvested_blocks` so the host loop picks it up exactly like a
+  gossip-committed block.
+
+- `handle_proposal_msg` (bonus): if a Proposal arrives for a future
+  round (`round > active_round`), automatically fast-forwards to that
+  round — closes a related liveness hole where a restarted node at
+  round 0 could not catch up to peers at round R > 0 unless the
+  persisted `bft_state.json` had a non-zero round.
+
+**Verified locally:** 945 workspace tests pass; `clippy -D warnings`
+clean. Production real-condition validation (restart a single validator,
+confirm chain self-heals without `--bootnode`) is the next step before
+deploying.
+
+#### Scope discipline
+
+Out of scope: syncing more than one block at a time (current design
+requests one block per catch-up cycle, which is sufficient for the
+typical "1 block behind on restart" case; deeper catch-ups still use
+`--bootnode`); changing the consensus rules; altering the Proposal /
+Prevote / Precommit wire format.
+
 ## [0.0.92] — 2026-05-30
 
 ### Fixed — discovery refresh no longer stalls BFT consensus
