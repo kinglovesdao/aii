@@ -33,6 +33,17 @@
 - [Practical Prompts Library](#-practical-prompts-library)
 - [Security Model](#-security-model)
 - [FAQ](#-faq)
+- [🌐 Multilingual Quick Start](#-multilingual-quick-start)
+  - [🇺🇸 English](#-english)
+  - [🇨🇳 中文](#-中文-chinese)
+  - [🇯🇵 日本語](#-日本語-japanese)
+  - [🇰🇷 한국어](#-한국어-korean)
+  - [🇷🇺 Русский](#-русский-russian)
+  - [🇩🇪 Deutsch](#-deutsch-german)
+  - [🇫🇷 Français](#-français-french)
+  - [🇧🇷 Português](#-português-portuguese)
+  - [🇮🇳 हिन्दी](#-हिन्दी-hindi)
+  - [🇸🇦 العربية](#-العربية-arabic)
 
 ---
 
@@ -608,6 +619,296 @@ AII's AI integration is designed with **security-first** principles:
 **Q: Is aii-mcp production-ready?**
 
 > The testnet is live and stable. Mainnet is not yet launched (Phase 2 pending: feature freeze, ≥21 validators, audit). The MCP server's tool surface is stable but may expand as mainnet approaches.
+
+---
+
+## 🌐 Multilingual Quick Start
+
+> Choose your language · 选择语言 · 言語選択 · 언어 선택 · Выберите язык · Sprache · Langue · Idioma · भाषा · اللغة
+
+---
+
+### 🇺🇸 English
+
+**What is AII MCP?**
+AII exposes a Model Context Protocol (MCP) server (`aii-mcp`) that lets any AI assistant — Claude, Cursor, Cline — query the blockchain and manage wallets via natural language. No API keys, no REST endpoints: the AI calls typed tools directly.
+
+**Prerequisites:** Rust 1.85+, Git
+
+**Build & connect:**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — add to claude_desktop_config.json:
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**Try it:** Ask Claude: *"What is the current AII block height?"*
+
+---
+
+### 🇨🇳 中文 (Chinese)
+
+**AII MCP 是什么？**
+AII 提供 MCP（模型上下文协议）服务器 `aii-mcp`，让 Claude、Cursor、Cline 等 AI 助手通过自然语言直接查询区块链、管理钱包。无需 API 密钥，无需 REST 接口，AI 直接调用结构化工具。
+
+**前置要求：** Rust 1.85+、Git
+
+**构建与连接：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — 编辑 claude_desktop_config.json：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**实用提示词：**
+- *"查询 AII 当前区块高度"*
+- *"为我创建一个新的 AII 钱包地址"*
+- *"帮我分析这个节点运行 AII 验证人的硬件是否达标"*
+
+---
+
+### 🇯🇵 日本語 (Japanese)
+
+**AII MCPとは？**
+AIIは、MCP（Model Context Protocol）サーバー `aii-mcp` を提供します。Claude、Cursor、Clineなどの AIアシスタントが自然言語でブロックチェーンを照会し、ウォレットを管理できます。APIキー不要、RESTエンドポイント不要で、AIが直接型付きツールを呼び出します。
+
+**前提条件：** Rust 1.85+、Git
+
+**ビルドと接続：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — claude_desktop_config.json に追加：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**試してみる：** Claudeに聞いてみましょう：*「AII の現在のブロック高さは？」*
+
+---
+
+### 🇰🇷 한국어 (Korean)
+
+**AII MCP란 무엇인가요?**
+AII는 MCP(Model Context Protocol) 서버 `aii-mcp`를 제공합니다. Claude, Cursor, Cline 등의 AI 어시스턴트가 자연어로 블록체인을 조회하고 지갑을 관리할 수 있습니다. API 키나 REST 엔드포인트 없이 AI가 직접 타입화된 도구를 호출합니다.
+
+**사전 요구사항：** Rust 1.85+, Git
+
+**빌드 및 연결：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — claude_desktop_config.json에 추가：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**실용 프롬프트：**
+- *"현재 AII 블록 높이를 조회해주세요"*
+- *"새 AII 지갑 주소를 생성해주세요"*
+
+---
+
+### 🇷🇺 Русский (Russian)
+
+**Что такое AII MCP?**
+AII предоставляет сервер MCP (Model Context Protocol) `aii-mcp`, который позволяет AI-ассистентам — Claude, Cursor, Cline — запрашивать блокчейн и управлять кошельками на естественном языке. Без API-ключей, без REST-эндпоинтов: AI вызывает типизированные инструменты напрямую.
+
+**Требования：** Rust 1.85+, Git
+
+**Сборка и подключение：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — добавить в claude_desktop_config.json：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**Попробуйте：** Спросите Claude: *«Какова текущая высота блока AII?»*
+
+---
+
+### 🇩🇪 Deutsch (German)
+
+**Was ist AII MCP?**
+AII stellt einen MCP-Server (Model Context Protocol) `aii-mcp` bereit, der KI-Assistenten wie Claude, Cursor und Cline ermöglicht, die Blockchain in natürlicher Sprache abzufragen und Wallets zu verwalten. Keine API-Schlüssel, keine REST-Endpunkte: Die KI ruft typisierte Werkzeuge direkt auf.
+
+**Voraussetzungen：** Rust 1.85+, Git
+
+**Build und Verbindung：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — zu claude_desktop_config.json hinzufügen：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**Ausprobieren：** Fragen Sie Claude: *„Was ist die aktuelle AII-Blockhöhe?"*
+
+---
+
+### 🇫🇷 Français (French)
+
+**Qu'est-ce qu'AII MCP ?**
+AII fournit un serveur MCP (Model Context Protocol) `aii-mcp` qui permet aux assistants IA — Claude, Cursor, Cline — d'interroger la blockchain et de gérer des portefeuilles en langage naturel. Sans clés API, sans endpoints REST : l'IA appelle directement des outils typés.
+
+**Prérequis：** Rust 1.85+, Git
+
+**Build et connexion：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — ajouter à claude_desktop_config.json：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**Essayez：** Demandez à Claude : *« Quelle est la hauteur actuelle du bloc AII ? »*
+
+---
+
+### 🇧🇷 Português (Portuguese)
+
+**O que é AII MCP?**
+O AII fornece um servidor MCP (Model Context Protocol) `aii-mcp` que permite que assistentes de IA — Claude, Cursor, Cline — consultem a blockchain e gerenciem carteiras em linguagem natural. Sem chaves de API, sem endpoints REST: a IA chama ferramentas tipadas diretamente.
+
+**Pré-requisitos：** Rust 1.85+, Git
+
+**Build e conexão：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — adicionar ao claude_desktop_config.json：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**Experimente：** Pergunte ao Claude: *"Qual é a altura atual do bloco AII?"*
+
+---
+
+### 🇮🇳 हिन्दी (Hindi)
+
+**AII MCP क्या है?**
+AII एक MCP (Model Context Protocol) सर्वर `aii-mcp` प्रदान करता है जो Claude, Cursor, Cline जैसे AI असिस्टेंट को प्राकृतिक भाषा में ब्लॉकचेन क्वेरी करने और वॉलेट प्रबंधित करने की सुविधा देता है। कोई API कुंजी नहीं, कोई REST एंडपॉइंट नहीं: AI सीधे टाइप किए गए टूल्स को कॉल करता है।
+
+**पूर्वापेक्षाएं：** Rust 1.85+, Git
+
+**बिल्ड और कनेक्शन：**
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — claude_desktop_config.json में जोड़ें：
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+**आज़माएं：** Claude से पूछें: *"AII की वर्तमान ब्लॉक ऊंचाई क्या है?"*
+
+---
+
+<div dir="rtl">
+
+### 🇸🇦 العربية (Arabic)
+
+**ما هو AII MCP؟**
+يوفر AII خادم MCP (بروتوكول سياق النموذج) `aii-mcp` الذي يتيح لمساعدي الذكاء الاصطناعي — Claude وCursor وCline — الاستعلام عن سلسلة الكتل وإدارة المحافظ بلغة طبيعية. دون مفاتيح API أو نقاط نهاية REST: يستدعي الذكاء الاصطناعي الأدوات المكتوبة مباشرةً.
+
+**المتطلبات الأساسية：** Rust 1.85+، Git
+
+**البناء والاتصال：**
+
+</div>
+
+```bash
+git clone https://github.com/kinglovesdao/aii.git && cd aii
+cargo build --release -p aii-mcp
+
+# Claude Desktop — أضف إلى claude_desktop_config.json:
+{
+  "mcpServers": {
+    "aii": {
+      "command": "/path/to/aii/target/release/aii-mcp",
+      "args": ["--rpc", "https://aii.allfund.xyz/api"]
+    }
+  }
+}
+```
+
+<div dir="rtl">
+
+**جرّب：** اسأل Claude: *"ما هو ارتفاع كتلة AII الحالية؟"*
+
+</div>
 
 ---
 
