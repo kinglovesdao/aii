@@ -5,6 +5,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.95] — 2026-06-02
+
+### Fixed — Two-phase NodeState recovery: O(1) memory, ~22s startup on 1.35M-block chain
+
+v0.0.94's single-pass recover still allocated O(N) Headers in heap before pruning,
+causing startup OOM on CN (1.76 GB RAM) with 1.35M blocks. v0.0.95 replaces it
+with a three-pass approach that never allocates more than MAX_BLOCKS_IN_MEMORY
+entries regardless of chain length.
+
+**Measured on 1.35M-block CN testnet node:**
+- Startup time: 22 seconds (previously 20+ minutes and never completed)
+- RSS after recovery: 441 MB (previously 1480+ MB → OOM killed)
+- Available memory: 1160 MB (previously 70 MB)
+
+**How it works:**
+- Pass 1: scan Headers CF → build number→hash index (40 B/entry × 1.35M = 54 MB peak)
+- Compute keep set: newest 2048 block numbers (MAX_BLOCKS_IN_MEMORY)
+- Pass 2: re-scan Headers CF → build full Header objects only for kept hashes (≤2048 entries)
+- Pass 3: scan Bodies CF → load body + tx_index only for kept hashes
+- Peak heap during recovery: ~54 MB instead of ~480 MB
+
+**Also discovered:** DPoS epoch 81 elected a 2-validator set (JP + CN). This
+explains why JP+CN can reach BFT quorum (200 stake ≥ threshold 134 = (200×2)/3+1).
+
 ## [0.0.94] — 2026-06-02
 
 ### Fixed — NodeState block-store cap: prevents unbounded RSS growth and OOM on long-running nodes

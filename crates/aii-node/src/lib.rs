@@ -589,11 +589,11 @@ impl NodeState {
         spec: ChainSpec,
         backend: Arc<RocksDbBackend>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut by_hash: HashMap<H256, Header> = HashMap::new();
-        let mut by_number: HashMap<u64, H256> = HashMap::new();
-        let mut body_by_hash: HashMap<H256, BlockBody> = HashMap::new();
-        let mut tx_index: HashMap<H256, (u64, usize)> = HashMap::new();
-
+        // Phase 1: scan Headers CF to build a lightweight number→hash index
+        // (40 bytes per entry). This avoids allocating full Header structs for
+        // every block on disk — critical on long-running nodes with millions of
+        // blocks where a full load would OOM before pruning even starts.
+        let mut num_to_hash: HashMap<u64, H256> = HashMap::new();
         for kv in backend.iter(ColumnFamily::Headers) {
             let (k, v) = kv?;
             if k.len() != 32 {
@@ -602,12 +602,50 @@ impl NodeState {
             let mut h_arr = [0u8; 32];
             h_arr.copy_from_slice(&k);
             let hash = H256::new(h_arr);
+            // Decode only `number` (first field in Header RLP after parent_hash).
             let mut s: &[u8] = &v;
             let header = Header::decode(&mut s)?;
-            by_number.insert(header.number, hash);
-            by_hash.insert(hash, header);
+            num_to_hash.insert(header.number, hash);
         }
 
+        // Determine the newest MAX_BLOCKS_IN_MEMORY block numbers to keep.
+        let mut sorted_nums: Vec<u64> = num_to_hash.keys().copied().collect();
+        sorted_nums.sort_unstable();
+        let skip = sorted_nums.len().saturating_sub(MAX_BLOCKS_IN_MEMORY);
+        let keep_nums: std::collections::HashSet<u64> =
+            sorted_nums[skip..].iter().copied().collect();
+        let keep_hashes: std::collections::HashSet<H256> = keep_nums
+            .iter()
+            .filter_map(|n| num_to_hash.get(n).copied())
+            .collect();
+        // Drop the full index; only keep the filtered subset.
+        drop(sorted_nums);
+        let by_number: HashMap<u64, H256> = num_to_hash
+            .into_iter()
+            .filter(|(n, _)| keep_nums.contains(n))
+            .collect();
+
+        // Phase 2: re-scan Headers CF, loading full Header structs only for
+        // the kept hashes (≤ MAX_BLOCKS_IN_MEMORY entries).
+        let mut by_hash: HashMap<H256, Header> = HashMap::new();
+        for kv in backend.iter(ColumnFamily::Headers) {
+            let (k, v) = kv?;
+            if k.len() != 32 {
+                continue;
+            }
+            let mut h_arr = [0u8; 32];
+            h_arr.copy_from_slice(&k);
+            let hash = H256::new(h_arr);
+            if !keep_hashes.contains(&hash) {
+                continue;
+            }
+            let mut s: &[u8] = &v;
+            by_hash.insert(hash, Header::decode(&mut s)?);
+        }
+
+        // Phase 3: scan Bodies CF, loading only kept bodies.
+        let mut body_by_hash: HashMap<H256, BlockBody> = HashMap::new();
+        let mut tx_index: HashMap<H256, (u64, usize)> = HashMap::new();
         for kv in backend.iter(ColumnFamily::Bodies) {
             let (k, v) = kv?;
             if k.len() != 32 {
@@ -616,6 +654,9 @@ impl NodeState {
             let mut h_arr = [0u8; 32];
             h_arr.copy_from_slice(&k);
             let hash = H256::new(h_arr);
+            if !keep_hashes.contains(&hash) {
+                continue;
+            }
             let mut s: &[u8] = &v;
             let body = BlockBody::decode(&mut s)?;
             if let Some(header) = by_hash.get(&hash) {
@@ -626,23 +667,13 @@ impl NodeState {
             body_by_hash.insert(hash, body);
         }
 
-        // Rebuild `order` (insertion-order vec for recent_headers) by
-        // sorting headers by number ascending — same observable order as
-        // the live commit path produces. Only keep the newest
-        // MAX_BLOCKS_IN_MEMORY entries in the hot cache so recovery never
-        // loads the full chain history into heap on a long-running node.
-        let mut sorted: Vec<(u64, H256)> = by_number.iter().map(|(n, h)| (*n, *h)).collect();
-        sorted.sort_unstable_by_key(|(n, _)| *n);
-        let skip = sorted.len().saturating_sub(MAX_BLOCKS_IN_MEMORY);
-        if skip > 0 {
-            let keep: std::collections::HashSet<H256> =
-                sorted[skip..].iter().map(|(_, h)| *h).collect();
-            by_hash.retain(|h, _| keep.contains(h));
-            by_number.retain(|_, h| keep.contains(h));
-            body_by_hash.retain(|h, _| keep.contains(h));
-            tx_index.retain(|_, (num, _)| by_number.contains_key(num));
-        }
-        let order: Vec<H256> = sorted.into_iter().skip(skip).map(|(_, h)| h).collect();
+        // Rebuild `order` from the kept, sorted entries.
+        let order: Vec<H256> = {
+            let mut kv: Vec<(u64, H256)> =
+                by_number.iter().map(|(n, h)| (*n, *h)).collect();
+            kv.sort_unstable_by_key(|(n, _)| *n);
+            kv.into_iter().map(|(_, h)| h).collect()
+        };
 
         let head = backend
             .get(ColumnFamily::Meta, META_KEY_HEAD)?
