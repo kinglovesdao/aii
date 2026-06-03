@@ -5,6 +5,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.94] — 2026-06-02
+
+### Fixed — NodeState block-store cap: prevents unbounded RSS growth and OOM on long-running nodes
+
+Before v0.0.94, `NodeState::BlockStore` held every committed block in heap
+memory without eviction. On the testnet this caused both the JP (3.5 GB RAM)
+and CN (1.76 GB RAM) validators to be OOM-killed by the kernel after
+accumulating ~1 million blocks (~1–1.3 GB RSS). After each kill the chain
+stalled until all three validators were back in sync.
+
+**Root-cause fix in `aii-node`:**
+
+- Added `MAX_BLOCKS_IN_MEMORY = 2048` constant — the hot-cache cap.
+- `commit_block`: after inserting a new block, evicts the oldest entry
+  (removes from `by_hash`, `by_number`, `body_by_hash`, and `tx_index`)
+  until `order.len() <= 2048`. Older blocks remain on RocksDB disk.
+- `recover`: on startup, only the newest 2048 blocks are loaded from
+  RocksDB into the in-memory cache, preventing a startup OOM on a node
+  that has a long chain history on disk.
+
+**Scope discipline:** RPC methods (`eth_getBlockByNumber`,
+`eth_getTransactionByHash`) return `null` for blocks older than the cache
+window. Full archive queries require a dedicated archive node; the validator
+role is consensus, not history serving.
+
+**Also fixed (pre-existing compilation errors):**
+- `aii-cli/Cargo.toml`: added missing `aii-state`, `aii-storage`, `aii-evm`
+  dependencies required by `run_state_credit` and `live_transfer_load`.
+- `aii-node/src/lib.rs`: added `NodeState::set_bft_peers(&[SocketAddr])`
+  referenced in `main.rs` but never implemented.
+- `aii-node/src/sync.rs`: added `fetch_bft_peers_from_peer(url)` referenced
+  in `main.rs` but never implemented (calls `aii_getUpdatePeers` RPC with
+  graceful fallback to empty on unsupported peers).
+- `aii-mcp/src/lib.rs`: fixed `run_bft_capacity` (missing `network_nodes`
+  arg) and `run_discovery_probe` (missing `http_bootnodes` arg) call sites.
+
 ## [0.0.93] — 2026-05-31
 
 ### Fixed — BFT block-sync over gossip: validator restart no longer stalls the chain

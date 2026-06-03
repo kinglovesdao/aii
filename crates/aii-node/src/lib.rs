@@ -31,10 +31,16 @@ pub use dpos::{
 pub use governance::{Governance, Proposal, ProposalStatus, Vote};
 pub use precompile::{dispatch as precompile_dispatch, PrecompileOutcome, PRECOMPILE_ADDR};
 pub use staking::{StakeRecord, StakeTable};
-pub use sync::bootstrap_sync_from_peer;
+pub use sync::{bootstrap_sync_from_peer, fetch_bft_peers_from_peer};
 pub use validator_registry::{ValidatorKeys, ValidatorRegistry};
 
 const BFT_STAKE_WEIGHT_UNIT_WEI: u128 = 1_000_000_000_000_000_000;
+
+/// Maximum number of blocks kept in the in-memory `BlockStore`. Older blocks
+/// remain on disk (RocksDB) but are evicted from the hot cache. Prevents
+/// unbounded RSS growth on long-running nodes (each block ≈ 1 KB on-disk but
+/// HashMap overhead makes it 4–10× larger in heap).
+const MAX_BLOCKS_IN_MEMORY: usize = 2048;
 
 /// `BlockExecutor` adapter built on top of a live [`NodeState`].
 ///
@@ -622,10 +628,21 @@ impl NodeState {
 
         // Rebuild `order` (insertion-order vec for recent_headers) by
         // sorting headers by number ascending — same observable order as
-        // the live commit path produces.
+        // the live commit path produces. Only keep the newest
+        // MAX_BLOCKS_IN_MEMORY entries in the hot cache so recovery never
+        // loads the full chain history into heap on a long-running node.
         let mut sorted: Vec<(u64, H256)> = by_number.iter().map(|(n, h)| (*n, *h)).collect();
         sorted.sort_unstable_by_key(|(n, _)| *n);
-        let order: Vec<H256> = sorted.into_iter().map(|(_, h)| h).collect();
+        let skip = sorted.len().saturating_sub(MAX_BLOCKS_IN_MEMORY);
+        if skip > 0 {
+            let keep: std::collections::HashSet<H256> =
+                sorted[skip..].iter().map(|(_, h)| *h).collect();
+            by_hash.retain(|h, _| keep.contains(h));
+            by_number.retain(|_, h| keep.contains(h));
+            body_by_hash.retain(|h, _| keep.contains(h));
+            tx_index.retain(|_, (num, _)| by_number.contains_key(num));
+        }
+        let order: Vec<H256> = sorted.into_iter().skip(skip).map(|(_, h)| h).collect();
 
         let head = backend
             .get(ColumnFamily::Meta, META_KEY_HEAD)?
@@ -723,6 +740,18 @@ impl NodeState {
                     s.tx_index.insert(tx.hash(), (block.header.number, idx));
                 }
                 s.body_by_hash.insert(hash, block.body.clone());
+                // Evict the oldest block once the hot-cache cap is exceeded.
+                while s.order.len() > MAX_BLOCKS_IN_MEMORY {
+                    let oldest = s.order.remove(0);
+                    if let Some(hdr) = s.by_hash.remove(&oldest) {
+                        s.by_number.remove(&hdr.number);
+                    }
+                    if let Some(body) = s.body_by_hash.remove(&oldest) {
+                        for tx in &body.transactions {
+                            s.tx_index.remove(&tx.hash());
+                        }
+                    }
+                }
             }
         }
         if let Some(canonical) = fork_detected {
@@ -1481,6 +1510,11 @@ impl NodeState {
         if let Ok(mut g) = self.update_peers.write() {
             *g = peers;
         }
+    }
+
+    /// Store the known BFT gossip peers so the P2P layer can use them.
+    pub fn set_bft_peers(&self, peers: &[std::net::SocketAddr]) {
+        self.set_update_peers(peers.iter().map(ToString::to_string).collect());
     }
 
     /// Read the current update-peer list. Returns an empty vec on

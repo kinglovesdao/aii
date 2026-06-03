@@ -57,6 +57,24 @@ pub async fn bootstrap_sync_from_peer(
     Ok(synced)
 }
 
+/// Ask a running peer for its known BFT gossip peers via the
+/// `aii_getUpdatePeers` JSON-RPC method. Returns an empty vec when the
+/// peer is unreachable or doesn't support the method.
+pub async fn fetch_bft_peers_from_peer(
+    peer_url: &str,
+) -> Result<Vec<std::net::SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = HttpClientBuilder::default().build(peer_url)?;
+    let raw: Vec<String> = client
+        .request("aii_getUpdatePeers", rpc_params![])
+        .await
+        .unwrap_or_default();
+    let addrs = raw
+        .into_iter()
+        .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+        .collect();
+    Ok(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

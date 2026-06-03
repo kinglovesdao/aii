@@ -306,7 +306,7 @@ impl Server {
                     .and_then(Value::as_u64)
                     .map(|n| n as usize);
                 let target_secs = args.get("target_secs").and_then(Value::as_u64);
-                let r = run_bft_capacity(validators, proposal_bytes, target_secs)
+                let r = run_bft_capacity(validators, proposal_bytes, target_secs, None)
                     .map_err(|e| rpc_err(&e))?;
                 Ok(tool_text(serde_json::to_string_pretty(&r).unwrap()))
             }
@@ -342,7 +342,7 @@ impl Server {
                     .get("timeout_ms")
                     .and_then(Value::as_u64)
                     .unwrap_or(1500);
-                let r = run_discovery_probe(&seeds, listen, bft_listen, timeout_ms)
+                let r = run_discovery_probe(&seeds, listen, bft_listen, timeout_ms, &[])
                     .await
                     .map_err(|e| rpc_err(&e))?;
                 Ok(tool_text(serde_json::to_string_pretty(&r).unwrap()))

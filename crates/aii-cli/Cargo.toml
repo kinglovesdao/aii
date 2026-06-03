@@ -28,6 +28,9 @@ aii-consensus-poa = { workspace = true }
 aii-net-p2p = { workspace = true }
 aii-block = { workspace = true }
 aii-microchain = { workspace = true }
+aii-state = { workspace = true }
+aii-storage = { workspace = true }
+aii-evm = { workspace = true }
 alloy-rlp = { workspace = true }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 serde = { workspace = true }
